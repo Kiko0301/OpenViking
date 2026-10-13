@@ -34,7 +34,7 @@ from openviking.server.user_config import (
     user_config_backup_uri,
 )
 from openviking.service.core import OpenVikingService
-from openviking.service.deletion import setup_deletion
+from openviking.service.deletion import DeletionService, setup_deletion
 from openviking.service.task_store import (
     SYSTEM_TASK_ACCOUNT_ID,
     SYSTEM_TASK_USER_ID,
@@ -304,6 +304,28 @@ async def _wait_for_task(client: httpx.AsyncClient, task_id: str) -> dict:
 
 
 # ---- Account CRUD ----
+
+
+async def test_delete_account_files_disables_automatic_pathlock(monkeypatch):
+    """Account cleanup must bypass the deleted tree's automatic PathLock."""
+    path = "/local/account-to-delete"
+    agfs = Mock()
+    agfs.rm = AsyncMock()
+    agfs.stat = AsyncMock(side_effect=AGFSNotFoundError(path))
+    service = Mock()
+    service.viking_fs._async_agfs = agfs
+    tracker = Mock()
+    monkeypatch.setattr("openviking.service.deletion.get_task_tracker", lambda: tracker)
+    deletion = DeletionService(
+        service=service,
+        manager=Mock(),
+        service_loop=asyncio.get_running_loop(),
+    )
+
+    await deletion._delete_account_files("account-to-delete")
+
+    agfs.rm.assert_awaited_once_with(path, recursive=True, auto_pathlock=False)
+    tracker.forget_account_tasks.assert_called_once_with("account-to-delete")
 
 
 @pytest_asyncio.fixture
@@ -850,12 +872,10 @@ async def test_account_memory_templates_range_expressions_reach_file_body(
     fs = lightweight_admin_app.state.fake_service.viking_fs
     snapshot = await resolve_account_memory_registry(fs, account_id, MemoryTypeRegistry())
     schema = snapshot.get("events")
-    context = ExtractContext(
-        [
-            Message(id="m1", role="user", parts=[TextPart("Selected source message")]),
-            Message(id="m2", role="user", parts=[TextPart("Unrelated source message")]),
-        ]
-    )
+    context = ExtractContext([
+        Message(id="m1", role="user", parts=[TextPart("Selected source message")]),
+        Message(id="m2", role="user", parts=[TextPart("Unrelated source message")]),
+    ])
     rendered = MemoryFileUtils.write(
         MemoryFile(memory_type="events", extra_fields={"ranges": "0", "summary": "summary"}),
         content_template=schema.content_template,
@@ -1178,33 +1198,29 @@ async def test_account_memory_templates_locked_fields_cannot_be_modified(
         for key, value in defaults.items()
         if key not in editable
     ]
-    invalid.extend(
-        [
-            {"unknown": "ignored?"},
-            {"Description": "wrong key"},
-            {"_updated_at": "forged"},
-            {"_account_content_template": False},
-            {"deployment_content_template": "forged"},
-            {"enabled": 1},
-            {"fields": [{"name": "renamed_field", "description": "changed"}]},
-            {"description": None},
-            {"description": " \n"},
-            {"fields": [None]},
-        ]
-    )
+    invalid.extend([
+        {"unknown": "ignored?"},
+        {"Description": "wrong key"},
+        {"_updated_at": "forged"},
+        {"_account_content_template": False},
+        {"deployment_content_template": "forged"},
+        {"enabled": 1},
+        {"fields": [{"name": "renamed_field", "description": "changed"}]},
+        {"description": None},
+        {"description": " \n"},
+        {"fields": [None]},
+    ])
     for field in defaults["fields"]:
         invalid.extend(
             {"fields": [{"name": field["name"], key: None if value is not None else "changed"}]}
             for key, value in field.items()
             if key not in {"name", "description"}
         )
-        invalid.extend(
-            [
-                {"fields": [{"name": field["name"], "unknown": "ignored?"}]},
-                {"fields": [{"name": field["name"], "description": ""}]},
-                {"fields": [{"name": field["name"]}, {"name": field["name"]}]},
-            ]
-        )
+        invalid.extend([
+            {"fields": [{"name": field["name"], "unknown": "ignored?"}]},
+            {"fields": [{"name": field["name"], "description": ""}]},
+            {"fields": [{"name": field["name"]}, {"name": field["name"]}]},
+        ])
     if memory_type == "events":
         invalid.extend(
             {"fields": [{"name": name, "description": "changed"}]} for name in ("goal", "ranges")
@@ -2280,22 +2296,18 @@ async def test_delete_account(
             account_id=SYSTEM_TASK_ACCOUNT_ID,
             user_id=SYSTEM_TASK_USER_ID,
         )
-        await queue.enqueue(
-            {
-                "task_id": user_cleanup.task_id,
-                "account_id": acct,
-                "user_id": "alice",
-                "target": {"account_id": acct, "user_id": "bob"},
-            }
-        )
-        await queue.enqueue(
-            {
-                "task_id": late_task_id,
-                "account_id": SYSTEM_TASK_ACCOUNT_ID,
-                "user_id": SYSTEM_TASK_USER_ID,
-                "target": {"account_id": acct, "user_id": "bob"},
-            }
-        )
+        await queue.enqueue({
+            "task_id": user_cleanup.task_id,
+            "account_id": acct,
+            "user_id": "alice",
+            "target": {"account_id": acct, "user_id": "bob"},
+        })
+        await queue.enqueue({
+            "task_id": late_task_id,
+            "account_id": SYSTEM_TASK_ACCOUNT_ID,
+            "user_id": SYSTEM_TASK_USER_ID,
+            "target": {"account_id": acct, "user_id": "bob"},
+        })
         skipped = await _wait_for_task(admin_client, late_task_id)
         assert skipped["status"] == "completed"
         assert skipped["result"] == {"deleted": not recreated, "stale": True}
