@@ -64,13 +64,6 @@ class SessionCommitProcessor(DequeueHandlerBase):
             if not await session.exists():
                 error = f"Session '{msg.session_id}' no longer exists"
                 tracker = get_task_tracker()
-                await tracker.create(
-                    "session_commit",
-                    resource_id=msg.session_id,
-                    account_id=ctx.account_id,
-                    user_id=ctx.user.user_id,
-                    task_id=msg.task_id,
-                )
                 await tracker.fail(
                     msg.task_id,
                     error,
@@ -121,6 +114,14 @@ class SessionCommitProcessor(DequeueHandlerBase):
             msg, ctx = self._parse_message(data)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             return ProcessResult.failed(str(exc))
+        # Failed registration must retain queue work; processing errors remain terminal.
+        await get_task_tracker().create(
+            "session_commit",
+            resource_id=msg.session_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            task_id=msg.task_id,
+        )
         try:
             processed = await self._process(msg, ctx)
         except Exception as exc:
