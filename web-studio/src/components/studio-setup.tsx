@@ -9,9 +9,6 @@ import {
   CloudIcon,
   ServerIcon,
   Loader2Icon,
-  MonitorIcon,
-  MoonIcon,
-  SunIcon,
 } from 'lucide-react'
 import { Button } from '#/components/ui/button'
 import { Input } from '#/components/ui/input'
@@ -669,7 +666,7 @@ export function StudioSetup({
                             checked={(theme ?? 'system') === value}
                             onChange={() => setTheme(value)}
                           />
-                          <ThemeIllustration appearance={value} />
+                          <ThemePreview appearance={value} />
                           <span className="mt-2 flex items-center justify-between gap-1 text-xs font-medium sm:text-sm">
                             {t(value)}
                             {(theme ?? 'system') === value ? (
@@ -865,24 +862,45 @@ export function StudioSetup({
   )
 }
 
-function ThemeIllustration({
-  appearance,
-}: {
-  appearance: (typeof THEMES)[number]
-}) {
-  const Icon =
-    appearance === 'light'
-      ? SunIcon
-      : appearance === 'dark'
-        ? MoonIcon
-        : MonitorIcon
-
+function ThemePreview({ appearance }: { appearance: (typeof THEMES)[number] }) {
   return (
     <div
       aria-hidden="true"
-      className="flex h-14 items-center justify-center text-muted-foreground"
+      className={`relative h-14 overflow-hidden rounded-md border border-black/10 bg-clip-padding ${appearance === 'light' ? 'bg-[#f9fafb]' : appearance === 'dark' ? 'bg-[#191b20]' : 'bg-[linear-gradient(110deg,#f9fafb_calc(50%_-_0.5px),#191b20_calc(50%_+_0.5px))]'}`}
     >
-      <Icon className="size-6" strokeWidth={1.5} />
+      <div
+        className={`flex h-4 items-center gap-1 border-b px-2 ${appearance === 'dark' ? 'border-white/10' : 'border-black/10'}`}
+      >
+        {[0, 1, 2].map((dot) => (
+          <span
+            key={dot}
+            className={`size-1 rounded-full ${appearance === 'dark' ? 'bg-white/25' : 'bg-black/20'}`}
+          />
+        ))}
+      </div>
+      <div className="flex h-full">
+        <div
+          className={`w-1/4 border-r p-1.5 ${appearance === 'dark' ? 'border-white/10 bg-white/5' : 'border-black/10 bg-black/[0.03]'}`}
+        >
+          <div
+            className={`mb-1.5 h-1 rounded-full ${appearance === 'dark' ? 'bg-white/20' : 'bg-black/15'}`}
+          />
+          <div
+            className={`h-1 w-2/3 rounded-full ${appearance === 'dark' ? 'bg-white/10' : 'bg-black/10'}`}
+          />
+        </div>
+        <div className="flex-1 space-y-1.5 p-2">
+          <div
+            className={`h-1.5 w-3/5 rounded-full ${appearance === 'dark' ? 'bg-white/35' : 'bg-black/20'}`}
+          />
+          <div
+            className={`h-1 w-full rounded-full ${appearance === 'dark' ? 'bg-white/10' : 'bg-black/10'}`}
+          />
+          <div
+            className={`h-1 w-4/5 rounded-full ${appearance === 'dark' ? 'bg-white/10' : 'bg-black/10'}`}
+          />
+        </div>
+      </div>
     </div>
   )
 }
