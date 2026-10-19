@@ -866,7 +866,7 @@ function ThemePreview({ appearance }: { appearance: (typeof THEMES)[number] }) {
   return (
     <div
       aria-hidden="true"
-      className={`relative h-14 overflow-hidden rounded-md border border-black/10 ${appearance === 'light' ? 'bg-[#f9fafb]' : appearance === 'dark' ? 'bg-[#191b20]' : 'bg-[linear-gradient(110deg,#f9fafb_50%,#191b20_50%)]'}`}
+      className={`relative h-14 overflow-hidden rounded-md border border-black/10 ${appearance === 'light' ? 'bg-[#f9fafb]' : appearance === 'dark' ? 'bg-[#191b20]' : 'bg-[linear-gradient(110deg,#f9fafb_calc(50%_-_0.5px),#191b20_calc(50%_+_0.5px))]'}`}
     >
       <div
         className={`flex h-4 items-center gap-1 border-b px-2 ${appearance === 'dark' ? 'border-white/10' : 'border-black/10'}`}
