@@ -171,7 +171,7 @@ class ResourceMemoryLinkService:
         task_result: Optional[Dict[str, Any]] = None
 
         async with self._reason_session_lock:
-            session = await self._session_service.get(
+            session = await self._session_service.open(
                 session_id,
                 ctx,
                 auto_create=True,
@@ -242,7 +242,7 @@ class ResourceMemoryLinkService:
         task_result: Optional[Dict[str, Any]] = None
 
         async with self._reason_session_lock:
-            session = await self._session_service.get(
+            session = await self._session_service.open(
                 session_id,
                 ctx,
                 auto_create=True,
