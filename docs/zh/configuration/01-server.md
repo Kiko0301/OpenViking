@@ -196,6 +196,9 @@ Search 和 Find 请求的默认 `limit` 为 `10`，可以在每次 API 或 SDK �
     "parse_output": {
       "mode": "agfs"
     }
+  },
+  "parser": {
+    "download_temp_dir": "/data/openviking/parser-tmp"
   }
 }
 ```
@@ -217,6 +220,14 @@ Search 和 Find 请求的默认 `limit` 为 `10`，可以在每次 API 或 SDK �
 `parse_output.mode=local` 可避免把 parser 中间产物写入共享 AGFS。当前 worker
 必须在下游任务入队前把所需字节提交到正式资源树。产物会在内容提交后清理；
 请为 `local_root` 预留足够空间以容纳并发导入。
+
+### `parser`
+
+| 字段 | 类型 / 常用值 | 默认值 | 作用 |
+|---|---|---|---|
+| `download_temp_dir` | 路径或 `null` | 系统临时目录 | 内置 parser 下载文件、Git checkout 和压缩包解压使用的临时目录 |
+
+配置后，parser 会在该目录下创建带有 `ov_git_`、`ov_zip_` 等前缀的临时目录；未配置时继续使用系统临时目录。
 
 ## 队列 Worker 配置
 

@@ -160,6 +160,18 @@ class ParserApiConfig(BaseModel):
         return self
 
 
+class ParserRuntimeConfig(BaseModel):
+    """Runtime directories used by built-in parser download/extraction paths."""
+
+    download_temp_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Directory for parser-owned downloads, Git checkouts, and archive extraction. "
+            "Defaults to the system temporary directory."
+        ),
+    )
+
+
 class CompileApiConfig(BaseModel):
     """Configuration for the external Compile task API."""
 
@@ -211,6 +223,11 @@ class OpenVikingConfig(BaseModel):
 
     storage: StorageConfig = Field(
         default_factory=StorageConfig, description="Storage configuration"
+    )
+
+    parser: ParserRuntimeConfig = Field(
+        default_factory=ParserRuntimeConfig,
+        description="Runtime directories used by built-in parsers",
     )
 
     embedding: EmbeddingConfig = Field(
