@@ -787,7 +787,7 @@ async def remember(messages: list[StoreMessage]) -> str:
     service = get_service()
     ctx = _get_ctx()
     session_id = f"mcp-store-{uuid.uuid4().hex[:12]}"
-    session = await service.sessions.get(session_id, ctx, auto_create=True)
+    session = await service.sessions.open(session_id, ctx, auto_create=True)
     for msg in messages:
         if msg.content:
             add_async = getattr(session, "add_message_async", None)
