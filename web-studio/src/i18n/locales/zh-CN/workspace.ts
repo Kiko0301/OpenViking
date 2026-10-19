@@ -33,6 +33,7 @@ const workspace = {
       defaultTitle: 'OpenViking Studio',
     },
     navigation: {
+      arranger: { title: '编排' },
       compile: { title: '编译' },
       home: {
         title: '首页',

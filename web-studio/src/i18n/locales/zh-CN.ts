@@ -6,8 +6,10 @@ import workspace from './zh-CN/workspace'
 import resources from './zh-CN/resources'
 import activity from './zh-CN/activity'
 import memoryTemplates from './zh-CN/memory-templates'
+import arranger from './zh-CN/arranger'
 
 const zhCN = {
+  arranger,
   gateway,
   compile,
   vikingbot,

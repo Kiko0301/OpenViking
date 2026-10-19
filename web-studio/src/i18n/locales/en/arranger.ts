@@ -1,0 +1,147 @@
+const arranger = {
+  title: 'Arrange',
+  description:
+    'Organize business knowledge and live data into context that agents can read directly, with less tool and argument guesswork.',
+  shortDescription: 'Organize static knowledge and live data',
+  pathLabel: 'Root Viking URI',
+  loading: 'Loading context',
+  searchPlaceholder: 'Filter loaded nodes',
+  emptySummary: 'No directory summary',
+  confirmDelete: 'Delete {{uri}} from OpenViking?',
+  start: {
+    liveDescription:
+      'Choose an MCP tool and preset known arguments so agents can fetch current data when reading the node.',
+    liveTitle: 'Live context',
+    pathHint:
+      'For example, viking://resources/arrange. The path is preserved in the URL.',
+    pathTitle: 'Choose a directory to arrange',
+    staticDescription:
+      'Organize directories, Markdown, and existing resources. Changes are written to OpenViking immediately.',
+    staticTitle: 'Static content',
+  },
+  actions: {
+    cancel: 'Cancel',
+    confirm: 'Confirm',
+    connectionSettings: 'Connection settings',
+    addResource: 'Add resource',
+    copy: 'Copy',
+    createRoot: 'Create this directory',
+    delete: 'Delete',
+    editMount: 'Edit mount',
+    fullscreen: 'Toggle fullscreen',
+    load: 'Load',
+    loadMore: 'Load more',
+    mount: 'Mount context',
+    move: 'Move',
+    newDirectory: 'New directory',
+    newFile: 'New document',
+    refresh: 'Refresh',
+    save: 'Save now',
+  },
+  views: {
+    graph: 'Graph view',
+    list: 'List view',
+  },
+  fields: {
+    arguments: 'Preset arguments',
+    description: 'Description',
+    mountNamePlaceholder: 'status.md',
+    name: 'Name',
+    optional: 'Optional',
+    required: 'Required',
+    server: 'MCP server',
+    summary: 'Directory summary',
+    tags: 'Tags',
+    tagsHint: 'Separate multiple tags with commas.',
+    tagsPlaceholder: 'production, observability',
+    targetUri: 'Destination URI',
+    timeout: 'Timeout (seconds)',
+    title: 'Title',
+    tool: 'Tool',
+    toolUri: 'Tool URI',
+  },
+  live: {
+    badge: 'Live',
+    boundTool: 'Bound tool',
+    destructiveHint: 'May modify data',
+    incomplete: 'Live context inventory unavailable',
+    mutationsBlocked: 'Mutating operations are blocked until mounts load.',
+    noDescription: 'This tool does not provide a description.',
+    overview: 'Node details',
+    rawConfig: 'Raw config',
+    readOnly: 'Live context is read-only',
+    readOnlyHint: 'Read-only tool',
+    runtime: 'Runtime policy',
+    timeoutValue: '{{value}} second attempt timeout',
+  },
+  mount: {
+    argumentsDescription:
+      'Generated from the selected tool input schema. Required values must be provided.',
+    argumentsTitle: 'Tool arguments',
+    catalogIncomplete: 'Some tool catalogs failed to load',
+    chooseToolFirst:
+      'Select a tool to generate its argument form automatically.',
+    loadingTools: 'Loading servers',
+    noArguments: 'This tool does not require preset arguments.',
+    notSet: 'Not set',
+    selectServer: 'Select an MCP server',
+    selectTool: 'Select a tool',
+    selectValue: 'Select a value',
+    toolCount: '{{count}} tools',
+  },
+  save: {
+    conflict: 'Conflict detected. Your input is preserved.',
+    dirty: 'Unsaved changes',
+    error: 'Save failed',
+    saved: 'Saved',
+    saving: 'Saving',
+  },
+  dialogs: {
+    addResource: {
+      description:
+        'Import a local file or public source into the selected directory.',
+    },
+    copy: {
+      title: 'Copy resource',
+      description: 'Choose the new URI inside the loaded root.',
+    },
+    file: {
+      title: 'New document',
+      description:
+        'Create a text or Markdown document in the selected directory.',
+    },
+    mkdir: {
+      title: 'New directory',
+      description: 'Create a directory in the selected location.',
+    },
+    mount: {
+      title: 'Mount live context',
+      description: 'Bind an MCP tool to a Markdown context node.',
+    },
+    move: {
+      title: 'Move resource',
+      description: 'Choose the new URI inside the loaded root.',
+    },
+  },
+  errors: {
+    loadRoot: 'Could not load root',
+    read: 'Could not read this file',
+    rootNotDirectory: 'The selected root is not a directory',
+  },
+  messages: {
+    deleted: 'Resource deleted',
+  },
+  validation: {
+    invalidArguments: 'Check required tool arguments and their data formats.',
+    invalidTimeout: 'Timeout must be a number greater than 0.',
+    mountRequired: 'Name, tool, and title are required.',
+    required: 'This argument is required.',
+    selectTool: 'Select a valid MCP tool.',
+  },
+  values: {
+    false: 'No',
+    true: 'Yes',
+  },
+} as const
+
+export default arranger

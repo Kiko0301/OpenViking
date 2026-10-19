@@ -6,8 +6,10 @@ import resources from './en/resources'
 import activity from './en/activity'
 import memoryTemplates from './en/memory-templates'
 import gateway from './en/gateway'
+import arranger from './en/arranger'
 
 const en = {
+  arranger,
   gateway,
   compile,
   vikingbot,

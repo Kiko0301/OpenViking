@@ -23,6 +23,7 @@ import {
   UsersRoundIcon,
   WaypointsIcon,
   WorkflowIcon,
+  NetworkIcon,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useTheme } from 'next-themes'
@@ -101,6 +102,13 @@ const NAV_ITEMS: readonly NavItem[] = [
     section: 'workspace',
     titleKey: 'navigation.filesystem.title',
     to: '/filesystem',
+  },
+  {
+    icon: NetworkIcon,
+    id: 'arranger',
+    section: 'workspace',
+    titleKey: 'navigation.arranger.title',
+    to: '/arranger',
   },
   {
     icon: BotIcon,
