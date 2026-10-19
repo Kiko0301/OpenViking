@@ -68,6 +68,8 @@ await client.commitSession("s1", { keepRecentCount: 0, eventTags: [] });
 await client.addMCP("weather", "https://mcp.example.com/api", {
   Authorization: "Bearer token",
 });
+// 工具摘要和索引默认在后台继续处理。
+// 需要等待完成时，将 { wait: true } 作为第四个参数传入。
 const tools = await client.findMCPTools("当前天气", 5);
 const mounted = await client.mountMCPTool(
   "viking://agent/tools/weather/current.json",

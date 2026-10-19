@@ -18,6 +18,9 @@ export type LiveContextMount = {
 
 export type JsonSchema = {
   type?: string | string[]
+  anyOf?: JsonSchema[]
+  oneOf?: JsonSchema[]
+  allOf?: JsonSchema[]
   title?: string
   description?: string
   default?: unknown

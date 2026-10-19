@@ -10,14 +10,19 @@ import (
 )
 
 // AddMCP registers a Streamable HTTP MCP server and discovers its tools.
-func (c *Client) AddMCP(ctx context.Context, name string, serverURL string, headers map[string]string) (map[string]any, error) {
+func (c *Client) AddMCP(ctx context.Context, name string, serverURL string, headers map[string]string, opts ...*WaitOptions) (map[string]any, error) {
 	if headers == nil {
 		headers = map[string]string{}
+	}
+	wait := false
+	if len(opts) > 0 && opts[0] != nil {
+		wait = opts[0].Wait
 	}
 	payload := map[string]any{
 		"name":    name,
 		"url":     serverURL,
 		"headers": headers,
+		"wait":    wait,
 	}
 	var result map[string]any
 	err := c.doJSON(ctx, http.MethodPost, "/api/v1/mcps", nil, payload, &result)
@@ -72,9 +77,13 @@ func (c *Client) GetMCP(ctx context.Context, name string) (map[string]any, error
 }
 
 // SyncMCP refreshes an MCP tool catalog and reports affected live context mounts.
-func (c *Client) SyncMCP(ctx context.Context, name string) (map[string]any, error) {
+func (c *Client) SyncMCP(ctx context.Context, name string, opts ...*WaitOptions) (map[string]any, error) {
+	wait := false
+	if len(opts) > 0 && opts[0] != nil {
+		wait = opts[0].Wait
+	}
 	var result map[string]any
-	err := c.doJSON(ctx, http.MethodPost, "/api/v1/mcps/"+url.PathEscape(name)+"/sync", nil, nil, &result)
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/mcps/"+url.PathEscape(name)+"/sync", nil, map[string]any{"wait": wait}, &result)
 	return result, err
 }
 

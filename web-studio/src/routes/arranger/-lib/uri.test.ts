@@ -4,7 +4,10 @@ import {
   assertMutationBoundary,
   isWithinRoot,
   joinVikingUri,
+  mcpServerNameFromToolUri,
   normalizeVikingUri,
+  parentVikingUri,
+  resolveMountNodeUri,
 } from './uri'
 
 describe('arranger Viking URI boundaries', () => {
@@ -13,6 +16,14 @@ describe('arranger Viking URI boundaries', () => {
       'viking://resources/team',
     )
     expect(() => normalizeVikingUri('viking://resources/../secret')).toThrow()
+    expect(
+      parentVikingUri('viking://resources/arrange/knowledge_base_server/'),
+    ).toBe('viking://resources/arrange')
+    expect(
+      parentVikingUri(
+        'viking://resources/arrange/knowledge_base_server/error.log.md',
+      ),
+    ).toBe('viking://resources/arrange/knowledge_base_server')
   })
 
   it('compares path segments instead of string prefixes', () => {
@@ -45,5 +56,33 @@ describe('arranger Viking URI boundaries', () => {
     expect(joinVikingUri('viking://resources/arrange', 'notes.md')).toBe(
       'viking://resources/arrange/notes.md',
     )
+  })
+
+  it('derives the MCP server from a Tool URI', () => {
+    expect(
+      mcpServerNameFromToolUri(
+        'viking://agent/tools/mcp_service_volcengine_tls/search_logs_v2_tool.json',
+      ),
+    ).toBe('mcp_service_volcengine_tls')
+    expect(
+      mcpServerNameFromToolUri('viking://resources/arrange/status.md'),
+    ).toBeNull()
+    expect(mcpServerNameFromToolUri('not-a-viking-uri')).toBeNull()
+  })
+
+  it('keeps an edited mount at its existing URI', () => {
+    expect(
+      resolveMountNodeUri(
+        'viking://resources/arrange',
+        'error.log.md',
+        'viking://resources/arrange/knowledge_base_server/error.log.md',
+      ),
+    ).toBe('viking://resources/arrange/knowledge_base_server/error.log.md')
+    expect(
+      resolveMountNodeUri(
+        'viking://resources/arrange/knowledge_base_server/',
+        'new.log.md',
+      ),
+    ).toBe('viking://resources/arrange/knowledge_base_server/new.log.md')
   })
 })

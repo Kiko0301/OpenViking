@@ -246,6 +246,20 @@ export async function readTextDocument(uri: string): Promise<TextDocument> {
   }
 }
 
+export async function readLiveContext(uri: string): Promise<unknown> {
+  return getOvResult<unknown>(
+    getOvClient().instance.get('/api/v1/content/read', {
+      baseURL: apiBaseUrl(),
+      params: {
+        uri: normalizeVikingUri(uri),
+        offset: 0,
+        limit: -1,
+        raw: false,
+      },
+    }),
+  )
+}
+
 export function hashText(content: string): string {
   return bytesToHex(sha256(new TextEncoder().encode(content)))
 }

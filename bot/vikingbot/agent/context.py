@@ -201,6 +201,18 @@ The following local and remote Skills extend your capabilities.
         # OpenViking identity model, the bot API key owns the User, and the
         # message sender is represented as a peer under that User.
         if ov_tools_enable:
+            parts.append(
+                "## OpenViking Live Context and MCP\n\n"
+                "- For operational or real-time data, first use openviking_search and "
+                "openviking_multi_read to look for an already-arranged Live Context node. "
+                "Its preset arguments are authoritative and must not be replaced or inferred.\n"
+                "- If no suitable Live Context node exists and the MCP discovery tools are "
+                "available, use openviking_find_mcp_tools as the fallback. Select one returned "
+                "candidate, use its URI unchanged, and construct arguments strictly from its "
+                "inputSchema before calling openviking_invoke_mcp_tool.\n"
+                "- Inspect the discovered annotations before invocation. MCP calls may have "
+                "external side effects and must not be retried after an ambiguous failure."
+            )
             # Fetch the authenticated actor's peer profile.
             start = _time.time()
             profile = await self.memory.get_viking_peer_profile(

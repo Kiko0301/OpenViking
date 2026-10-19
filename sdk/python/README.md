@@ -297,6 +297,8 @@ client.add_mcp(
     url="https://mcp.example.com/api",
     headers={"Authorization": "Bearer token"},
 )
+# Tool summaries and indexing continue in the background by default.
+# Pass wait=True when they must finish before this call returns.
 tools = client.find_mcp_tools("current weather", limit=5)
 mounted = client.mount_mcp_tool(
     tool_uri="viking://agent/tools/weather/current.json",

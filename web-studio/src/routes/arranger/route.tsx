@@ -99,9 +99,11 @@ import {
 } from './-lib/schema'
 import {
   joinVikingUri,
+  mcpServerNameFromToolUri,
   nameFromVikingUri,
   normalizeVikingUri,
   parentVikingUri,
+  resolveMountNodeUri,
 } from './-lib/uri'
 
 const ContextGraph = lazy(() =>
@@ -120,6 +122,7 @@ type ActionKind = 'copy' | 'file' | 'mkdir' | 'mount' | 'move'
 
 type ActionState = {
   kind: ActionKind
+  parentUri?: string
   source?: VikingFsEntry
 } | null
 
@@ -165,7 +168,6 @@ function ArrangerWorkbench() {
   const [directoryLimits, setDirectoryLimits] = useState<
     Record<string, number>
   >({})
-  const [selected, setSelected] = useState<VikingFsEntry | null>(null)
   const [filter, setFilter] = useState('')
   const [action, setAction] = useState<ActionState>(null)
   const [addResourceOpen, setAddResourceOpen] = useState(false)
@@ -232,20 +234,18 @@ function ArrangerWorkbench() {
     mounts: new Map(),
   }
   const rootEntry = rootQuery.data || null
+  const selected = useMemo(() => {
+    if (!search.selected) return null
+    return (
+      entries.find((entry) => entry.uri === search.selected) ||
+      (rootEntry?.uri === search.selected ? rootEntry : null)
+    )
+  }, [entries, rootEntry, search.selected])
 
   useEffect(() => {
     setExpanded(new Set(rootUri ? [rootUri] : []))
     setDirectoryLimits({})
-    setSelected(null)
   }, [rootUri, identityScopeKey])
-
-  useEffect(() => {
-    if (!search.selected || selected?.uri === search.selected) return
-    const match =
-      entries.find((entry) => entry.uri === search.selected) ||
-      (rootEntry?.uri === search.selected ? rootEntry : null)
-    if (match) setSelected(match)
-  }, [entries, rootEntry, search.selected, selected?.uri])
 
   const refresh = useCallback(async () => {
     await queryClient.invalidateQueries({
@@ -255,7 +255,6 @@ function ArrangerWorkbench() {
 
   const choose = useCallback(
     (entry: VikingFsEntry) => {
-      setSelected(entry)
       void navigate({
         search: (previous) => ({ ...previous, selected: entry.uri }),
         replace: true,
@@ -299,7 +298,10 @@ function ArrangerWorkbench() {
   const selectedDirectory = selected
     ? selected.isDir
       ? selected
-      : entries.find((entry) => entry.uri === parentVikingUri(selected.uri))
+      : entries.find(
+          (entry) =>
+            normalizeVikingUri(entry.uri) === parentVikingUri(selected.uri),
+        )
     : rootEntry
   const createParent = selectedDirectory?.uri || rootUri
 
@@ -447,7 +449,9 @@ function ArrangerWorkbench() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => setAction({ kind: 'mkdir' })}
+              onClick={() =>
+                setAction({ kind: 'mkdir', parentUri: createParent })
+              }
             >
               <FolderPlusIcon />
               {t('actions.newDirectory')}
@@ -455,7 +459,9 @@ function ArrangerWorkbench() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => setAction({ kind: 'file' })}
+              onClick={() =>
+                setAction({ kind: 'file', parentUri: createParent })
+              }
             >
               <FilePlus2Icon />
               {t('actions.newFile')}
@@ -463,7 +469,9 @@ function ArrangerWorkbench() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => setAction({ kind: 'mount' })}
+              onClick={() =>
+                setAction({ kind: 'mount', parentUri: createParent })
+              }
             >
               <CableIcon />
               {t('actions.mount')}
@@ -560,9 +568,18 @@ function ArrangerWorkbench() {
                   <ContextGraph
                     root={rootEntry}
                     entries={filteredEntries}
+                    expanded={expanded}
                     selectedUri={selected?.uri}
                     isLive={(uri) => liveIndex.mounts.has(uri)}
                     onSelect={choose}
+                    onToggle={(uri) =>
+                      setExpanded((current) => {
+                        const next = new Set(current)
+                        if (next.has(uri)) next.delete(uri)
+                        else next.add(uri)
+                        return next
+                      })
+                    }
                   />
                 </Suspense>
               ) : (
@@ -581,7 +598,11 @@ function ArrangerWorkbench() {
               liveMount={liveIndex.mounts.get((selected || rootEntry).uri)}
               mountsComplete={liveIndex.complete}
               onAction={(kind) =>
-                setAction({ kind, source: selected || rootEntry })
+                setAction({
+                  kind,
+                  parentUri: createParent,
+                  source: selected || rootEntry,
+                })
               }
               onDelete={async () => {
                 const entry = selected || rootEntry
@@ -597,7 +618,13 @@ function ArrangerWorkbench() {
                       source: entry,
                     })
                   }
-                  setSelected(null)
+                  void navigate({
+                    search: (previous) => ({
+                      ...previous,
+                      selected: rootUri,
+                    }),
+                    replace: true,
+                  })
                   await refresh()
                   toast.success(t('messages.deleted'))
                 } catch (error) {
@@ -617,7 +644,7 @@ function ArrangerWorkbench() {
           action={action}
           catalog={catalogQuery.data}
           catalogLoading={catalogQuery.isLoading}
-          defaultParent={createParent}
+          defaultParent={action.parentUri || createParent}
           liveIndex={liveIndex}
           rootUri={rootUri}
           onClose={() => setAction(null)}
@@ -780,7 +807,7 @@ function ContextTree({
       </button>
       {entry.isDir && expanded.has(entry.uri) && (
         <>
-          {(children.get(entry.uri) || []).map((child) =>
+          {(children.get(normalizeVikingUri(entry.uri)) || []).map((child) =>
             renderEntry(child, depth + 1),
           )}
           {directoriesWithMore.has(entry.uri) && (
@@ -1151,45 +1178,49 @@ function ActionDialog({
   )
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const initializedMountRef = useRef<string | null>(null)
+  const initializedArgumentsRef = useRef<string | null>(null)
   const selectedTool = catalog?.tools.find((tool) => tool.uri === toolUri)
   const serverTools =
     catalog?.servers.find((server) => server.name === serverName)?.tools || []
 
   useEffect(() => {
     const source = action.source
-    if (!source) return
+    if (!source || initializedMountRef.current === source.uri) return
     const mount = liveIndex.mounts.get(source.uri)
     if (!mount) return
+    initializedMountRef.current = source.uri
     setName(source.name)
     setToolUri(mount.tool_uri)
-    setServerName(mount.mcp)
+    setServerName(mcpServerNameFromToolUri(mount.tool_uri) || mount.mcp)
     setTitle(mount.title || nameFromVikingUri(source.uri))
+    setDescription(mount.description || '')
+    setTimeoutValue(String(mount.timeout_seconds || 60))
     setTags((mount.tags || []).join(', '))
-    void readTextDocument(source.uri).then((document) => {
-      const metadata = parseLiveContextMetadata(document.content)
-      if (!metadata) return
-      setDescription(metadata.description || '')
-      setTimeoutValue(String(metadata.timeout_seconds || 60))
-      setTitle(metadata.title || nameFromVikingUri(source.uri))
-      setToolUri(metadata.tool_uri || mount.tool_uri)
-      setTags((metadata.tags || mount.tags || []).join(', '))
-    })
   }, [action.source, liveIndex.mounts])
 
   useEffect(() => {
-    if (action.kind !== 'mount' || serverName || !catalog?.servers.length)
+    if (
+      action.kind !== 'mount' ||
+      action.source ||
+      serverName ||
+      !catalog?.servers.length
+    )
       return
     setServerName(catalog.servers[0].name)
-  }, [action.kind, catalog?.servers, serverName])
+  }, [action.kind, action.source, catalog?.servers, serverName])
 
   useEffect(() => {
-    if (!selectedTool) return
-    const mount = action.source
-      ? liveIndex.mounts.get(action.source.uri)
-      : undefined
+    const source = action.source
+    if (!source || !selectedTool) return
+    const mount = liveIndex.mounts.get(source.uri)
+    if (!mount || selectedTool.uri !== mount.tool_uri) return
+    const initializationKey = `${source.uri}:${selectedTool.uri}`
+    if (initializedArgumentsRef.current === initializationKey) return
+    initializedArgumentsRef.current = initializationKey
     const values = initialSchemaArguments(
       selectedTool.tool.inputSchema,
-      mount?.arguments,
+      mount.arguments,
     )
     setArgumentValues(
       argumentsToInputValues(selectedTool.tool.inputSchema, values),
@@ -1228,7 +1259,11 @@ function ActionDialog({
         const input: MountInput = {
           arguments: validated.arguments,
           description: description || undefined,
-          node_uri: joinVikingUri(defaultParent, name),
+          node_uri: resolveMountNodeUri(
+            defaultParent,
+            name,
+            action.source?.uri,
+          ),
           tags: tags
             .split(',')
             .map((tag) => tag.trim())
@@ -1311,6 +1346,7 @@ function ActionDialog({
             <Field label={t('fields.name')} required>
               <Input
                 value={name}
+                readOnly={action.kind === 'mount' && Boolean(action.source)}
                 onChange={(event) => setName(event.target.value)}
                 placeholder={
                   action.kind === 'mount'
@@ -1376,8 +1412,6 @@ function ActionDialog({
                       setToolUri(uri)
                       setArgumentErrors({})
                       if (!tool) return
-                      setTitle(tool.tool.title || tool.tool.name)
-                      setDescription(tool.tool.description || '')
                       const defaults = initialSchemaArguments(
                         tool.tool.inputSchema,
                       )

@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest'
 import {
   argumentsToInputValues,
   initialSchemaArguments,
+  resolveSchema,
   schemaFields,
+  schemaType,
   validateSchemaArguments,
 } from './schema'
 
@@ -48,6 +50,40 @@ describe('MCP input schema forms', () => {
         a: 'required',
         b: 'Expected a number',
       },
+    })
+  })
+
+  it('parses nullable anyOf values using their non-null type', () => {
+    const nullableSchema = {
+      properties: {
+        limit: {
+          anyOf: [{ type: 'integer' }, { type: 'null' }],
+          default: 10,
+        },
+        start_time: {
+          anyOf: [{ type: 'integer' }, { type: 'null' }],
+          default: null,
+        },
+      },
+      type: 'object',
+    } as const
+
+    expect(schemaType(nullableSchema.properties.start_time)).toBe('integer')
+    expect(resolveSchema(nullableSchema.properties.start_time)).toEqual({
+      default: null,
+      type: 'integer',
+    })
+    expect(
+      validateSchemaArguments(nullableSchema, {
+        limit: '10',
+        start_time: '1792310712773',
+      }),
+    ).toEqual({
+      arguments: {
+        limit: 10,
+        start_time: 1792310712773,
+      },
+      errors: {},
     })
   })
 })

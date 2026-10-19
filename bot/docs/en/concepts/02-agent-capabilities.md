@@ -60,6 +60,22 @@ Each MCP Server can configure:
 
 MCP parameter Schemas are normalized for compatibility before being passed to the model and ToolRegistry.
 
+When the OpenViking Server connected to VikingBot has registered MCP Servers, VikingBot
+also exposes two stable OpenViking tools:
+
+- `openviking_find_mcp_tools` dynamically discovers tools by intent and returns their
+  complete `inputSchema` and annotations.
+- `openviking_invoke_mcp_tool` uses a discovered URI to execute the tool through
+  OpenViking.
+
+This path does not require duplicating upstream MCP configuration under
+`bot.tools.mcp_servers`, and discovered tools are not dynamically registered in
+VikingBot. OpenViking owns the upstream connection, credentials, and argument
+validation while VikingBot keeps only the two stable meta-tools. The Agent first
+searches for an arranged Live Context node and reads it; dynamic discovery is the
+fallback when no suitable node exists. `readonly` mode exposes discovery only, and
+Studio-managed group conversations disable both tools by default.
+
 ## Subagents
 
 The main Agent uses `spawn` to submit independent work to SubagentManager. A subagent shares the model and corresponding workspace but receives a restricted tool set:

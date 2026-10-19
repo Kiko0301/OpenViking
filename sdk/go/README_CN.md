@@ -143,6 +143,8 @@ _, err := client.AddMCP(
     "https://mcp.example.com/api",
     map[string]string{"Authorization": "Bearer token"},
 )
+// 工具摘要和索引默认在后台继续处理。
+// 需要等待完成时，在最后传入 &openviking.WaitOptions{Wait: true}。
 tools, err := client.FindMCPTools(ctx, "当前天气", 5)
 mounted, err := client.MountMCPTool(
     ctx,

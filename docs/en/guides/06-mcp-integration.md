@@ -3,6 +3,8 @@
 OpenViking Server includes an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) endpoint. Clients supporting Streamable HTTP can connect directly. Clients supporting only stdio can use the proxy in the [Agent Plugins package](../agent-integrations/15-agent-plugins.md).
 
 > **Quick setup?** See [MCP Clients](../agent-integrations/06-mcp-clients.md) for client configuration snippets and platform-specific notes. This page covers the full tool reference and advanced configuration.
+>
+> **Connecting an external MCP server?** See [Live context integration and arrangement](23-live-context-arrangement.md) for `ov mcps`, the Tool Catalog, live nodes, Studio Arranger, and Context as Code.
 
 ## Prerequisites
 

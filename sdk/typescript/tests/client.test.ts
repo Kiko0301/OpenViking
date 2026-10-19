@@ -1019,6 +1019,7 @@ describe("OpenVikingClient", () => {
       name: "demo",
       url: "https://mcp.example.com/api",
       headers: { Authorization: "Bearer secret" },
+      wait: false,
     });
     expect(JSON.parse(String(fetcher.mock.calls[3]![1]?.body))).toEqual({
       query: "weather forecast",
@@ -1028,6 +1029,9 @@ describe("OpenVikingClient", () => {
       name: "demo",
       url: "https://mcp.example.com/api",
       headers: {},
+    });
+    expect(JSON.parse(String(fetcher.mock.calls[6]![1]?.body))).toEqual({
+      wait: false,
     });
     expect(JSON.parse(String(fetcher.mock.calls[8]![1]?.body))).toEqual({
       uri: "viking://agent/tools/demo/current.json",

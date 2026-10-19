@@ -68,6 +68,7 @@ fn response_payload(response: &Value) -> &Value {
 pub async fn add(
     client: &HttpClient,
     raw_config: &str,
+    wait: bool,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -77,10 +78,18 @@ pub async fn add(
         let response: Value = client
             .post(
                 "/api/v1/mcps",
-                &json!({"name": name, "url": server.url, "headers": server.headers}),
+                &json!({
+                    "name": name,
+                    "url": server.url,
+                    "headers": server.headers,
+                    "wait": wait,
+                }),
             )
             .await?;
         responses.push(response);
+    }
+    if !wait && matches!(output_format, OutputFormat::Table) {
+        eprintln!("Note: MCP tool processing may continue in the background.");
     }
     if responses.len() == 1 {
         print_response(&responses[0], output_format, compact);
@@ -359,13 +368,20 @@ fn push_tool_arguments(lines: &mut Vec<String>, schema: Option<&Value>) {
 pub async fn sync(
     client: &HttpClient,
     name: &str,
+    wait: bool,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
     validate_server_name(name)?;
     let response: Value = client
-        .post(&format!("/api/v1/mcps/{name}/sync"), &json!({}))
+        .post(
+            &format!("/api/v1/mcps/{name}/sync"),
+            &json!({"wait": wait}),
+        )
         .await?;
+    if !wait && matches!(output_format, OutputFormat::Table) {
+        eprintln!("Note: MCP tool processing may continue in the background.");
+    }
     if let Some(rendered) = render_sync_for_table(&response, output_format) {
         println!("{rendered}");
     } else {

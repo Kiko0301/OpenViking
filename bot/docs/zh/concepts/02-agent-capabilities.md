@@ -60,6 +60,18 @@ OpenAPI 的 `disabled_tools` 可以按请求隐藏工具；渠道的 `ov_tools_e
 
 MCP 参数 Schema 会先做兼容转换，再交给模型和 ToolRegistry。
 
+当 VikingBot 连接的 OpenViking Server 已注册 MCP Server 时，还会提供两个固定的
+OpenViking 工具：
+
+- `openviking_find_mcp_tools`：按意图动态发现工具并返回完整 `inputSchema` 和 annotations；
+- `openviking_invoke_mcp_tool`：使用发现结果中的 URI，通过 OpenViking 代理执行工具。
+
+这条链路不要求在 `bot.tools.mcp_servers` 中重复配置上游 MCP，也不会把发现到的工具动态
+注册到 VikingBot。OpenViking 负责上游连接、凭证和参数校验，VikingBot 只保留两个稳定的
+元工具。Agent 会优先搜索并读取已经编排好的 Live Context 节点；没有合适节点时才进行动态
+工具发现。`readonly` 模式只提供发现工具，不提供调用工具；Studio 托管群聊默认同时禁用
+这两个工具。
+
 ## 子 Agent
 
 主 Agent 使用 `spawn` 把独立任务交给 SubagentManager。子 Agent 共享模型和对应工作区，但使用受限工具集：

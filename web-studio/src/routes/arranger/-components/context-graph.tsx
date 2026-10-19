@@ -8,24 +8,34 @@ import {
   ReactFlow,
 } from '@xyflow/react'
 import type { NodeProps } from '@xyflow/react'
-import { CableIcon, FileTextIcon, FolderIcon } from 'lucide-react'
+import {
+  CableIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  FileTextIcon,
+  FolderIcon,
+} from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 
 import '@xyflow/react/dist/style.css'
 
 import type { VikingFsEntry } from '#/routes/resources/-types/viking-fm'
 import { cn } from '#/lib/utils'
+import { normalizeVikingUri, parentVikingUri } from '../-lib/uri'
 
 type GraphData = {
   entry: VikingFsEntry
+  expanded: boolean
   isLive: boolean
   label: string
 }
 
 type ContextGraphProps = {
   entries: VikingFsEntry[]
+  expanded: Set<string>
   isLive: (uri: string) => boolean
   onSelect: (entry: VikingFsEntry) => void
+  onToggle: (uri: string) => void
   root: VikingFsEntry
   selectedUri?: string
 }
@@ -52,6 +62,12 @@ function ResourceNode({ data, selected }: NodeProps) {
         )}
       />
       <span className="truncate">{value.label}</span>
+      {value.entry.isDir &&
+        (value.expanded ? (
+          <ChevronDownIcon className="ml-auto size-3.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRightIcon className="ml-auto size-3.5 shrink-0 text-muted-foreground" />
+        ))}
       <Handle type="source" position={Position.Right} className="opacity-0" />
     </div>
   )
@@ -59,14 +75,12 @@ function ResourceNode({ data, selected }: NodeProps) {
 
 const nodeTypes = { resource: ResourceNode }
 
-function parentUri(uri: string): string {
-  return uri.slice(0, uri.lastIndexOf('/'))
-}
-
 export function ContextGraph({
   entries,
+  expanded,
   isLive,
   onSelect,
+  onToggle,
   root,
   selectedUri,
 }: ContextGraphProps) {
@@ -76,17 +90,18 @@ export function ContextGraph({
     graph.setGraph({ rankdir: 'LR', nodesep: 24, ranksep: 64 })
     const allEntries = [root, ...entries]
     for (const entry of allEntries) {
-      graph.setNode(entry.uri, { height: 44, width: 176 })
+      graph.setNode(normalizeVikingUri(entry.uri), { height: 44, width: 176 })
     }
     const nextEdges = entries
-      .filter((entry) => graph.hasNode(parentUri(entry.uri)))
+      .filter((entry) => graph.hasNode(parentVikingUri(entry.uri)))
       .map((entry) => {
-        const source = parentUri(entry.uri)
-        graph.setEdge(source, entry.uri)
+        const source = parentVikingUri(entry.uri)
+        const target = normalizeVikingUri(entry.uri)
+        graph.setEdge(source, target)
         return {
-          id: `${source}->${entry.uri}`,
+          id: `${source}->${target}`,
           source,
-          target: entry.uri,
+          target,
           type: 'smoothstep',
         }
       })
@@ -94,32 +109,42 @@ export function ContextGraph({
     return {
       edges: nextEdges,
       nodes: allEntries.map((entry) => {
-        const position = graph.node(entry.uri) as { x: number; y: number }
+        const id = normalizeVikingUri(entry.uri)
+        const position = graph.node(id) as { x: number; y: number }
         return {
-          id: entry.uri,
+          id,
           data: {
             entry,
+            expanded: expanded.has(entry.uri),
             isLive: isLive(entry.uri),
             label: entry.name || entry.uri,
           } satisfies GraphData,
           position: { x: position.x - 88, y: position.y - 22 },
-          selected: entry.uri === selectedUri,
+          selected:
+            selectedUri !== undefined &&
+            normalizeVikingUri(entry.uri) === normalizeVikingUri(selectedUri),
           type: 'resource',
         }
       }),
     }
-  }, [entries, isLive, root, selectedUri])
+  }, [entries, expanded, isLive, root, selectedUri])
 
   return (
     <ReactFlow
+      key={nodes.map((node) => node.id).join('|')}
       nodes={nodes}
       edges={edges}
       nodeTypes={nodeTypes}
       fitView
+      fitViewOptions={{ padding: 0.15 }}
       minZoom={0.35}
       maxZoom={1.6}
       nodesDraggable={false}
-      onNodeClick={(_, node) => onSelect((node.data as GraphData).entry)}
+      onNodeClick={(_, node) => {
+        const entry = (node.data as GraphData).entry
+        onSelect(entry)
+        if (entry.isDir) onToggle(entry.uri)
+      }}
       proOptions={{ hideAttribution: true }}
       className="bg-background"
     >

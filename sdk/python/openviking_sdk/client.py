@@ -954,11 +954,18 @@ class AsyncHTTPClient:
         name: str,
         url: str,
         headers: Optional[Mapping[str, str]] = None,
+        *,
+        wait: bool = False,
     ) -> Dict[str, Any]:
         response = await self._request(
             "POST",
             "/api/v1/mcps",
-            json={"name": name, "url": url, "headers": dict(headers or {})},
+            json={
+                "name": name,
+                "url": url,
+                "headers": dict(headers or {}),
+                "wait": wait,
+            },
         )
         return self._handle_response(response)
 
@@ -997,9 +1004,13 @@ class AsyncHTTPClient:
         response = await self._request("GET", f"/api/v1/mcps/{name_path}")
         return self._handle_response(response)
 
-    async def sync_mcp(self, name: str) -> Dict[str, Any]:
+    async def sync_mcp(self, name: str, *, wait: bool = False) -> Dict[str, Any]:
         name_path = self._path_segment(name)
-        response = await self._request("POST", f"/api/v1/mcps/{name_path}/sync")
+        response = await self._request(
+            "POST",
+            f"/api/v1/mcps/{name_path}/sync",
+            json={"wait": wait},
+        )
         return self._handle_response(response)
 
     async def get_mcp_status(self, name: str) -> Dict[str, Any]:
@@ -1457,8 +1468,6 @@ class AsyncHTTPClient:
         self._handle_response(response)
 
     async def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
-        response = await self._request(
-            "GET",
             "/api/v1/content/read",
             params={
                 "uri": VikingURI.normalize_file_reference(uri),
@@ -2667,8 +2676,10 @@ class SyncHTTPClient:
         name: str,
         url: str,
         headers: Optional[Mapping[str, str]] = None,
+        *,
+        wait: bool = False,
     ) -> Dict[str, Any]:
-        return run_async(self._async_client.add_mcp(name, url, headers=headers))
+        return run_async(self._async_client.add_mcp(name, url, headers=headers, wait=wait))
 
     def remove_mcp(self, name: str) -> Dict[str, Any]:
         return run_async(self._async_client.remove_mcp(name))
@@ -2690,8 +2701,8 @@ class SyncHTTPClient:
     def get_mcp(self, name: str) -> Dict[str, Any]:
         return run_async(self._async_client.get_mcp(name))
 
-    def sync_mcp(self, name: str) -> Dict[str, Any]:
-        return run_async(self._async_client.sync_mcp(name))
+    def sync_mcp(self, name: str, *, wait: bool = False) -> Dict[str, Any]:
+        return run_async(self._async_client.sync_mcp(name, wait=wait))
 
     def get_mcp_status(self, name: str) -> Dict[str, Any]:
         return run_async(self._async_client.get_mcp_status(name))
@@ -2986,13 +2997,11 @@ class SyncHTTPClient:
     def mv(self, from_uri: str, to_uri: str) -> None:
         run_async(self._async_client.mv(from_uri, to_uri))
 
-    def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
+    def read(self, uri: str, offset: int = 0, limit: int = -1) -> Union[str, Dict[str, Any]]:
         return run_async(self._async_client.read(uri, offset=offset, limit=limit))
 
     def read_raw(self, uri: str, offset: int = 0, limit: int = -1) -> str:
-        return run_async(self._async_client.read_raw(uri, offset=offset, limit=limit))
-
-    def download_bytes(self, uri: str) -> bytes:
+    def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
         return run_async(self._async_client.download_bytes(uri))
 
     def abstract(self, uri: str) -> str:

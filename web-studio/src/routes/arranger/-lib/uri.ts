@@ -47,6 +47,27 @@ export function nameFromVikingUri(uri: string): string {
   return normalizeVikingUri(uri).split('/').pop() || ''
 }
 
+export function mcpServerNameFromToolUri(uri: string): string | null {
+  try {
+    const match = /^viking:\/\/agent\/tools\/([^/]+)\/[^/]+\.json$/.exec(
+      normalizeVikingUri(uri),
+    )
+    return match?.[1] || null
+  } catch {
+    return null
+  }
+}
+
+export function resolveMountNodeUri(
+  parentUri: string,
+  name: string,
+  existingUri?: string,
+): string {
+  return existingUri
+    ? normalizeVikingUri(existingUri)
+    : joinVikingUri(parentUri, name)
+}
+
 export function assertMutationBoundary(
   source: string,
   target: string | undefined,

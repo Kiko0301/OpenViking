@@ -15,13 +15,28 @@ export function schemaFields(schema: JsonSchema): SchemaField[] {
   }))
 }
 
+export function resolveSchema(schema: JsonSchema): JsonSchema {
+  const alternatives = schema.anyOf || schema.oneOf
+  if (!alternatives) return schema
+  const nonNull = alternatives.filter((candidate) => {
+    const type = candidate.type
+    return type !== 'null' && !(Array.isArray(type) && type.includes('null'))
+  })
+  if (nonNull.length !== 1) return schema
+  const parent = { ...schema }
+  delete parent.anyOf
+  delete parent.oneOf
+  return { ...nonNull[0], ...parent }
+}
+
 export function schemaType(schema: JsonSchema): string {
-  if (Array.isArray(schema.type)) {
-    return schema.type.find((type) => type !== 'null') || 'string'
+  const resolved = resolveSchema(schema)
+  if (Array.isArray(resolved.type)) {
+    return resolved.type.find((type) => type !== 'null') || 'string'
   }
-  if (schema.type) return schema.type
-  if (schema.properties) return 'object'
-  if (schema.items) return 'array'
+  if (resolved.type) return resolved.type
+  if (resolved.properties) return 'object'
+  if (resolved.items) return 'array'
   return 'string'
 }
 
@@ -38,7 +53,8 @@ export function initialSchemaArguments(
 }
 
 export function parseSchemaInput(raw: string, schema: JsonSchema): unknown {
-  const type = schemaType(schema)
+  const resolved = resolveSchema(schema)
+  const type = schemaType(resolved)
   if (type === 'number' || type === 'integer') {
     const value = Number(raw)
     if (!Number.isFinite(value)) throw new Error('Expected a number')

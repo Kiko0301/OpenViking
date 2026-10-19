@@ -1920,6 +1920,9 @@ enum McpCommands {
         /// MCP configuration JSON containing an mcpServers object
         #[arg(value_name = "json")]
         config: String,
+        /// Wait until tool processing is complete
+        #[arg(short = 'w', long)]
+        wait: bool,
     },
     /// Remove a registered MCP server
     Remove {
@@ -1961,6 +1964,9 @@ enum McpCommands {
         /// MCP server name
         #[arg(value_name = "name")]
         name: String,
+        /// Wait until tool processing is complete
+        #[arg(short = 'w', long)]
+        wait: bool,
     },
     /// Check a registered MCP server
     Status {
@@ -3663,14 +3669,9 @@ async fn main() {
         Commands::Mcps { action } => {
             let client = ctx.get_client();
             match action {
-                McpCommands::Add { config } => {
-                    commands::mcps::add(
-                        &client,
-                        &config,
-                        ctx.output_format,
-                        ctx.compact,
-                    )
-                    .await
+                McpCommands::Add { config, wait } => {
+                    commands::mcps::add(&client, &config, wait, ctx.output_format, ctx.compact)
+                        .await
                 }
                 McpCommands::Remove { name } => {
                     commands::mcps::remove(&client, &name, ctx.output_format, ctx.compact).await
@@ -3688,8 +3689,8 @@ async fn main() {
                 McpCommands::Show { name } => {
                     commands::mcps::show(&client, &name, ctx.output_format, ctx.compact).await
                 }
-                McpCommands::Sync { name } => {
-                    commands::mcps::sync(&client, &name, ctx.output_format, ctx.compact).await
+                McpCommands::Sync { name, wait } => {
+                    commands::mcps::sync(&client, &name, wait, ctx.output_format, ctx.compact).await
                 }
                 McpCommands::Status { name } => {
                     commands::mcps::status(&client, &name, ctx.output_format, ctx.compact).await
@@ -6539,16 +6540,30 @@ mod tests {
             "mcps",
             "add",
             r#"{"mcpServers":{"weather":{"url":"https://example.com/mcp","headers":{"Authorization":"Bearer token"}}}}"#,
+            "--wait",
         ])
         .expect("mcps add should parse");
         match add.command {
             Commands::Mcps {
-                action: McpCommands::Add { config },
+                action: McpCommands::Add { config, wait },
             } => {
                 assert!(config.contains(r#""weather""#));
                 assert!(config.contains(r#""Authorization""#));
+                assert!(wait);
             }
             _ => panic!("expected mcps add"),
+        }
+
+        let sync = Cli::try_parse_from(["ov", "mcps", "sync", "weather", "-w"])
+            .expect("mcps sync should parse");
+        match sync.command {
+            Commands::Mcps {
+                action: McpCommands::Sync { name, wait },
+            } => {
+                assert_eq!(name, "weather");
+                assert!(wait);
+            }
+            _ => panic!("expected mcps sync"),
         }
 
         let invoke = Cli::try_parse_from([

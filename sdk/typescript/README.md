@@ -68,6 +68,8 @@ Deployments using shared temporary storage can set `uploadMode: "shared"`; the s
 await client.addMCP("weather", "https://mcp.example.com/api", {
   Authorization: "Bearer token",
 });
+// Tool summaries and indexing continue in the background by default.
+// Pass { wait: true } as the fourth argument to wait.
 const tools = await client.findMCPTools("current weather", 5);
 const mounted = await client.mountMCPTool(
   "viking://agent/tools/weather/current.json",

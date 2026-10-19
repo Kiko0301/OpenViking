@@ -293,6 +293,8 @@ client.add_mcp(
     url="https://mcp.example.com/api",
     headers={"Authorization": "Bearer token"},
 )
+# 工具摘要和索引默认在后台继续处理。
+# 需要处理完成后再返回时传入 wait=True。
 tools = client.find_mcp_tools("当前天气", limit=5)
 mounted = client.mount_mcp_tool(
     tool_uri="viking://agent/tools/weather/current.json",

@@ -19,13 +19,14 @@ async def test_async_http_client_exposes_all_mcp_operations():
         "demo",
         "https://mcp.example.com/api",
         headers={"Authorization": "Bearer secret"},
+        wait=True,
     ) == {"ok": True}
     await client.remove_mcp("demo/server")
     await client.list_mcps()
     await client.find_mcp_tools("weather forecast", limit=5)
     await client.validate_mcp("demo", "https://mcp.example.com/api")
     await client.get_mcp("demo/server")
-    await client.sync_mcp("demo/server")
+    await client.sync_mcp("demo/server", wait=True)
     await client.get_mcp_status("demo")
     await client.invoke_mcp_tool(
         "agent/tools/demo/current.json",
@@ -67,6 +68,7 @@ async def test_async_http_client_exposes_all_mcp_operations():
                 "name": "demo",
                 "url": "https://mcp.example.com/api",
                 "headers": {"Authorization": "Bearer secret"},
+                "wait": True,
             },
         ),
         call("DELETE", "/api/v1/mcps/demo%2Fserver"),
@@ -86,7 +88,11 @@ async def test_async_http_client_exposes_all_mcp_operations():
             },
         ),
         call("GET", "/api/v1/mcps/demo%2Fserver"),
-        call("POST", "/api/v1/mcps/demo%2Fserver/sync"),
+        call(
+            "POST",
+            "/api/v1/mcps/demo%2Fserver/sync",
+            json={"wait": True},
+        ),
         call("GET", "/api/v1/mcps/status", params={"name": "demo"}),
         call(
             "POST",

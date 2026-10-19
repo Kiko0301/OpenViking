@@ -16,6 +16,7 @@ from vikingbot.agent.tools.ov_file import (
     VikingMultiReadTool,
     VikingSearchTool,
 )
+from vikingbot.agent.tools.ov_mcp import VikingFindMCPToolsTool, VikingInvokeMCPTool
 from vikingbot.agent.tools.registry import ToolRegistry
 from vikingbot.agent.tools.shell import ExecTool
 from vikingbot.agent.tools.web import WebFetchTool
@@ -103,8 +104,10 @@ def register_default_tools(
         registry.register(VikingGlobTool(config=config))
         registry.register(VikingExportTool(config=config))
         registry.register(VikingMemoryCommitTool(config=config))
+        registry.register(VikingFindMCPToolsTool(config=config))
         if not config.read_only:
             registry.register(VikingAddResourceTool(config=config))
+            registry.register(VikingInvokeMCPTool(config=config))
 
     # Image generation tool
     if include_image_tool:

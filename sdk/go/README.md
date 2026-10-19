@@ -255,6 +255,8 @@ _, err := client.AddMCP(
 	"https://mcp.example.com/api",
 	map[string]string{"Authorization": "Bearer token"},
 )
+// Tool summaries and indexing continue in the background by default.
+// Pass &openviking.WaitOptions{Wait: true} as the final argument to wait.
 tools, err := client.FindMCPTools(ctx, "current weather", 5)
 mounted, err := client.MountMCPTool(
 	ctx,

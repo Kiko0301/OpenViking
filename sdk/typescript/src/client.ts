@@ -309,9 +309,10 @@ export class OpenVikingClient {
     name: string,
     url: string,
     headers: Record<string, string> = {},
+    options: Pick<WaitOptions, "wait"> = {},
   ): Promise<JsonObject> {
     return this.request("POST", "/api/v1/mcps", {
-      body: { name, url, headers },
+      body: { name, url, headers, wait: options.wait ?? false },
     });
   }
   /** Remove an MCP server and its tool catalog. */
@@ -343,8 +344,13 @@ export class OpenVikingClient {
     return this.request("GET", `/api/v1/mcps/${pathPart(name)}`);
   }
   /** Refresh an MCP tool catalog and report affected live context mounts. */
-  syncMCP(name: string): Promise<MCPSyncResult> {
-    return this.request("POST", `/api/v1/mcps/${pathPart(name)}/sync`);
+  syncMCP(
+    name: string,
+    options: Pick<WaitOptions, "wait"> = {},
+  ): Promise<MCPSyncResult> {
+    return this.request("POST", `/api/v1/mcps/${pathPart(name)}/sync`, {
+      body: { wait: options.wait ?? false },
+    });
   }
   /** Check whether an MCP server is reachable. */
   getMCPStatus(name: string): Promise<JsonObject> {

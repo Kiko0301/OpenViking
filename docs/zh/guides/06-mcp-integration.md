@@ -3,6 +3,8 @@
 OpenViking Server 内置 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) 端点。支持 Streamable HTTP 的客户端可直接连接；只支持 stdio 的客户端可使用 [Agent Plugins 包](../agent-integrations/15-agent-plugins.md)提供的代理。
 
 > **快速接入？** 见 [MCP 客户端](../agent-integrations/06-mcp-clients.md) 获取各平台配置片段和注意事项。本页面覆盖完整的工具参考和高级配置。
+>
+> **接入外部 MCP Server？** 见[实时上下文接入与编排](23-live-context-arrangement.md)，了解 `ov mcps`、Tool Catalog、实时节点、Studio Arranger 和 Context as Code。
 
 ## 前提条件
 

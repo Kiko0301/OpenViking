@@ -336,7 +336,9 @@ class MCPService:
         tools: list[dict[str, Any]],
         removed_names: set[str],
         ctx: RequestContext,
-    ) -> None:
+        *,
+        wait: bool = True,
+    ) -> dict[str, Any] | None:
         server_root = f"{_TOOLS_ROOT}/{server_name}"
         await self._ensure_directory(_TOOLS_ROOT, ctx)
         await self._ensure_directory(server_root, ctx)
@@ -349,12 +351,13 @@ class MCPService:
             }
             for item in tools
         ]
+        result = None
         if operations:
-            await self._service.fs.batch_write(
+            result = await self._service.fs.batch_write(
                 root_uri=server_root,
                 operations=operations,
                 ctx=ctx,
-                wait=True,
+                wait=wait,
             )
 
         for name in sorted(removed_names):
@@ -362,8 +365,9 @@ class MCPService:
                 f"{server_root}/{name}.json",
                 ctx=ctx,
                 recursive=False,
-                wait=True,
+                wait=wait,
             )
+        return result
 
     async def _catalog_uris(self, server_name: str, ctx: RequestContext) -> list[str]:
         root = f"{_TOOLS_ROOT}/{server_name}"
@@ -604,6 +608,8 @@ class MCPService:
         url: str,
         headers: dict[str, str],
         ctx: RequestContext,
+        *,
+        wait: bool = False,
     ) -> dict[str, Any]:
         name = self._validate_server_name(name)
         url = self._validate_url(url)
@@ -633,14 +639,17 @@ class MCPService:
                 "created_at": timestamp,
                 "updated_at": timestamp,
             }
-            await self._publish_catalog(name, tools, set(), ctx)
+            processing = await self._publish_catalog(name, tools, set(), ctx, wait=wait)
             registry["servers"][name] = server
             await self._write_document(self._registry_path(ctx.account_id), registry)
 
-        return {
+        result = {
             **self._public_server(server, len(tools)),
             "protocol_version": initialized.protocolVersion,
         }
+        if processing is not None:
+            result["processing"] = processing
+        return result
 
     async def remove(self, name: str, ctx: RequestContext) -> dict[str, Any]:
         name = self._validate_server_name(name)
@@ -762,7 +771,13 @@ class MCPService:
             "tool_count": len(tools),
         }
 
-    async def sync(self, name: str, ctx: RequestContext) -> dict[str, Any]:
+    async def sync(
+        self,
+        name: str,
+        ctx: RequestContext,
+        *,
+        wait: bool = False,
+    ) -> dict[str, Any]:
         async with self._lock(ctx.account_id):
             server, headers = await self._registered(name, ctx)
             initialized, discovered = await self._discover(server, headers)
@@ -795,6 +810,7 @@ class MCPService:
                 [current_tools[tool_name] for tool_name in added + changed],
                 set(removed),
                 ctx,
+                wait=wait,
             )
             affected_mounts = await self._affected_mounts(name, current_tools, ctx)
             registry = await self._load(ctx)
@@ -1326,6 +1342,8 @@ class MCPService:
         server, headers = await self._registered(server_name, ctx)
         if tool_name not in await self._catalog_names(server_name, ctx):
             raise NotFoundError(uri, "MCP tool")
+        tool_document = await self._tool(uri, ctx)
+        self._validate_tool_arguments(tool_document, arguments)
 
         async with self._session(server, headers, timeout_seconds) as session:
             await session.initialize()

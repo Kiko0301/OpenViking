@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -55,7 +55,8 @@ async def test_add_stores_headers_only_in_internal_registry(monkeypatch):
         "_load",
         AsyncMock(return_value=registry),
     )
-    monkeypatch.setattr(service, "_publish_catalog", AsyncMock())
+    publish = AsyncMock(return_value={"queue_status": "pending"})
+    monkeypatch.setattr(service, "_publish_catalog", publish)
 
     async def capture_write(path, document):
         writes[path] = document
@@ -71,12 +72,44 @@ async def test_add_stores_headers_only_in_internal_registry(monkeypatch):
 
     assert result["tool_count"] == 1
     assert result["header_names"] == ["Authorization"]
+    assert result["processing"] == {"queue_status": "pending"}
     assert "headers" not in result
+    publish.assert_awaited_once()
+    assert publish.await_args.kwargs == {"wait": False}
     stored = writes["/local/account-1/_system/mcps.json"]["servers"]["weather"]
     assert "tools" not in stored
     assert "header_names" not in stored
     assert stored["headers"]["Authorization"] == "Bearer secret"
     assert list(writes) == ["/local/account-1/_system/mcps.json"]
+
+
+async def test_publish_catalog_forwards_wait_to_batch_write(monkeypatch):
+    batch_write = AsyncMock(return_value={"queue_status": "pending"})
+    remove = AsyncMock()
+    service = MCPService(
+        SimpleNamespace(fs=SimpleNamespace(batch_write=batch_write, rm=remove))
+    )
+    monkeypatch.setattr(service, "_ensure_directory", AsyncMock())
+
+    result = await service._publish_catalog(
+        "demo",
+        [
+            {
+                "server": "demo",
+                "revision": "revision",
+                "tool": {"name": "echo", "inputSchema": {"type": "object"}},
+            }
+        ],
+        {"old"},
+        _ctx(),
+        wait=False,
+    )
+
+    assert result == {"queue_status": "pending"}
+    batch_write.assert_awaited_once()
+    assert batch_write.await_args.kwargs["wait"] is False
+    remove.assert_awaited_once()
+    assert remove.await_args.kwargs["wait"] is False
 
 
 async def test_url_and_tool_filename_validation(monkeypatch):
@@ -148,6 +181,22 @@ async def test_invoke_failure_is_not_retried_or_rewrapped(monkeypatch):
         "_catalog_names",
         AsyncMock(return_value={"current"}),
     )
+    monkeypatch.setattr(
+        service,
+        "_tool",
+        AsyncMock(
+            return_value={
+                "tool": {
+                    "name": "current",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }
+            }
+        ),
+    )
 
     session = SimpleNamespace(
         initialize=AsyncMock(),
@@ -181,6 +230,25 @@ async def test_invoke_returns_upstream_result_without_routing_wrapper(monkeypatc
     server = {"name": "demo", "url": "https://mcp.example.com/api"}
     monkeypatch.setattr(service, "_registered", AsyncMock(return_value=(server, {})))
     monkeypatch.setattr(service, "_catalog_names", AsyncMock(return_value={"get-sum"}))
+    monkeypatch.setattr(
+        service,
+        "_tool",
+        AsyncMock(
+            return_value={
+                "tool": {
+                    "name": "get-sum",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "number"},
+                            "b": {"type": "number"},
+                        },
+                        "required": ["a", "b"],
+                    },
+                }
+            }
+        ),
+    )
     upstream = CallToolResult(
         content=[TextContent(type="text", text="5")],
         structuredContent={"value": 5},
@@ -206,6 +274,43 @@ async def test_invoke_returns_upstream_result_without_routing_wrapper(monkeypatc
     }
     assert "uri" not in result
     assert "result" not in result
+
+
+async def test_invoke_rejects_invalid_arguments_before_opening_session(monkeypatch):
+    service = MCPService(SimpleNamespace())
+    monkeypatch.setattr(
+        service,
+        "_registered",
+        AsyncMock(return_value=({"name": "weather", "url": "https://example.com/mcp"}, {})),
+    )
+    monkeypatch.setattr(service, "_catalog_names", AsyncMock(return_value={"current"}))
+    monkeypatch.setattr(
+        service,
+        "_tool",
+        AsyncMock(
+            return_value={
+                "tool": {
+                    "name": "current",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }
+            }
+        ),
+    )
+    open_session = MagicMock()
+    monkeypatch.setattr(service, "_session", open_session)
+
+    with pytest.raises(InvalidArgumentError, match="city"):
+        await service.invoke(
+            "viking://agent/tools/weather/current.json",
+            {},
+            _ctx(),
+        )
+
+    open_session.assert_not_called()
 
 
 async def test_invoke_live_context_uses_definition_and_arguments(monkeypatch):
@@ -743,7 +848,7 @@ async def test_sync_writes_only_added_and_changed_tools(monkeypatch):
     monkeypatch.setattr(service, "_load", AsyncMock(return_value=registry))
     monkeypatch.setattr(service, "_write_document", AsyncMock())
 
-    result = await service.sync("demo", _ctx())
+    result = await service.sync("demo", _ctx(), wait=True)
 
     assert result["changes"] == {
         "added": ["added"],
@@ -754,7 +859,13 @@ async def test_sync_writes_only_added_and_changed_tools(monkeypatch):
     assert result["affected_mounts"] == affected
     published = publish.await_args.args[1]
     assert [document["tool"]["name"] for document in published] == ["added", "changed"]
-    publish.assert_awaited_once_with("demo", published, {"removed"}, _ctx())
+    publish.assert_awaited_once_with(
+        "demo",
+        published,
+        {"removed"},
+        _ctx(),
+        wait=True,
+    )
 
 
 async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeypatch):
@@ -870,7 +981,11 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
     transport = httpx.ASGITransport(app=app)
 
     requests = [
-        ("POST", "/api/v1/mcps", {"name": "demo", "url": "https://example.com/mcp"}),
+        (
+            "POST",
+            "/api/v1/mcps",
+            {"name": "demo", "url": "https://example.com/mcp", "wait": True},
+        ),
         ("DELETE", "/api/v1/mcps/demo", None),
         ("GET", "/api/v1/mcps", None),
         ("POST", "/api/v1/mcps/find", {"query": "weather"}),
@@ -880,7 +995,7 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
             {"name": "demo", "url": "https://example.com/mcp"},
         ),
         ("GET", "/api/v1/mcps/demo", None),
-        ("POST", "/api/v1/mcps/demo/sync", None),
+        ("POST", "/api/v1/mcps/demo/sync", {"wait": True}),
         ("GET", "/api/v1/mcps/status?name=demo", None),
         (
             "POST",
@@ -939,6 +1054,13 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
             assert response.status_code == 200, response.text
 
     assert all(mock.await_count == 1 for mock in methods.values())
+    methods["add"].assert_awaited_once_with(
+        "demo",
+        "https://example.com/mcp",
+        {},
+        _ctx(),
+        wait=True,
+    )
     methods["mount"].assert_awaited_once_with(
         "viking://agent/tools/demo/current.json",
         "viking://resources/demo/current.md",
@@ -950,6 +1072,13 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
         tags=["project=demo"],
         wait=True,
     )
+    methods["find"].assert_awaited_once_with(
+        "weather",
+        10,
+        _ctx(),
+        include_definition=True,
+    )
+    methods["sync"].assert_awaited_once_with("demo", _ctx(), wait=True)
     methods["batch_mount"].assert_awaited_once_with(
         [
             MCPToolMount(

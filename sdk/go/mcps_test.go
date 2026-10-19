@@ -25,6 +25,7 @@ func TestMCPOperationsMatchServerContract(t *testing.T) {
 				"name":    "demo",
 				"url":     "https://mcp.example.com/api",
 				"headers": map[string]any{"Authorization": "Bearer secret"},
+				"wait":    false,
 			},
 		},
 		{method: http.MethodDelete, path: "/api/v1/mcps/demo"},
@@ -44,7 +45,11 @@ func TestMCPOperationsMatchServerContract(t *testing.T) {
 			},
 		},
 		{method: http.MethodGet, path: "/api/v1/mcps/demo"},
-		{method: http.MethodPost, path: "/api/v1/mcps/demo/sync"},
+		{
+			method: http.MethodPost,
+			path:   "/api/v1/mcps/demo/sync",
+			body:   map[string]any{"wait": false},
+		},
 		{
 			method: http.MethodGet,
 			path:   "/api/v1/mcps/status",

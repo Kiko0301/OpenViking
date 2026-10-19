@@ -22,6 +22,13 @@ class AddMCPRequest(BaseModel):
     name: str
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
+    wait: bool = False
+
+
+class SyncMCPRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    wait: bool = False
 
 
 class FindMCPToolsRequest(BaseModel):
@@ -73,7 +80,13 @@ async def add_mcp(
     body: AddMCPRequest,
     ctx: RequestContext = Depends(get_request_context),
 ):
-    result = await get_service().mcps.add(body.name, body.url, body.headers, ctx)
+    result = await get_service().mcps.add(
+        body.name,
+        body.url,
+        body.headers,
+        ctx,
+        wait=body.wait,
+    )
     return Response(status="ok", result=result)
 
 
@@ -170,7 +183,12 @@ async def find_mcp_tools(
     body: FindMCPToolsRequest,
     ctx: RequestContext = Depends(get_request_context),
 ):
-    result = await get_service().mcps.find(body.query, body.limit, ctx)
+    result = await get_service().mcps.find(
+        body.query,
+        body.limit,
+        ctx,
+        include_definition=True,
+    )
     return Response(status="ok", result=result)
 
 
@@ -213,7 +231,12 @@ async def validate_mcp(
 @router.post("/{name}/sync")
 async def sync_mcp(
     name: str,
+    body: SyncMCPRequest | None = None,
     ctx: RequestContext = Depends(get_request_context),
 ):
-    result = await get_service().mcps.sync(name, ctx)
+    result = await get_service().mcps.sync(
+        name,
+        ctx,
+        wait=body.wait if body is not None else False,
+    )
     return Response(status="ok", result=result)
