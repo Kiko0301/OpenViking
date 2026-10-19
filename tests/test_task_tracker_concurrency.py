@@ -390,43 +390,6 @@ def test_owner_loop_dispatcher_prefers_completed_result_over_simultaneous_stop()
 
 
 @pytest.mark.asyncio
-async def test_store_io_limiter_bounds_concurrency():
-    from openviking.service.task_tracker_concurrency import StoreIOLimiter
-
-    limiter = StoreIOLimiter(max_concurrent=3)
-    release = asyncio.Event()
-    entered = 0
-    max_entered = 0
-    limit_reached = asyncio.Event()
-
-    async def operation() -> None:
-        nonlocal entered, max_entered
-        entered += 1
-        max_entered = max(max_entered, entered)
-        if entered == 3:
-            limit_reached.set()
-        await release.wait()
-        entered -= 1
-
-    tasks = [asyncio.create_task(limiter.run("test", operation)) for _ in range(20)]
-    await asyncio.wait_for(limit_reached.wait(), timeout=1)
-    await asyncio.sleep(0)
-
-    assert max_entered == 3
-    release.set()
-    await asyncio.gather(*tasks)
-    assert limiter.inflight == 0
-    assert limiter.max_observed_inflight == 3
-
-
-def test_store_io_limiter_rejects_non_positive_limit():
-    from openviking.service.task_tracker_concurrency import StoreIOLimiter
-
-    with pytest.raises(ValueError, match="max_concurrent must be positive"):
-        StoreIOLimiter(max_concurrent=0)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_run_to_completion_releases_failed_request_and_preserves_cancellation(cancel):
     from openviking.service.task_tracker_concurrency import run_to_completion
@@ -644,7 +607,6 @@ async def test_cancelled_thread_write_settles_before_later_same_task_mutation():
         "completed",
     ]
     assert tracker._task_locks.entry_count == 0
-    assert tracker._store_io.inflight == 0
 
 
 @pytest.mark.asyncio
@@ -675,7 +637,6 @@ async def test_cancelled_outcome_finishes_terminal_transition(outcome, expected_
     assert snapshot.status.value == expected_status
     assert store.payloads[task.task_id]["status"] == expected_status
     assert tracker._task_locks.entry_count == 0
-    assert tracker._store_io.inflight == 0
 
 
 @pytest.mark.asyncio
@@ -717,59 +678,6 @@ async def test_cancelled_cancel_request_still_cancels_active_work_and_finalizes(
     assert snapshot.status == TaskStatus.CANCELLED
     assert store.payloads[task.task_id]["status"] == TaskStatus.CANCELLED.value
     assert tracker._task_locks.entry_count == 0
-    assert tracker._store_io.inflight == 0
-
-
-@pytest.mark.asyncio
-async def test_cancel_request_cancelled_before_store_admission_does_not_cancel_work():
-    from openviking.service.task_tracker import TaskStatus, TaskTracker
-
-    store = _ControllableTaskStore()
-    tracker = TaskTracker(store=store, max_concurrent_store_io=1)
-    blocker = await tracker.create("add_resource", account_id="acme", user_id="alice")
-    target = await tracker.create("add_resource", account_id="acme", user_id="alice")
-    await tracker.start(target.task_id)
-    store.update_started[blocker.task_id] = asyncio.Event()
-    store.update_release[blocker.task_id] = asyncio.Event()
-
-    blocking_update = asyncio.create_task(tracker.start(blocker.task_id))
-    await store.update_started[blocker.task_id].wait()
-
-    work_started = asyncio.Event()
-    work_cancelled = asyncio.Event()
-
-    async def active_work() -> None:
-        tracker.register_running_task(target.task_id)
-        work_started.set()
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
-            work_cancelled.set()
-            raise
-
-    worker = asyncio.create_task(active_work())
-    await work_started.wait()
-    cancelling = asyncio.create_task(tracker.cancel(target.task_id))
-    for _ in range(100):
-        if tracker._task_locks.entry_count == 2:
-            break
-        await asyncio.sleep(0.01)
-
-    cancelling.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(cancelling, timeout=1)
-
-    snapshot = await tracker.get(target.task_id)
-    assert snapshot is not None
-    assert snapshot.status == TaskStatus.RUNNING
-    assert not work_cancelled.is_set()
-    assert not worker.done()
-
-    worker.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await worker
-    store.update_release[blocker.task_id].set()
-    await blocking_update
 
 
 @pytest.mark.asyncio
@@ -929,62 +837,6 @@ async def test_clock_rollback_cannot_make_stale_store_snapshot_look_newer(monkey
 
 
 @pytest.mark.asyncio
-async def test_task_tracker_store_io_limit_allows_bounded_parallelism():
-    from openviking.service.task_tracker import TaskTracker
-
-    store = _BlockingCreateTaskStore(expected_concurrency=3)
-    tracker = TaskTracker(store=store, max_concurrent_store_io=3)
-
-    creates = [
-        asyncio.create_task(tracker.create("add_resource", account_id="acme", user_id="alice"))
-        for _ in range(10)
-    ]
-    await asyncio.wait_for(store.expected_entered.wait(), timeout=1)
-    await asyncio.sleep(0)
-
-    assert store.max_create_inflight == 3
-    store.create_release.set()
-    await asyncio.gather(*creates)
-    assert tracker._store_io.max_observed_inflight == 3
-    assert tracker._store_io.inflight == 0
-
-
-@pytest.mark.asyncio
-async def test_cancelled_create_waiting_for_store_slot_has_no_side_effect():
-    from openviking.service.task_tracker import TaskTracker
-
-    store = _BlockingCreateTaskStore(expected_concurrency=1)
-    tracker = TaskTracker(store=store, max_concurrent_store_io=1)
-
-    first = asyncio.create_task(tracker.create("add_resource", account_id="acme", user_id="alice"))
-    await asyncio.wait_for(store.expected_entered.wait(), timeout=1)
-
-    waiting = asyncio.create_task(
-        tracker.create("add_resource", account_id="acme", user_id="alice")
-    )
-    for _ in range(100):
-        if tracker._task_locks.entry_count == 2:
-            break
-        await asyncio.sleep(0.01)
-    assert tracker._task_locks.entry_count == 2
-
-    waiting.cancel()
-    await asyncio.sleep(0.05)
-    cancelled_before_release = waiting.done()
-    store.create_release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await waiting
-
-    created = await first
-
-    assert cancelled_before_release
-    assert store.create_calls == 1
-    assert set(store.payloads) == {created.task_id}
-    assert tracker._task_locks.entry_count == 0
-    assert tracker._store_io.inflight == 0
-
-
-@pytest.mark.asyncio
 async def test_cancelled_create_waiting_for_task_lock_finishes_before_lock_release():
     from openviking.service.task_tracker import TaskTracker
 
@@ -1040,7 +892,7 @@ async def test_task_tracker_public_mutation_stays_on_calling_loop():
 
 
 @pytest.mark.asyncio
-async def test_cancelling_foreign_mutation_cleans_task_lock_and_store_slot():
+async def test_cancelling_foreign_mutation_cleans_task_lock():
     from openviking.service.task_tracker import TaskStatus, TaskTracker
 
     store = _ThreadBlockingUpdateTaskStore()
@@ -1071,7 +923,6 @@ async def test_cancelling_foreign_mutation_cleans_task_lock_and_store_slot():
     assert snapshot is not None
     assert snapshot.status == TaskStatus.RUNNING
     assert tracker._task_locks.entry_count == 0
-    assert tracker._store_io.inflight == 0
     assert store.payloads[task.task_id]["status"] == TaskStatus.RUNNING.value
 
 

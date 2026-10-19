@@ -238,7 +238,7 @@ async def test_cursor_prunes_cold_expired_records_without_loading_cache():
         task.status = status
         task.updated_at = time.time() - days * 86400
         await store.update(task)
-    tracker = TaskTracker(store, max_concurrent_store_io=1)
+    tracker = TaskTracker(store)
     page = await asyncio.wait_for(
         tracker.list_page(
             **owner,
@@ -262,13 +262,13 @@ async def test_cursor_prunes_cold_expired_records_without_loading_cache():
 @pytest.mark.asyncio
 async def test_cursor_cleanup_rechecks_task_updated_after_scan(monkeypatch):
     store = PersistentTaskStore(_FakeAgfs())
-    tracker = TaskTracker(store, max_concurrent_store_io=1)
+    tracker = TaskTracker(store)
     owner = {"account_id": "acme", "user_id": "alice"}
     task = await tracker.create("compile", task_id="updated-after-scan", **owner)
     task.status = TaskStatus.COMPLETED
     task.updated_at = time.time() - 2 * 86400
     await store.update(task)
-    tracker = TaskTracker(store, max_concurrent_store_io=1)
+    tracker = TaskTracker(store)
     prune = tracker._prune_persisted_expired
     scanned = asyncio.Event()
 
@@ -291,10 +291,8 @@ async def test_cursor_cleanup_rechecks_task_updated_after_scan(monkeypatch):
         )
         await asyncio.wait_for(scanned.wait(), timeout=3)
         task.updated_at = time.time()
-        # A scan waiting for this task lock must not hold the sole I/O slot.
-        await asyncio.wait_for(
-            tracker._store_io.run("update", lambda: store.update(task)), timeout=3
-        )
+        # Cleanup must re-read the task after the concurrent update completes.
+        await asyncio.wait_for(store.update(task), timeout=3)
     page = await asyncio.wait_for(reading, timeout=3)
     assert [record.task_id for record in page] == [task.task_id]
     assert await store.get(task.task_id, **owner) is not None
