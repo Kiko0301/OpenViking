@@ -33,7 +33,6 @@ from openviking.service.task_events import (
 from openviking.service.task_store import TaskStore
 from openviking.service.task_tracker_concurrency import (
     KeyedAsyncLockPool,
-    StoreIOLimiter,
     run_to_completion,
 )
 from openviking.service.task_work_index import QueueTaskMetadata, TaskWorkIndex
@@ -187,7 +186,7 @@ class TaskTracker:
     TTL_FAILED = 604_800  # 7 days
     CLEANUP_INTERVAL = 300  # 5 minutes
 
-    def __init__(self, store: TaskStore, *, max_concurrent_store_io: int = 8) -> None:
+    def __init__(self, store: TaskStore) -> None:
         self._store = store
         self._tasks: Dict[str, TaskRecord] = {}
         self._lock = threading.Lock()
@@ -195,7 +194,6 @@ class TaskTracker:
         # multiple TaskTracker writers must add store-level revision/CAS first.
         self._task_locks = KeyedAsyncLockPool[str]()
         self._business_locks = KeyedAsyncLockPool[tuple[str, str, str, str]]()
-        self._store_io = StoreIOLimiter(max_concurrent_store_io)
         self._cleanup_task: Optional[asyncio.Task] = None
         self._work_index = TaskWorkIndex()
         self._install_work_index_callbacks()
@@ -313,14 +311,11 @@ class TaskTracker:
                 )
                 return False
             try:
-                await self._store_io.run(
-                    "delete",
-                    lambda: run_to_completion(
-                        lambda: self._store.delete(
-                            task_id,
-                            account_id=account_id,
-                            user_id=user_id,
-                        )
+                await run_to_completion(
+                    lambda: self._store.delete(
+                        task_id,
+                        account_id=account_id,
+                        user_id=user_id,
                     ),
                 )
             except Exception:
@@ -800,14 +795,11 @@ class TaskTracker:
                     raise RuntimeError(
                         f"Cannot delete active task record: {task.task_id}({task.task_type})"
                     )
-                await self._store_io.run(
-                    "delete",
-                    lambda task_id=task.task_id: run_to_completion(
-                        lambda: self._store.delete(
-                            task_id,
-                            account_id=account_id,
-                            user_id=user_id,
-                        )
+                await run_to_completion(
+                    lambda task_id=task.task_id: self._store.delete(
+                        task_id,
+                        account_id=account_id,
+                        user_id=user_id,
                     ),
                 )
                 with self._lock:
@@ -981,10 +973,7 @@ class TaskTracker:
         account_id: str,
         user_id: Optional[str],
     ) -> Optional[TaskRecord]:
-        payload = await self._store_io.run(
-            "get",
-            lambda: self._store.get(task_id, account_id=account_id, user_id=user_id),
-        )
+        payload = await self._store.get(task_id, account_id=account_id, user_id=user_id)
         if payload is None:
             return None
         return self._record_from_payload(payload)
@@ -994,10 +983,7 @@ class TaskTracker:
     ) -> List[TaskRecord]:
         return [
             self._record_from_payload(payload)
-            for payload in await self._store_io.run(
-                "list",
-                lambda: self._store.list(account_id, user_id=user_id),
-            )
+            for payload in await self._store.list(account_id, user_id=user_id)
         ]
 
     async def _persist_and_publish(
@@ -1041,14 +1027,10 @@ class TaskTracker:
             self._publish_task(task)
             committed = True
 
-        # Semaphore/lock waits remain cancellable. Once the store operation is
-        # admitted, settle the physical write and publish its cache snapshot
-        # before propagating caller cancellation.
+        # Lock waits remain cancellable. Once the write starts, settle it and
+        # publish its cache snapshot before propagating caller cancellation.
         try:
-            await self._store_io.run(
-                operation,
-                lambda: run_to_completion(write_and_publish),
-            )
+            await run_to_completion(write_and_publish)
         except asyncio.CancelledError as exc:
             if committed:
                 raise _CommittedMutationCancelled() from exc

@@ -5,18 +5,14 @@
 
 import asyncio
 import threading
-import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Generic, TypeVar
 
 from openviking.concurrency import AsyncSemaphore
-from openviking_cli.utils.logger import get_logger
 
 _KeyT = TypeVar("_KeyT")
 _ResultT = TypeVar("_ResultT")
-
-logger = get_logger(__name__)
 
 
 async def run_to_completion(
@@ -57,55 +53,6 @@ async def run_to_completion(
             work.exception()
         raise cancellation
     return work.result()
-
-
-class StoreIOLimiter:
-    """Bound task-store concurrency and expose low-cardinality diagnostics."""
-
-    def __init__(self, max_concurrent: int, slow_threshold_seconds: float = 1.0) -> None:
-        if max_concurrent <= 0:
-            raise ValueError("max_concurrent must be positive")
-        self._semaphore = AsyncSemaphore(max_concurrent)
-        self._lock = threading.Lock()
-        self._slow_threshold_seconds = slow_threshold_seconds
-        self._inflight = 0
-        self._max_observed_inflight = 0
-
-    @property
-    def inflight(self) -> int:
-        with self._lock:
-            return self._inflight
-
-    @property
-    def max_observed_inflight(self) -> int:
-        with self._lock:
-            return self._max_observed_inflight
-
-    async def run(
-        self,
-        operation: str,
-        factory: Callable[[], Awaitable[_ResultT]],
-    ) -> _ResultT:
-        started_at = time.monotonic()
-        async with self._semaphore:
-            with self._lock:
-                self._inflight += 1
-                self._max_observed_inflight = max(
-                    self._max_observed_inflight,
-                    self._inflight,
-                )
-            try:
-                return await factory()
-            finally:
-                with self._lock:
-                    self._inflight -= 1
-                duration_seconds = time.monotonic() - started_at
-                if duration_seconds >= self._slow_threshold_seconds:
-                    logger.warning(
-                        "Slow task store operation: operation=%s duration_ms=%.1f",
-                        operation,
-                        duration_seconds * 1000,
-                    )
 
 
 @dataclass
