@@ -55,7 +55,9 @@ template: |
   - Preserve the exact MCP Tool URI `{{ tool_uri }}` without translating, shortening, or rewriting it.
   - Preserve every mounted argument name and value from `{{ arguments }}`.
   - Explain that the mounted arguments describe this node's default live-context call.
-  - Explicitly guide an agent to read the Tool definition at `{{ tool_uri }}` and its inputSchema, then invoke the same MCP Tool with other valid arguments when a request needs different inputs or more precise results.
+  - Explicitly state that a complete read of this Live Context node executes the bound MCP Tool with the mounted arguments and returns the latest result, rather than cached content.
+  - Explicitly state that after a successful complete read, an agent must use that returned result and must not invoke the MCP Tool again with the same arguments.
+  - Guide an agent to read the Tool definition at `{{ tool_uri }}` and its inputSchema, then invoke the Tool directly only when the request requires different valid arguments.
   - Do not claim that the mounted arguments are the only allowed arguments.
   - Do not invent Tool capabilities, parameters, results, or constraints absent from the supplied node.
   - Do not use Markdown headings or tables.

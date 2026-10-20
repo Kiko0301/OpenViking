@@ -186,7 +186,9 @@ def test_live_context_summary_prompt_preserves_agent_invocation_details():
     assert "Calculate e plus pi" in prompt
     assert "Adds two mounted constants." in prompt
     assert "inputSchema" in prompt
-    assert "other valid arguments" in prompt
+    assert "returns the latest result" in prompt
+    assert "must not invoke the MCP Tool again with the same arguments" in prompt
+    assert "only when the request requires different valid arguments" in prompt
 
 
 def test_directory_overview_prompt_preserves_live_context_invocation_guidance():
@@ -204,7 +206,9 @@ def test_directory_overview_prompt_preserves_live_context_invocation_guidance():
     assert "exact MCP Tool URI" in prompt
     assert "mounted arguments" in prompt
     assert "inputSchema" in prompt
-    assert "other valid arguments" in prompt
+    assert "returns the latest result" in prompt
+    assert "must not invoke the Tool again with the same arguments" in prompt
+    assert "only when different valid arguments are required" in prompt
 
 
 def test_cuda_extensions_are_dispatched_as_code():

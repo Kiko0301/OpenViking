@@ -100,6 +100,7 @@ import {
   normalizeVikingUri,
   parentVikingUri,
   resolveMountNodeUri,
+  toggleExpandedUri,
 } from './-lib/uri'
 
 const ContextGraph = lazy(() =>
@@ -258,6 +259,10 @@ function ArrangerWorkbench() {
     },
     [navigate],
   )
+
+  const toggleExpanded = useCallback((uri: string) => {
+    setExpanded((current) => toggleExpandedUri(current, uri))
+  }, [])
 
   const submitPath = () => {
     try {
@@ -540,14 +545,7 @@ function ArrangerWorkbench() {
                   }))
                 }
                 onSelect={choose}
-                onToggle={(uri) =>
-                  setExpanded((current) => {
-                    const next = new Set(current)
-                    if (next.has(uri)) next.delete(uri)
-                    else next.add(uri)
-                    return next
-                  })
-                }
+                onToggle={toggleExpanded}
               />
             </ScrollArea>
             <section className="min-h-0 overflow-hidden border-r">
@@ -568,14 +566,7 @@ function ArrangerWorkbench() {
                     selectedUri={selected?.uri}
                     isLive={(uri) => liveIndex.mounts.has(uri)}
                     onSelect={choose}
-                    onToggle={(uri) =>
-                      setExpanded((current) => {
-                        const next = new Set(current)
-                        if (next.has(uri)) next.delete(uri)
-                        else next.add(uri)
-                        return next
-                      })
-                    }
+                    onToggle={toggleExpanded}
                   />
                 </Suspense>
               ) : (
@@ -769,20 +760,13 @@ function ContextTree({
           selectedUri === entry.uri && 'bg-muted font-medium',
         )}
         style={{ paddingLeft: `${8 + depth * 14}px` }}
-        onClick={() => onSelect(entry)}
+        onClick={() => {
+          onSelect(entry)
+          if (entry.isDir) onToggle(entry.uri)
+        }}
       >
         {entry.isDir ? (
-          <span
-            role="button"
-            tabIndex={0}
-            onClick={(event) => {
-              event.stopPropagation()
-              onToggle(entry.uri)
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') onToggle(entry.uri)
-            }}
-          >
+          <span aria-hidden="true">
             {expanded.has(entry.uri) ? (
               <ChevronDownIcon className="size-3.5" />
             ) : (

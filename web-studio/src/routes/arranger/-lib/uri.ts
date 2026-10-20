@@ -20,6 +20,21 @@ export function isWithinRoot(uri: string, rootUri: string): boolean {
   return uriValue === rootValue || uriValue.startsWith(`${rootValue}/`)
 }
 
+export function toggleExpandedUri(
+  expanded: ReadonlySet<string>,
+  uri: string,
+): Set<string> {
+  const target = normalizeVikingUri(uri)
+  const isExpanded = [...expanded].some(
+    (current) => normalizeVikingUri(current) === target,
+  )
+  if (!isExpanded) return new Set([...expanded, uri])
+
+  return new Set(
+    [...expanded].filter((current) => !isWithinRoot(current, target)),
+  )
+}
+
 export function joinVikingUri(parent: string, name: string): string {
   const cleanName = name.trim()
   if (

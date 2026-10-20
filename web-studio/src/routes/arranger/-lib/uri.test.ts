@@ -8,6 +8,7 @@ import {
   normalizeVikingUri,
   parentVikingUri,
   resolveMountNodeUri,
+  toggleExpandedUri,
 } from './uri'
 
 describe('arranger Viking URI boundaries', () => {
@@ -36,6 +37,31 @@ describe('arranger Viking URI boundaries', () => {
     expect(
       isWithinRoot('viking://resources/arranger', 'viking://resources/arrange'),
     ).toBe(false)
+  })
+
+  it('collapses a directory and all expanded descendants', () => {
+    const expanded = new Set([
+      'viking://resources/arrange',
+      'viking://resources/arrange/mysql',
+      'viking://resources/arrange/mysql/metrics/',
+      'viking://resources/arrange/mysql-other',
+    ])
+
+    expect([
+      ...toggleExpandedUri(expanded, 'viking://resources/arrange/mysql/'),
+    ]).toEqual([
+      'viking://resources/arrange',
+      'viking://resources/arrange/mysql-other',
+    ])
+    expect([
+      ...toggleExpandedUri(
+        new Set(['viking://resources/arrange']),
+        'viking://resources/arrange/mysql',
+      ),
+    ]).toEqual([
+      'viking://resources/arrange',
+      'viking://resources/arrange/mysql',
+    ])
   })
 
   it('keeps targets in the root and out of the source subtree', () => {
