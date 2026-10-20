@@ -1027,7 +1027,10 @@ async def test_read_delegates_to_visible_read(monkeypatch):
     monkeypatch.setattr(
         mcp_endpoint,
         "get_service",
-        lambda: SimpleNamespace(fs=SimpleNamespace(read_visible=read_visible)),
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(read_visible=read_visible),
+            mcps=SimpleNamespace(read_live_context=AsyncMock(return_value=None)),
+        ),
     )
     uri = "viking://user/test_user/project/private.md"
 
@@ -1081,49 +1084,55 @@ x-openviking:
 ---
 """
     read_visible = AsyncMock(return_value=content)
-    invoke_live_context = AsyncMock(
-        return_value={
-            "content": [{"type": "text", "text": "Sunny, 23 C"}],
-            "structuredContent": {"temperature": 23, "condition": "sunny"},
-            "isError": False,
-        }
-    )
+    read_live_context = AsyncMock(return_value='{\n  "temperature": 23,\n  "condition": "sunny"\n}')
     monkeypatch.setattr(
         mcp_endpoint,
         "get_service",
         lambda: SimpleNamespace(
             fs=SimpleNamespace(read_visible=read_visible),
-            mcps=SimpleNamespace(invoke_live_context=invoke_live_context),
+            mcps=SimpleNamespace(read_live_context=read_live_context),
         ),
     )
 
     result = await read("viking://resources/demo/weather.md")
 
-    assert isinstance(result, CallToolResult)
-    assert result.isError is False
-    assert result.structuredContent == {"temperature": 23, "condition": "sunny"}
-    assert len(result.content) == 1
-    assert isinstance(result.content[0], TextContent)
-    assert result.content[0].text == "Sunny, 23 C"
-    invoke_live_context.assert_awaited_once_with(content, DEFAULT_CTX)
+    assert result == '{\n  "temperature": 23,\n  "condition": "sunny"\n}'
+    read_live_context.assert_awaited_once_with(content, DEFAULT_CTX)
 
 
-async def test_paginated_read_does_not_invoke_live_context(monkeypatch):
+async def test_read_returns_live_context_text_without_mcp_result_wrapper(monkeypatch):
     read_visible = AsyncMock(return_value="type: OpenViking Live Context\n")
-    invoke_live_context = AsyncMock()
+    read_live_context = AsyncMock(return_value="Sunny, 23 C")
     monkeypatch.setattr(
         mcp_endpoint,
         "get_service",
         lambda: SimpleNamespace(
             fs=SimpleNamespace(read_visible=read_visible),
-            mcps=SimpleNamespace(invoke_live_context=invoke_live_context),
+            mcps=SimpleNamespace(read_live_context=read_live_context),
+        ),
+    )
+
+    result = await read("viking://resources/demo/weather.md")
+
+    assert result == "Sunny, 23 C"
+
+
+async def test_paginated_read_does_not_invoke_live_context(monkeypatch):
+    read_visible = AsyncMock(return_value="type: OpenViking Live Context\n")
+    read_live_context = AsyncMock()
+    monkeypatch.setattr(
+        mcp_endpoint,
+        "get_service",
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(read_visible=read_visible),
+            mcps=SimpleNamespace(read_live_context=read_live_context),
         ),
     )
 
     result = await read("viking://resources/demo/weather.md", offset=1, limit=5)
 
     assert result == "type: OpenViking Live Context\n"
-    invoke_live_context.assert_not_awaited()
+    read_live_context.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1147,7 +1156,8 @@ async def test_read_image_returns_native_mcp_content(monkeypatch, uri, image_byt
                 read_file_bytes=read_file_bytes,
                 read_visible=read_visible,
                 stat=stat,
-            )
+            ),
+            mcps=SimpleNamespace(read_live_context=AsyncMock(return_value=None)),
         ),
     )
     result = await mcp_endpoint.mcp.call_tool("read", {"uris": uri})
@@ -1175,7 +1185,8 @@ async def test_read_mixed_batch_preserves_source_order(monkeypatch):
                 read_file_bytes=read_file_bytes,
                 read_visible=read_visible,
                 stat=stat,
-            )
+            ),
+            mcps=SimpleNamespace(read_live_context=AsyncMock(return_value=None)),
         ),
     )
     text_uri = "viking://resources/notes.md"
@@ -1387,7 +1398,8 @@ async def test_read_svg_remains_text(monkeypatch):
             fs=SimpleNamespace(
                 read_file_bytes=read_file_bytes,
                 read_visible=read_visible,
-            )
+            ),
+            mcps=SimpleNamespace(read_live_context=AsyncMock(return_value=None)),
         ),
     )
     uri = "viking://resources/diagram.svg"

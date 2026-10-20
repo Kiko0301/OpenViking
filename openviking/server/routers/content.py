@@ -158,7 +158,7 @@ async def read(
         else:
             result = await service.fs.read_visible(resolved, ctx=_ctx, offset=offset, limit=limit)
             if offset == 0 and limit == -1:
-                live_result = await service.mcps.invoke_live_context(result, _ctx)
+                live_result = await service.mcps.read_live_context(result, _ctx)
                 if live_result is not None:
                     result = live_result
     except AGFSNotFoundError:

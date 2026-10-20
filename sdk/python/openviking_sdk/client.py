@@ -1468,6 +1468,8 @@ class AsyncHTTPClient:
         self._handle_response(response)
 
     async def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
+        response = await self._request(
+            "GET",
             "/api/v1/content/read",
             params={
                 "uri": VikingURI.normalize_file_reference(uri),
@@ -2997,11 +2999,13 @@ class SyncHTTPClient:
     def mv(self, from_uri: str, to_uri: str) -> None:
         run_async(self._async_client.mv(from_uri, to_uri))
 
-    def read(self, uri: str, offset: int = 0, limit: int = -1) -> Union[str, Dict[str, Any]]:
+    def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
         return run_async(self._async_client.read(uri, offset=offset, limit=limit))
 
     def read_raw(self, uri: str, offset: int = 0, limit: int = -1) -> str:
-    def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
+        return run_async(self._async_client.read_raw(uri, offset=offset, limit=limit))
+
+    def download_bytes(self, uri: str) -> bytes:
         return run_async(self._async_client.download_bytes(uri))
 
     def abstract(self, uri: str) -> str:

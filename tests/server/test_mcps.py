@@ -16,7 +16,7 @@ from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import mcps as mcps_router_module
 from openviking.service.mcp_service import MCPService, MCPToolMount
-from openviking_cli.exceptions import InvalidArgumentError, UnavailableError
+from openviking_cli.exceptions import InvalidArgumentError, ProcessingError, UnavailableError
 from openviking_cli.session.user_id import UserIdentifier
 
 pytestmark = pytest.mark.asyncio
@@ -86,9 +86,7 @@ async def test_add_stores_headers_only_in_internal_registry(monkeypatch):
 async def test_publish_catalog_forwards_wait_to_batch_write(monkeypatch):
     batch_write = AsyncMock(return_value={"queue_status": "pending"})
     remove = AsyncMock()
-    service = MCPService(
-        SimpleNamespace(fs=SimpleNamespace(batch_write=batch_write, rm=remove))
-    )
+    service = MCPService(SimpleNamespace(fs=SimpleNamespace(batch_write=batch_write, rm=remove)))
     monkeypatch.setattr(service, "_ensure_directory", AsyncMock())
 
     result = await service._publish_catalog(
@@ -343,10 +341,85 @@ x-openviking:
     )
 
 
+@pytest.mark.parametrize(
+    ("mcp_result", "expected"),
+    [
+        (
+            {
+                "content": [{"type": "text", "text": '{"sum": 5.858}'}],
+                "structuredContent": {"sum": 5.858},
+                "isError": False,
+            },
+            '{"sum": 5.858}',
+        ),
+        (
+            {
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"},
+                ],
+                "isError": False,
+            },
+            "first\nsecond",
+        ),
+        (
+            {
+                "structuredContent": {"sum": 5.858},
+                "isError": False,
+            },
+            '{\n  "sum": 5.858\n}',
+        ),
+    ],
+)
+async def test_read_live_context_returns_resource_content(monkeypatch, mcp_result, expected):
+    service = MCPService(SimpleNamespace())
+    monkeypatch.setattr(service, "invoke", AsyncMock(return_value=mcp_result))
+    content = """---
+type: OpenViking Live Context
+x-openviking:
+  type: mcp
+  definition: viking://agent/tools/demo/get-sum.json
+  args: {}
+---
+"""
+
+    assert await service.read_live_context(content, _ctx()) == expected
+
+
+@pytest.mark.parametrize(
+    "mcp_result",
+    [
+        {
+            "content": [{"type": "text", "text": "upstream failed"}],
+            "isError": True,
+        },
+        {
+            "content": [{"type": "image", "data": "abc", "mimeType": "image/png"}],
+            "isError": False,
+        },
+    ],
+)
+async def test_read_live_context_rejects_errors_and_non_text_results(monkeypatch, mcp_result):
+    service = MCPService(SimpleNamespace())
+    monkeypatch.setattr(service, "invoke", AsyncMock(return_value=mcp_result))
+    content = """---
+type: OpenViking Live Context
+x-openviking:
+  type: mcp
+  definition: viking://agent/tools/demo/get-sum.json
+  args: {}
+---
+"""
+
+    with pytest.raises(ProcessingError):
+        await service.read_live_context(content, _ctx())
+
+
 async def test_invoke_live_context_ignores_regular_content():
     service = MCPService(SimpleNamespace())
 
     assert await service.invoke_live_context("# Regular document", _ctx()) is None
+    assert await service.read_live_context("# Regular document", _ctx()) is None
 
 
 @pytest.mark.parametrize("include_definition", [False, True])

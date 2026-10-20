@@ -31,6 +31,7 @@ from openviking_cli.exceptions import (
     AlreadyExistsError,
     InvalidArgumentError,
     NotFoundError,
+    ProcessingError,
     UnavailableError,
 )
 
@@ -1323,6 +1324,63 @@ class MCPService:
             arguments,
             ctx,
             timeout_seconds=timeout_seconds,
+        )
+
+    async def read_live_context(
+        self,
+        content: str,
+        ctx: RequestContext,
+    ) -> str | None:
+        invocation = self._parse_live_context_node(content)
+        if invocation is None:
+            return None
+        tool_uri, arguments, timeout_seconds = invocation
+        result = await self.invoke(
+            tool_uri,
+            arguments,
+            ctx,
+            timeout_seconds=timeout_seconds,
+        )
+        return self._live_context_read_value(result, tool_uri)
+
+    @staticmethod
+    def _live_context_read_value(
+        result: dict[str, Any],
+        tool_uri: str,
+    ) -> str:
+        content = result.get("content")
+        text_blocks = (
+            [
+                block["text"]
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ]
+            if isinstance(content, list)
+            else []
+        )
+
+        if result.get("isError") is True:
+            detail = "\n".join(text_blocks).strip() or "upstream MCP tool returned an error"
+            raise ProcessingError(
+                f"Live context read failed: {detail}",
+                source=tool_uri,
+            )
+
+        if isinstance(content, list):
+            if text_blocks:
+                return "\n".join(text_blocks)
+            if not content:
+                return ""
+
+        structured = result.get("structuredContent")
+        if structured is not None:
+            return json.dumps(structured, ensure_ascii=False, indent=2)
+
+        raise ProcessingError(
+            "Live context read only supports text or structured MCP results",
+            source=tool_uri,
         )
 
     async def invoke(

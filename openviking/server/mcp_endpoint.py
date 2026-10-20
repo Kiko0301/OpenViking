@@ -430,6 +430,7 @@ async def set_acl(uri: str, acl: AclSpec) -> dict[str, Any]:
 
 # -- find_mcp_tools / invoke_mcp_tool ---------------------------------------------------------
 
+
 @_mcp_error_results(structured_output=False)
 @mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS, structured_output=False)
 async def find_mcp_tools(query: str, limit: int = 10) -> CallToolResult | str:
@@ -472,6 +473,7 @@ async def invoke_mcp_tool(
     except OpenVikingError as exc:
         return _mcp_failure(str(exc))
     return CallToolResult.model_validate(result)
+
 
 # -- find / search ---------------------------------------------------------
 
@@ -896,7 +898,7 @@ async def read(
     offset: int = 0,
     limit: int = -1,
 ) -> str | list[ContentBlock] | CallToolResult:
-    """Read one or more viking:// file URIs. A complete read of an OpenViking Live Context node transparently returns only its upstream MCP tool result; paginated reads only return stored descriptor text. Raster images and supported audio return native MCP content blocks. For directory listing, use the list tool instead."""
+    """Read one or more viking:// file URIs. A complete read of an OpenViking Live Context node returns its evaluated text content; paginated reads only return stored descriptor text. Raster images and supported audio return native MCP content blocks. For directory listing, use the list tool instead."""
     import asyncio
 
     service = get_service()
@@ -1008,9 +1010,9 @@ async def read(
                     limit=limit,
                 )
                 if offset == 0 and limit == -1:
-                    result = await service.mcps.invoke_live_context(content, ctx)
+                    result = await service.mcps.read_live_context(content, ctx)
                     if result is not None:
-                        return CallToolResult.model_validate(result)
+                        return result
                 return content
             except OpenVikingError as exc:
                 return _mcp_failure(exc)

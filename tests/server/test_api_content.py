@@ -273,15 +273,12 @@ x-openviking:
     b: 2.718
 ---
 """
-    live_result = {
-        "content": [{"type": "text", "text": "5.858"}],
-        "isError": False,
-    }
+    live_result = "5.858"
     fs = SimpleNamespace(
         read=AsyncMock(return_value=content),
         read_visible=AsyncMock(return_value=content),
     )
-    mcps = SimpleNamespace(invoke_live_context=AsyncMock(return_value=live_result))
+    mcps = SimpleNamespace(read_live_context=AsyncMock(return_value=live_result))
     monkeypatch.setattr(
         content_router,
         "get_service",
@@ -291,15 +288,15 @@ x-openviking:
     response = await content_router.read(uri=uri, offset=0, limit=-1, raw=False, _ctx=ctx)
 
     assert response.result == live_result
-    mcps.invoke_live_context.assert_awaited_once_with(content, ctx)
+    mcps.read_live_context.assert_awaited_once_with(content, ctx)
 
     raw_response = await content_router.read(uri=uri, offset=0, limit=-1, raw=True, _ctx=ctx)
     assert raw_response.result == content
-    mcps.invoke_live_context.assert_awaited_once()
+    mcps.read_live_context.assert_awaited_once()
 
     paged_response = await content_router.read(uri=uri, offset=1, limit=2, raw=False, _ctx=ctx)
     assert paged_response.result == content
-    mcps.invoke_live_context.assert_awaited_once()
+    mcps.read_live_context.assert_awaited_once()
 
 
 async def test_read_directory_uri_returns_invalid_argument(client_with_resource):
