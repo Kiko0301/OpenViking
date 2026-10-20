@@ -20,6 +20,7 @@ from openviking.service.external_task_service import ExternalTaskSnapshot
 from openviking.service.task_tracker import get_task_tracker
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.queuefs import get_queue_manager
+from openviking_cli.exceptions import ConflictError, InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
 
 pytest.importorskip("ragfs_python")
@@ -444,9 +445,8 @@ async def test_queued_cancel_finishes_history_without_releasing_running_task(
     await asyncio.wait_for(entered.wait(), 5)
     store = compile_service.lifecycle.store
     target_id = first.meta["request"]["compile"]["target_id"]
-    protection = {"task_id": first.task_id, "uris": [f"{TO}/removed.md"]}
-    async with store.edit(ctx.account_id, target_id) as record:
-        record["rollback_deletions"] = protection
+    await service.fs.rm(f"{TO}/page.md", ctx, wait=True)
+    protection = await store.get_outputs(ctx.account_id, target_id, first.task_id)
     try:
         request = CompileRequest.model_validate(
             {"from": [SRC], "to": TO, "skill": SKILL, "instruction": "refresh"}
@@ -472,7 +472,7 @@ async def test_queued_cancel_finishes_history_without_releasing_running_task(
         assert run["status"] == "cancelled" and run["finished_at"] is not None
         assert run["started_at"] is None
         assert (await store.get(ctx.account_id, target_id))["active_task_id"] == first.task_id
-        assert (await store.get(ctx.account_id, target_id))["rollback_deletions"] == protection
+        assert await store.get_outputs(ctx.account_id, target_id, first.task_id) == protection
     finally:
         release.set()
         await asyncio.wait_for(worker, 10)
@@ -480,7 +480,6 @@ async def test_queued_cancel_finishes_history_without_releasing_running_task(
         await tracker.get(first.task_id, ctx.account_id, ctx.user.user_id)
     ).status == "completed"
     assert (await store.get(ctx.account_id, target_id))["active_task_id"] is None
-    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"] is None
     submit.assert_awaited_once()
 
 
@@ -803,7 +802,8 @@ async def test_compile_rollback_preserves_user_deletions(
     store, target_id = service.compile.lifecycle.store, task.meta["request"]["compile"]["target_id"]
     run = await store.get_operation(ctx.account_id, target_id, task.task_id)
     await service.compile.lifecycle._rollback(TO, run, ctx)
-    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"]["uris"] == [scope]
+    history = await service.compile.list_operations(TO, ctx, limit=20, cursor=None)
+    assert any(item["operation_type"] == "rm" for item in history["operations"])
     await service.compile.on_finish(task, ExternalTaskSnapshot(status=status))
     assert not await service.viking_fs.exists(page, ctx=ctx)
     if ordinary:
@@ -813,12 +813,11 @@ async def test_compile_rollback_preserves_user_deletions(
         assert not await service.viking_fs.exists(scope, ctx=ctx)
     assert await service.viking_fs.read_file(sibling, ctx=ctx) == "before"
     assert await service.viking_fs.read_file(compiled_delete, ctx=ctx) == "before"
-    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"] is None
 
 
 @pytest.mark.asyncio
 async def test_compile_delete_failure_and_cancellation(service, compile_task, monkeypatch):
-    """Deletion failures leave no marker; cancellation saves successful deletions under the lease."""
+    """Failed deletes have no effects; cancellation finishes successful deletion metadata."""
     from openviking.storage.errors import LockAcquisitionError
 
     ctx, task = compile_task
@@ -829,7 +828,10 @@ async def test_compile_delete_failure_and_cancellation(service, compile_task, mo
         patch.setattr(service.viking_fs, "rm", AsyncMock(side_effect=OSError("delete failed")))
         with pytest.raises(OSError, match="delete failed"):
             await service.fs.rm(uri, ctx)
-    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"] is None
+    operations = await store.list_operations(ctx.account_id, target_id)
+    failed = next(item for item in operations if item["operation_type"] == "rm")
+    assert failed["status"] == "failed"
+    assert await service.viking_fs.exists(uri, ctx=ctx)
     entered, proceed = asyncio.Event(), asyncio.Event()
     after_remove = service.fs.compile_versions.after_remove
 
@@ -848,9 +850,276 @@ async def test_compile_delete_failure_and_cancellation(service, compile_task, mo
     proceed.set()
     with pytest.raises(asyncio.CancelledError):
         await deleting
-    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"]["uris"] == [uri]
+    operations = await store.list_operations(ctx.account_id, target_id)
+    assert any(
+        item["operation_type"] == "rm" and item["status"] == "completed" for item in operations
+    )
     await service.compile.on_finish(task, ExternalTaskSnapshot(status="failed"))
     assert not await service.viking_fs.exists(uri, ctx=ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+@pytest.mark.parametrize("operation", ["cp", "mv"])
+async def test_compile_rollback_preserves_file_operations(
+    service, compile_task, monkeypatch, operation, status
+):
+    """Transfer scopes retain their baseline and respect later ordinary edits."""
+    # Summary jobs use independent leases; content rollback uses the real filesystem and Git.
+    monkeypatch.setattr(service.fs, "_enqueue_copy_refresh", AsyncMock(return_value="queued"))
+    monkeypatch.setattr(service.fs, "_enqueue_delete_refresh", AsyncMock())
+    monkeypatch.setattr("openviking.service.fs_service.vectorize_directory_meta", AsyncMock())
+    ctx, task = compile_task
+    source, target = "viking://resources/ordinary", f"{TO}/imported"
+    await _write(service, f"{source}/note.md", "ordinary", ctx)
+    await _write(service, f"{source}/removed.md", "ordinary", ctx)
+    await service.viking_fs.mkdir(f"{source}/empty", ctx=ctx)
+    await service.viking_fs.mkdir(target, ctx=ctx)
+    await service.compile.on_start(task)
+    await _write(service, f"{target}/compile-only.md", "compiled", ctx)
+    if operation == "cp":
+        await service.fs.cp(source, target, ctx=ctx, recursive=True)
+    else:
+        await service.fs.mv(source, target, ctx)
+        assert not await service.viking_fs.exists(source, ctx=ctx)
+    await service.fs.rm(f"{target}/removed.md", ctx, wait=True)
+    await service.fs.write(f"{target}/edited.md", "ordinary latest", ctx, wait=True)
+    await service.fs.mv(f"{TO}/page.md", f"{TO}/renamed.md", ctx)
+    await service.fs.mkdir(f"{TO}/empty", ctx)
+    await service.fs.rm(f"{TO}/empty", ctx, recursive=True, wait=True)
+    await service.fs.mkdir(f"{TO}/empty", ctx)
+    await service.fs.batch_write(
+        root_uri=TO,
+        operations=[
+            {"uri": uri, "content": "compiled"}
+            for uri in (
+                f"{target}/note.md",
+                f"{target}/removed.md",
+                f"{target}/edited.md",
+                f"{target}/empty/compile-only.md",
+                f"{TO}/renamed.md",
+                f"{TO}/empty/compile-only.md",
+            )
+        ],
+        ctx=ctx,
+        defer_processing=True,
+        edit_source="compile",
+    )
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status=status))
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status=status))
+    assert await service.viking_fs.read_file(f"{target}/note.md", ctx=ctx) == "ordinary"
+    assert await service.viking_fs.read_file(f"{target}/edited.md", ctx=ctx) == "ordinary latest"
+    assert await service.viking_fs.read_file(f"{target}/compile-only.md", ctx=ctx) == "compiled"
+    assert await service.viking_fs.read_file(f"{TO}/renamed.md", ctx=ctx) == "before"
+    for uri in (
+        f"{TO}/page.md",
+        f"{target}/removed.md",
+        f"{target}/empty/compile-only.md",
+        f"{TO}/empty/compile-only.md",
+    ):
+        assert not await service.viking_fs.exists(uri, ctx=ctx)
+    for uri in (f"{target}/empty", f"{TO}/empty"):
+        assert (await service.viking_fs.stat(uri, ctx=ctx, skip_count=True))["isDir"]
+    history = await service.compile.list_operations(TO, ctx, limit=20, cursor=None)
+    assert {"mkdir", "rm", operation, "mv"} <= {
+        item["operation_type"] for item in history["operations"]
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["cp", "mv"])
+@pytest.mark.parametrize("existing", [False, True])
+async def test_partial_transfer_preserves_directory_baseline(
+    service, compile_task, monkeypatch, operation, existing
+):
+    """A partial transfer protects its final directory, including untouched Compile files."""
+    ctx, task = compile_task
+    source, target = "viking://resources/ordinary", f"{TO}/imported"
+    for name in ("a.md", "b.md"):
+        await _write(service, f"{source}/{name}", "same", ctx)
+    await service.viking_fs.mkdir(target, ctx=ctx)
+    if existing:
+        await _write(service, f"{target}/a.md", "before", ctx)
+    await service.compile.on_start(task)
+    await service.fs.batch_write(
+        root_uri=TO,
+        operations=[
+            {"uri": f"{target}/a.md", "content": "same"},
+            {"uri": f"{target}/b.md", "content": "untouched compiled"},
+        ],
+        ctx=ctx,
+        defer_processing=True,
+        edit_source="compile",
+    )
+    agfs = service.viking_fs._async_agfs
+    copy, ls = agfs.cp, agfs.ls
+    copied = []
+
+    async def ordered_entries(*args, **kwargs):
+        return sorted(await ls(*args, **kwargs), key=lambda entry: entry.get("name", ""))
+
+    async def fail_second_file(old_path, new_path, **kwargs):
+        """Fail the second physical copy only after the first write completes."""
+        if old_path.endswith("/b.md"):
+            assert copied == ["a.md"]
+            raise OSError("transfer interrupted")
+        result = await copy(old_path, new_path, **kwargs)
+        copied.append(old_path.rsplit("/", 1)[-1])
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(agfs, "ls", ordered_entries)
+        patch.setattr(agfs, "cp", fail_second_file)
+        with pytest.raises(OSError, match="transfer interrupted"):
+            await getattr(service.fs, operation)(
+                source, target, ctx=ctx, **({"recursive": True} if operation == "cp" else {})
+            )
+    assert copied == ["a.md"]
+    assert await service.viking_fs.read_file(f"{target}/a.md", ctx=ctx) == "same"
+    assert await service.viking_fs.read_file(f"{target}/b.md", ctx=ctx) == "untouched compiled"
+    await service.fs.batch_write(
+        root_uri=TO,
+        operations=[
+            {"uri": f"{target}/{name}", "content": "compiled later"} for name in ("a.md", "b.md")
+        ],
+        ctx=ctx,
+        defer_processing=True,
+        edit_source="compile",
+    )
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status="failed"))
+    assert await service.viking_fs.read_file(f"{target}/a.md", ctx=ctx) == "same"
+    assert await service.viking_fs.read_file(f"{target}/b.md", ctx=ctx) == "untouched compiled"
+    for name in ("a.md", "b.md"):
+        assert await service.viking_fs.read_file(f"{source}/{name}", ctx=ctx) == "same"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [".abstract.md", ".overview.md"])
+async def test_copy_derived_file_does_not_block_compile_rollback(service, compile_task, name):
+    """Derived files have no ordinary snapshot effect and cannot prevent business rollback."""
+    ctx, task = compile_task
+    source, target = f"viking://resources/ordinary/{name}", f"{TO}/{name}"
+    await _write(service, source, "derived", ctx)
+    await service.compile.on_start(task)
+    await service.fs.batch_write(
+        root_uri=TO,
+        operations=[{"uri": f"{TO}/page.md", "content": "compiled"}],
+        ctx=ctx,
+        defer_processing=True,
+        edit_source="compile",
+    )
+    await service.fs.cp(source, target, recursive=False, ctx=ctx)
+    store, target_id = service.compile.lifecycle.store, task.meta["request"]["compile"]["target_id"]
+    operation = next(
+        item
+        for item in await store.list_operations(ctx.account_id, target_id)
+        if item["operation_type"] == "cp"
+    )
+    manifest = await store.get_outputs(ctx.account_id, target_id, operation["operation_id"])
+    assert manifest["outputs"] == []
+    assert manifest.get("effects", []) == []
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status="failed"))
+    assert await service.viking_fs.read_file(f"{TO}/page.md", ctx=ctx) == "before"
+
+
+@pytest.mark.asyncio
+async def test_watch_move_and_compile_transfer_guards(service, compile_task):
+    ctx, _ = compile_task
+    source, target = "viking://resources/watched", "viking://resources/watched_moved"
+    await _write(service, f"{source}/note.md", "ordinary", ctx)
+    watch = await service.watch_scheduler.watch_manager.create_task(
+        path="unused.md", to_uri=source, account_id=ctx.account_id, user_id=ctx.user.user_id
+    )
+    await service.fs.mv(source, target, ctx)
+    assert not await service.viking_fs.exists(source, ctx=ctx)
+    assert watch.to_uri == target
+    with pytest.raises(ConflictError, match="Watched resources"):
+        await service.fs.cp(target, f"{TO}/blocked", recursive=True, ctx=ctx)
+    with pytest.raises(ConflictError, match="Watched resources"):
+        await service.fs.mv(target, f"{TO}/blocked", ctx)
+    assert not await service.viking_fs.exists(f"{TO}/blocked", ctx=ctx)
+    assert await service.viking_fs.read_file(f"{target}/note.md", ctx=ctx) == "ordinary"
+    await service.fs.cp(target, f"{TO}-sibling", recursive=True, ctx=ctx)
+    assert await service.viking_fs.read_file(f"{TO}-sibling/note.md", ctx=ctx) == "ordinary"
+    assert watch.to_uri == target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("running", [False, True])
+async def test_compile_destination_guards(service, compile_task, monkeypatch, running):
+    ctx, task = compile_task
+    alternate = "viking://resources/alternate_source"
+    await _write(service, f"{alternate}/note.md", "source", ctx)
+    store = service.compile.lifecycle.store
+    target_id = task.meta["request"]["compile"]["target_id"]
+    async with store.edit(ctx.account_id, target_id) as record:
+        record["from"] = [alternate]
+        record["schedule_configured"] = True
+    if running:
+        active = await service.compile.create(
+            CompileRequest.model_validate({"from": [alternate], "to": TO, "skill": SKILL}),
+            connection={},
+            ctx=ctx,
+        )
+        assert await service.compile.on_start(active) == "proceed"
+        assert await service.compile.on_start(task) == "busy"
+        with pytest.raises(ConflictError):
+            await service.fs.mv(TO + "/", "viking://resources/moved_target", ctx)
+    for source in (SRC, alternate):
+        for operation in (service.fs.cp, service.fs.mv):
+            with pytest.raises((ConflictError, InvalidArgumentError)):
+                await operation(
+                    source,
+                    f"{TO}/blocked",
+                    ctx=ctx,
+                    **({"recursive": True} if operation == service.fs.cp else {}),
+                )
+            assert await service.viking_fs.exists(source, ctx=ctx)
+            assert not await service.viking_fs.exists(f"{TO}/blocked", ctx=ctx)
+    with pytest.raises((ConflictError, InvalidArgumentError)):
+        await service.fs.cp(f"{SRC}/a.md", f"{TO}/blocked", ctx=ctx, recursive=False)
+    monkeypatch.setattr(
+        "openviking.service.resource_service.effective_resource_add_target",
+        AsyncMock(return_value=TO),
+    )
+    for target in (
+        {"to": TO},
+        {"parent": TO + "/"},
+        {"to": f"{TO}/blocked", "add_type": "tos"},
+        {},
+    ):
+        with pytest.raises(ConflictError, match="Compile target"):
+            await service.resources.add_resource(
+                "tos://bucket/docs/" if target.get("add_type") else "unused.md", ctx, **target
+            )
+    with pytest.raises(ConflictError, match="Compile target"):
+        await service.resources._resource_processor.reserve_unique_candidate(
+            candidate_uri=f"{TO}/blocked",
+            ctx=ctx,
+            target_validator=service.resources._ensure_resource_target_available,
+        )
+    assert not await service.viking_fs.exists(f"{TO}/blocked", ctx=ctx)
+    await service.resources._ensure_resource_target_available(TO + "-sibling", ctx)
+    await service.resources._ensure_resource_target_available(
+        "viking://resources", ctx, is_parent=True
+    )
+    sibling, lease = await service.resources._resource_processor.reserve_unique_candidate(
+        candidate_uri=TO,
+        ctx=ctx,
+        target_validator=service.resources._ensure_resource_target_available,
+    )
+    try:
+        assert sibling == TO + "_1"
+        await service.viking_fs.rm(sibling, recursive=True, ctx=ctx, lease_ref=lease)
+    finally:
+        await service.viking_fs._async_agfs.pathlock_release(lease)
+    if running:
+        await service.compile.on_finish(active, ExternalTaskSnapshot(status="failed"))
+    await service.fs.rm(TO, ctx, recursive=True)
+    await service.viking_fs.mkdir(TO, ctx=ctx)
+    assert await store.register(ctx.account_id, TO) == target_id
+    await service.fs.mv(SRC, f"{TO}/imported", ctx=ctx)
+    assert await service.viking_fs.read_file(f"{TO}/imported/a.md", ctx=ctx) == "before"
 
 
 @pytest.mark.parametrize(
@@ -1233,6 +1502,7 @@ async def test_moving_and_removing_target_keeps_registry_consistent(service, cli
     await service.fs.rm(TO, ctx, recursive=True)
     await service.fs.rm(moved, ctx, recursive=True)
     assert {item["status"] for item in await service.compile.list_configs(ctx)} == {"deleted"}
+    await service.resources._ensure_resource_target_available(moved, ctx)
     history = await service.compile.list_operations(moved, ctx, limit=10, cursor=None)
     old_id = history["operations"][-1]["operation_id"]
     assert await store.list_version_indexes(ctx.account_id, target_id) == []
@@ -1241,7 +1511,6 @@ async def test_moving_and_removing_target_keeps_registry_consistent(service, cli
     assert (await store.get(ctx.account_id, target_id))["status"] == "deleted"
     assert await store.register(ctx.account_id, moved) == target_id
     record = await store.get(ctx.account_id, target_id)
-    assert record["rollback_deletions"] is None
     assert not record["initialized"] and record["progress"]["source_commit"] is None
     assert not record["progress"]["processed_roots"] and record["versions_head"] is None
     assert await service.compile.list_operations(moved, ctx, limit=10, cursor=None) == history
