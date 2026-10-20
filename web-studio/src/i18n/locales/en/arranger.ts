@@ -16,7 +16,7 @@ const arranger = {
       'For example, viking://resources/arrange. The path is preserved in the URL.',
     pathTitle: 'Choose a directory to arrange',
     staticDescription:
-      'Organize directories, Markdown, and existing resources. Changes are written to OpenViking immediately.',
+      'Organize directories, Markdown, and existing resources, then save changes to OpenViking manually.',
     staticTitle: 'Static content',
   },
   actions: {
@@ -103,9 +103,14 @@ const arranger = {
   },
   save: {
     conflict: 'Conflict detected. Your input is preserved.',
+    continueEditing: 'Continue editing',
+    discard: 'Discard changes',
     dirty: 'Unsaved changes',
     error: 'Save failed',
+    leaveDescription: 'Save your changes before leaving, or discard this edit.',
+    leaveTitle: 'Save changes to “{{name}}”?',
     saved: 'Saved',
+    saveAndLeave: 'Save and leave',
     saving: 'Saving',
   },
   dialogs: {

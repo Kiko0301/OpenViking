@@ -15,7 +15,7 @@ const arranger = {
     pathHint: '例如 viking://resources/arrange，路径会保留在 URL 中。',
     pathTitle: '选择要编排的目录',
     staticDescription:
-      '直接组织目录、Markdown 和已有资源，修改会实时写入 OpenViking。',
+      '直接组织目录、Markdown 和已有资源，确认后手动保存到 OpenViking。',
     staticTitle: '静态内容',
   },
   actions: {
@@ -100,9 +100,14 @@ const arranger = {
   },
   save: {
     conflict: '检测到冲突，当前输入已保留',
+    continueEditing: '继续编辑',
+    discard: '放弃修改',
     dirty: '有未保存修改',
     error: '保存失败',
+    leaveDescription: '你可以先保存修改再离开，或放弃本次编辑。',
+    leaveTitle: '保存对“{{name}}”的修改？',
     saved: '已保存',
+    saveAndLeave: '保存并离开',
     saving: '保存中',
   },
   dialogs: {

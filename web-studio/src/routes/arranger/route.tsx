@@ -7,7 +7,11 @@ import {
   useRef,
   useState,
 } from 'react'
-import { createFileRoute, useNavigate } from '@tanstack/react-router'
+import {
+  createFileRoute,
+  useBlocker,
+  useNavigate,
+} from '@tanstack/react-router'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTheme } from 'next-themes'
 import { useTranslation } from 'react-i18next'
@@ -36,6 +40,16 @@ import { toast } from 'sonner'
 
 import { CodeEditor } from '#/components/code-editor'
 import { Alert, AlertDescription, AlertTitle } from '#/components/ui/alert'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '#/components/ui/alert-dialog'
 import { Badge } from '#/components/ui/badge'
 import { Button } from '#/components/ui/button'
 import {
@@ -978,6 +992,7 @@ function TextInspector({
   const [status, setStatus] = useState<
     'conflict' | 'dirty' | 'error' | 'saved' | 'saving'
   >('saved')
+  const [savingBeforeLeave, setSavingBeforeLeave] = useState(false)
   const latestRef = useRef('')
   const committedRef = useRef('')
   const hashRef = useRef('')
@@ -1002,7 +1017,8 @@ function TextInspector({
   }, [documentQuery.data])
 
   const flush = useCallback(async () => {
-    if (liveMount || runningRef.current) return
+    if (liveMount) return true
+    if (runningRef.current) return false
     runningRef.current = true
     try {
       while (latestRef.current !== committedRef.current) {
@@ -1025,7 +1041,7 @@ function TextInspector({
                 : 'error',
             )
           }
-          return
+          return false
         }
         committedRef.current = snapshot
         hashRef.current = hashText(snapshot)
@@ -1034,16 +1050,17 @@ function TextInspector({
           await onSaved()
         }
       }
+      return true
     } finally {
       runningRef.current = false
     }
   }, [entry.uri, liveMount, onSaved])
 
-  useEffect(() => {
-    if (status !== 'dirty') return
-    const timer = window.setTimeout(() => void flush(), 800)
-    return () => window.clearTimeout(timer)
-  }, [draft, flush, status])
+  const blocker = useBlocker({
+    shouldBlockFn: () => latestRef.current !== committedRef.current,
+    enableBeforeUnload: () => latestRef.current !== committedRef.current,
+    withResolver: true,
+  })
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1086,42 +1103,104 @@ function TextInspector({
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-9 shrink-0 items-center border-b px-3 text-xs text-muted-foreground">
-        {detectedLive ? t('live.readOnly') : t(`save.${status}`)}
-        {!detectedLive && (
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            className="ml-auto"
-            title={t('actions.save')}
-            disabled={status === 'saving'}
-            onClick={() => void flush()}
-          >
-            <SaveIcon />
-          </Button>
-        )}
+    <>
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="flex h-9 shrink-0 items-center border-b px-3 text-xs text-muted-foreground">
+          {detectedLive ? t('live.readOnly') : t(`save.${status}`)}
+          {!detectedLive && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="ml-auto"
+              title={t('actions.save')}
+              disabled={status === 'saving'}
+              onClick={() => void flush()}
+            >
+              <SaveIcon />
+            </Button>
+          )}
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto">
+          <CodeEditor
+            initialContent={draft}
+            filename={entry.name}
+            isDark={resolvedTheme === 'dark'}
+            readOnly={!editable}
+            lineWrapping
+            ariaLabel={entry.name}
+            onChange={
+              editable
+                ? (content) => {
+                    setDraft(content)
+                    latestRef.current = content
+                    if (status !== 'conflict') setStatus('dirty')
+                  }
+                : undefined
+            }
+          />
+        </div>
       </div>
-      <div className="min-h-0 flex-1 overflow-auto">
-        <CodeEditor
-          initialContent={draft}
-          filename={entry.name}
-          isDark={resolvedTheme === 'dark'}
-          readOnly={!editable}
-          lineWrapping
-          ariaLabel={entry.name}
-          onChange={
-            editable
-              ? (content) => {
-                  setDraft(content)
-                  latestRef.current = content
-                  if (status !== 'conflict') setStatus('dirty')
-                }
-              : undefined
+      <AlertDialog
+        open={blocker.status === 'blocked'}
+        onOpenChange={(open) => {
+          if (!open && !savingBeforeLeave && blocker.status === 'blocked') {
+            blocker.reset()
           }
-        />
-      </div>
-    </div>
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t('save.leaveTitle', { name: entry.name })}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('save.leaveDescription')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {(status === 'error' || status === 'conflict') && (
+            <p role="alert" className="text-sm text-destructive">
+              {t(`save.${status}`)}
+            </p>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel
+              disabled={savingBeforeLeave}
+              onClick={() => {
+                if (blocker.status === 'blocked') blocker.reset()
+              }}
+            >
+              {t('save.continueEditing')}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={savingBeforeLeave}
+              onClick={() => {
+                if (blocker.status === 'blocked') blocker.proceed()
+              }}
+            >
+              {t('save.discard')}
+            </AlertDialogAction>
+            <AlertDialogAction
+              disabled={savingBeforeLeave}
+              onClick={async (event) => {
+                event.preventDefault()
+                setSavingBeforeLeave(true)
+                const saved = await flush()
+                setSavingBeforeLeave(false)
+                if (saved && blocker.status === 'blocked') blocker.proceed()
+              }}
+            >
+              {savingBeforeLeave ? (
+                <Loader2Icon className="animate-spin" />
+              ) : (
+                <SaveIcon />
+              )}
+              {t('save.saveAndLeave')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   )
 }
 
