@@ -17,22 +17,34 @@ export type LiveContextMount = {
 }
 
 export type JsonSchema = {
-  type?: string | string[]
-  anyOf?: JsonSchema[]
-  oneOf?: JsonSchema[]
-  allOf?: JsonSchema[]
+  $ref?: string
+  $defs?: Record<string, JsonSchema>
+  definitions?: Record<string, JsonSchema>
+  type?: string | readonly string[]
+  anyOf?: readonly JsonSchema[]
+  oneOf?: readonly JsonSchema[]
+  allOf?: readonly JsonSchema[]
+  const?: unknown
   title?: string
   description?: string
   default?: unknown
-  enum?: unknown[]
+  enum?: readonly unknown[]
   properties?: Record<string, JsonSchema>
-  required?: string[]
+  required?: readonly string[]
   items?: JsonSchema
   minimum?: number
   maximum?: number
+  minItems?: number
+  maxItems?: number
   minLength?: number
   maxLength?: number
-  examples?: unknown[]
+  pattern?: string
+  format?: string
+  examples?: readonly unknown[]
+  additionalProperties?: boolean | JsonSchema
+  if?: JsonSchema
+  then?: JsonSchema
+  else?: JsonSchema
 }
 
 export type McpToolDefinition = {

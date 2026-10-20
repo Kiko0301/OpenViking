@@ -1,11 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  argumentsToInputValues,
+  cleanSchemaArguments,
   initialSchemaArguments,
-  resolveSchema,
-  schemaFields,
-  schemaType,
+  toRjsfSchema,
   validateSchemaArguments,
 } from './schema'
 
@@ -20,40 +18,32 @@ const schema = {
 } as const
 
 describe('MCP input schema forms', () => {
-  it('preserves field order and required state', () => {
-    expect(
-      schemaFields(schema).map(({ name, required }) => ({ name, required })),
-    ).toEqual([
-      { name: 'a', required: true },
-      { name: 'b', required: true },
-      { name: 'note', required: false },
-    ])
-  })
-
-  it('applies defaults and converts values to inputs', () => {
-    const values = initialSchemaArguments(schema, { a: 1 })
-    expect(values).toEqual({ a: 1, note: 'sum' })
-    expect(argumentsToInputValues(schema, values)).toEqual({
-      a: '1',
+  it('uses RJSF defaults without synthesizing missing values', () => {
+    expect(initialSchemaArguments(schema, { a: 1 })).toEqual({
+      a: 1,
       note: 'sum',
     })
   })
 
-  it('validates required values and parses numeric arguments', () => {
-    expect(validateSchemaArguments(schema, { a: '1.5', b: '2' })).toEqual({
+  it('validates and preserves typed form data with AJV', () => {
+    expect(validateSchemaArguments(schema, { a: 1.5, b: 2 })).toEqual({
       arguments: { a: 1.5, b: 2 },
-      errors: {},
+      errors: [],
     })
-    expect(validateSchemaArguments(schema, { a: '', b: 'bad' })).toEqual({
-      arguments: {},
-      errors: {
-        a: 'required',
-        b: 'Expected a number',
-      },
-    })
+
+    const result = validateSchemaArguments(schema, { a: 1 })
+    expect(result.arguments).toEqual({ a: 1 })
+    expect(result.errors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: 'required',
+          params: { missingProperty: 'b' },
+        }),
+      ]),
+    )
   })
 
-  it('parses nullable anyOf values using their non-null type', () => {
+  it('flattens nullable unions while retaining genuine alternatives', () => {
     const nullableSchema = {
       properties: {
         limit: {
@@ -64,26 +54,143 @@ describe('MCP input schema forms', () => {
           anyOf: [{ type: 'integer' }, { type: 'null' }],
           default: null,
         },
+        filter: {
+          oneOf: [{ type: 'string' }, { type: 'number' }],
+        },
       },
       type: 'object',
     } as const
 
-    expect(schemaType(nullableSchema.properties.start_time)).toBe('integer')
-    expect(resolveSchema(nullableSchema.properties.start_time)).toEqual({
-      default: null,
-      type: 'integer',
-    })
-    expect(
-      validateSchemaArguments(nullableSchema, {
-        limit: '10',
-        start_time: '1792310712773',
-      }),
-    ).toEqual({
-      arguments: {
-        limit: 10,
-        start_time: 1792310712773,
+    expect(toRjsfSchema(nullableSchema)).toMatchObject({
+      properties: {
+        limit: { type: 'integer', default: 10 },
+        start_time: { type: 'integer' },
+        filter: {
+          oneOf: [{ type: 'string' }, { type: 'number' }],
+        },
       },
-      errors: {},
     })
+  })
+
+  it('builds defaults and validates nested objects and arrays', () => {
+    const metricSchema = {
+      properties: {
+        region: { type: 'string' },
+        request: {
+          properties: {
+            Instances: {
+              anyOf: [
+                {
+                  items: {
+                    properties: {
+                      Dimensions: {
+                        items: {
+                          properties: {
+                            Name: { type: 'string' },
+                            Value: { type: 'string' },
+                          },
+                          required: ['Name', 'Value'],
+                          type: 'object',
+                        },
+                        type: 'array',
+                      },
+                    },
+                    required: ['Dimensions'],
+                    type: 'object',
+                  },
+                  type: 'array',
+                },
+                { type: 'null' },
+              ],
+              default: null,
+            },
+            MetricName: { type: 'string' },
+            Namespace: { type: 'string' },
+            Period: { type: 'string', default: '1m' },
+            StartTime: {
+              anyOf: [{ type: 'integer' }, { type: 'null' }],
+              default: null,
+            },
+            SubNamespace: { type: 'string' },
+          },
+          required: ['MetricName', 'Namespace', 'SubNamespace'],
+          type: 'object',
+        },
+      },
+      required: ['region', 'request'],
+      type: 'object',
+    } as const
+
+    expect(initialSchemaArguments(metricSchema)).toEqual({
+      request: { Period: '1m' },
+    })
+
+    const values = {
+      region: 'cn-beijing',
+      request: {
+        Instances: [
+          {
+            Dimensions: [{ Name: 'ResourceID', Value: 'mysql-c31d' }],
+          },
+        ],
+        MetricName: 'ThreadsConnected',
+        Namespace: 'VCM_RDS_MySQL',
+        Period: '1m',
+        StartTime: 1792310712,
+        SubNamespace: 'engine_monitor_new',
+      },
+    }
+    expect(validateSchemaArguments(metricSchema, values)).toEqual({
+      arguments: values,
+      errors: [],
+    })
+  })
+
+  it('omits empty optional values while retaining required containers', () => {
+    const nestedSchema = {
+      properties: {
+        optional: { type: 'string' },
+        request: {
+          properties: {
+            filter: { type: 'object', properties: {} },
+            tags: { type: 'array', items: { type: 'string' } },
+          },
+          type: 'object',
+        },
+      },
+      required: ['request'],
+      type: 'object',
+    } as const
+
+    expect(
+      cleanSchemaArguments(nestedSchema, {
+        optional: '',
+        request: { filter: {}, tags: [] },
+      }),
+    ).toEqual({ request: {} })
+  })
+
+  it('resolves definitions and validates referenced fields', () => {
+    const referencedSchema = {
+      $defs: {
+        dimension: {
+          properties: { Name: { type: 'string', minLength: 1 } },
+          required: ['Name'],
+          type: 'object',
+        },
+      },
+      properties: {
+        dimension: { $ref: '#/$defs/dimension' },
+      },
+      required: ['dimension'],
+      type: 'object',
+    } as const
+
+    expect(
+      validateSchemaArguments(referencedSchema, { dimension: { Name: '' } })
+        .errors,
+    ).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'minLength' })]),
+    )
   })
 })

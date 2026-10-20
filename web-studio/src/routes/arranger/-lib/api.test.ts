@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import { OvClientError } from '#/lib/ov-client'
+import type * as OvClientModule from '#/lib/ov-client'
 
 import {
   isLiveContextDocument,
@@ -6,7 +9,67 @@ import {
   parseMcpMounts,
   parseMcpServers,
   parseMcpTools,
+  saveText,
 } from './api'
+
+const { post } = vi.hoisted(() => ({ post: vi.fn() }))
+
+vi.mock('#/lib/ov-client', async (importOriginal) => {
+  const original = await importOriginal<typeof OvClientModule>()
+  return {
+    ...original,
+    getOvClient: () => ({
+      getOptions: () => ({ baseUrl: 'http://localhost:1933' }),
+      instance: { post },
+    }),
+  }
+})
+
+afterEach(() => {
+  post.mockReset()
+  vi.useRealTimers()
+})
+
+describe('text saving', () => {
+  it('retries transient resource-busy conflicts', async () => {
+    vi.useFakeTimers()
+    post
+      .mockRejectedValueOnce(
+        new OvClientError({
+          code: 'CONFLICT',
+          details: { conflict_type: 'path_busy', retryable: true },
+          message: 'resource is busy',
+          statusCode: 409,
+        }),
+      )
+      .mockResolvedValueOnce({})
+
+    const saving = saveText(
+      'viking://resources/arrange/note.md',
+      'content',
+      '0'.repeat(64),
+    )
+    await vi.runAllTimersAsync()
+
+    await expect(saving).resolves.toBeUndefined()
+    expect(post).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not retry content revision conflicts', async () => {
+    const conflict = new OvClientError({
+      code: 'CONFLICT',
+      details: { conflict_type: 'content_revision', retryable: false },
+      message: 'content revision changed',
+      statusCode: 409,
+    })
+    post.mockRejectedValueOnce(conflict)
+
+    await expect(
+      saveText('viking://resources/arrange/note.md', 'content', '0'.repeat(64)),
+    ).rejects.toBe(conflict)
+    expect(post).toHaveBeenCalledTimes(1)
+  })
+})
 
 describe('MCP response parsing', () => {
   it('accepts result objects and direct arrays', () => {

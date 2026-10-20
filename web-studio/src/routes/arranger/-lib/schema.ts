@@ -1,127 +1,125 @@
+import { createSchemaUtils } from '@rjsf/utils'
+import type { RJSFSchema, RJSFValidationError } from '@rjsf/utils'
+import validator from '@rjsf/validator-ajv8'
+
 import type { JsonSchema } from './model'
 
-export type SchemaField = {
-  name: string
-  schema: JsonSchema
-  required: boolean
+export type SchemaFormObject = Record<string, unknown>
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
-export function schemaFields(schema: JsonSchema): SchemaField[] {
-  const required = new Set(schema.required || [])
-  return Object.entries(schema.properties || {}).map(([name, property]) => ({
-    name,
-    schema: property,
-    required: required.has(name),
-  }))
-}
+function adaptSchemaValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(adaptSchemaValue)
+  if (!isPlainObject(value)) return value
 
-export function resolveSchema(schema: JsonSchema): JsonSchema {
-  const alternatives = schema.anyOf || schema.oneOf
-  if (!alternatives) return schema
-  const nonNull = alternatives.filter((candidate) => {
-    const type = candidate.type
-    return type !== 'null' && !(Array.isArray(type) && type.includes('null'))
-  })
-  if (nonNull.length !== 1) return schema
-  const parent = { ...schema }
-  delete parent.anyOf
-  delete parent.oneOf
-  return { ...nonNull[0], ...parent }
-}
+  const adapted = Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [key, adaptSchemaValue(child)]),
+  )
+  const alternatives = adapted.anyOf || adapted.oneOf
+  if (!Array.isArray(alternatives)) return adapted
 
-export function schemaType(schema: JsonSchema): string {
-  const resolved = resolveSchema(schema)
-  if (Array.isArray(resolved.type)) {
-    return resolved.type.find((type) => type !== 'null') || 'string'
+  const nonNull = alternatives.filter(
+    (candidate) =>
+      !isPlainObject(candidate) ||
+      (candidate.type !== 'null' &&
+        !(Array.isArray(candidate.type) && candidate.type.includes('null'))),
+  )
+  if (nonNull.length !== 1 || nonNull.length === alternatives.length) {
+    return adapted
   }
-  if (resolved.type) return resolved.type
-  if (resolved.properties) return 'object'
-  if (resolved.items) return 'array'
-  return 'string'
+
+  const result = {
+    ...(nonNull[0] as Record<string, unknown>),
+    ...adapted,
+  }
+  delete result.anyOf
+  delete result.oneOf
+  if (result.default === null) delete result.default
+  return result
+}
+
+export function toRjsfSchema(schema: JsonSchema): RJSFSchema {
+  return adaptSchemaValue(schema) as RJSFSchema
 }
 
 export function initialSchemaArguments(
   schema: JsonSchema,
   current: Record<string, unknown> = {},
-): Record<string, unknown> {
-  const result = { ...current }
-  for (const field of schemaFields(schema)) {
-    if (field.name in result || field.schema.default === undefined) continue
-    result[field.name] = field.schema.default
-  }
-  return result
+): SchemaFormObject {
+  const rjsfSchema = toRjsfSchema(schema)
+  const value = createSchemaUtils(validator, rjsfSchema).getDefaultFormState(
+    rjsfSchema,
+    current,
+  )
+  return isPlainObject(value) ? value : {}
 }
 
-export function parseSchemaInput(raw: string, schema: JsonSchema): unknown {
-  const resolved = resolveSchema(schema)
-  const type = schemaType(resolved)
-  if (type === 'number' || type === 'integer') {
-    const value = Number(raw)
-    if (!Number.isFinite(value)) throw new Error('Expected a number')
-    if (type === 'integer' && !Number.isInteger(value)) {
-      throw new Error('Expected an integer')
-    }
-    return value
+function schemaType(schema: RJSFSchema): string | undefined {
+  if (typeof schema.type === 'string') return schema.type
+  if (Array.isArray(schema.type)) {
+    return schema.type.find((type) => type !== 'null')
   }
-  if (type === 'boolean') {
-    if (raw === 'true') return true
-    if (raw === 'false') return false
-    throw new Error('Expected true or false')
-  }
-  if (type === 'object' || type === 'array') {
-    const value = JSON.parse(raw) as unknown
-    if (type === 'array' && !Array.isArray(value)) {
-      throw new Error('Expected a JSON array')
+  if (schema.properties) return 'object'
+  if (schema.items) return 'array'
+  return undefined
+}
+
+function pruneSchemaValue(
+  schema: RJSFSchema,
+  value: unknown,
+  required: boolean,
+): unknown {
+  if (value === undefined || (!required && value === null)) return undefined
+
+  const type = schemaType(schema)
+  if (type === 'object' && isPlainObject(value)) {
+    const requiredFields = new Set(schema.required || [])
+    const properties = schema.properties || {}
+    const result: Record<string, unknown> = {}
+
+    for (const [name, child] of Object.entries(value)) {
+      const childSchema = properties[name]
+      const next = isPlainObject(childSchema)
+        ? pruneSchemaValue(childSchema, child, requiredFields.has(name))
+        : child
+      if (next !== undefined) result[name] = next
     }
-    if (
-      type === 'object' &&
-      (!value || typeof value !== 'object' || Array.isArray(value))
-    ) {
-      throw new Error('Expected a JSON object')
-    }
-    return value
+    return !required && Object.keys(result).length === 0 ? undefined : result
   }
-  return raw
+
+  if (type === 'array' && Array.isArray(value)) {
+    const itemSchema = isPlainObject(schema.items) ? schema.items : undefined
+    const result = itemSchema
+      ? value
+          .map((item) => pruneSchemaValue(itemSchema, item, true))
+          .filter((item) => item !== undefined)
+      : value
+    return !required && result.length === 0 ? undefined : result
+  }
+
+  if (!required && value === '') return undefined
+  return value
+}
+
+export function cleanSchemaArguments(
+  schema: JsonSchema,
+  values: SchemaFormObject,
+): SchemaFormObject {
+  const result = pruneSchemaValue(toRjsfSchema(schema), values, true)
+  return isPlainObject(result) ? result : {}
 }
 
 export function validateSchemaArguments(
   schema: JsonSchema,
-  values: Record<string, string>,
+  values: SchemaFormObject,
 ): {
-  arguments: Record<string, unknown>
-  errors: Record<string, string>
+  arguments: SchemaFormObject
+  errors: RJSFValidationError[]
 } {
-  const result: Record<string, unknown> = {}
-  const errors: Record<string, string> = {}
-  for (const field of schemaFields(schema)) {
-    const raw = values[field.name]
-    if (!(field.name in values) || raw === '') {
-      if (field.required) errors[field.name] = 'required'
-      continue
-    }
-    try {
-      result[field.name] = parseSchemaInput(raw, field.schema)
-    } catch (error) {
-      errors[field.name] =
-        error instanceof Error ? error.message : String(error)
-    }
-  }
-  return { arguments: result, errors }
-}
-
-export function argumentsToInputValues(
-  schema: JsonSchema,
-  values: Record<string, unknown>,
-): Record<string, string> {
-  const result: Record<string, string> = {}
-  for (const field of schemaFields(schema)) {
-    const value = values[field.name]
-    if (value === undefined || value === null) continue
-    const type = schemaType(field.schema)
-    result[field.name] =
-      type === 'object' || type === 'array'
-        ? JSON.stringify(value, null, 2)
-        : String(value)
-  }
-  return result
+  const rjsfSchema = toRjsfSchema(schema)
+  const args = cleanSchemaArguments(schema, values)
+  const { errors } = validator.validateFormData(args, rjsfSchema)
+  return { arguments: args, errors }
 }

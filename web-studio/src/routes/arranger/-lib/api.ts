@@ -6,6 +6,7 @@ import {
   getFsStat,
   getOvClient,
   getOvResult,
+  isOvClientError,
   normalizeOvClientError,
   postFsMkdir,
   postFsMv,
@@ -33,6 +34,22 @@ type Envelope<T> = {
   has_more?: boolean
   result: T
   status: string
+}
+
+const SAVE_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000]
+
+function isRetryableWriteConflict(error: unknown): boolean {
+  if (!isOvClientError(error) || error.code !== 'CONFLICT') return false
+  return (
+    error.details !== null &&
+    typeof error.details === 'object' &&
+    'retryable' in error.details &&
+    error.details.retryable === true
+  )
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
 function apiBaseUrl(): string {
@@ -297,22 +314,35 @@ export async function saveText(
   content: string,
   expectedSha256: string,
 ): Promise<void> {
-  await getOvClient().instance.post(
-    '/api/v1/content/batch-write',
-    {
-      root_uri: normalizeVikingUri(uri).split('/').slice(0, -1).join('/'),
-      wait: false,
-      operations: [
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await getOvClient().instance.post(
+        '/api/v1/content/batch-write',
         {
-          uri: normalizeVikingUri(uri),
-          content,
-          mode: 'replace',
-          expected_sha256: expectedSha256,
+          root_uri: normalizeVikingUri(uri).split('/').slice(0, -1).join('/'),
+          wait: false,
+          operations: [
+            {
+              uri: normalizeVikingUri(uri),
+              content,
+              mode: 'replace',
+              expected_sha256: expectedSha256,
+            },
+          ],
         },
-      ],
-    },
-    { baseURL: apiBaseUrl() },
-  )
+        { baseURL: apiBaseUrl() },
+      )
+      return
+    } catch (error) {
+      if (
+        attempt >= SAVE_RETRY_DELAYS_MS.length ||
+        !isRetryableWriteConflict(error)
+      ) {
+        throw error
+      }
+      await delay(SAVE_RETRY_DELAYS_MS[attempt])
+    }
+  }
 }
 
 export async function moveResource(

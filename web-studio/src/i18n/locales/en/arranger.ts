@@ -82,15 +82,20 @@ const arranger = {
     updatedAt: 'Updated at {{value}}',
   },
   mount: {
+    addItem: 'Add item',
     argumentsDescription:
       'Generated from the selected tool input schema. Required values must be provided.',
     argumentsTitle: 'Tool arguments',
     catalogIncomplete: 'Some tool catalogs failed to load',
     chooseToolFirst:
       'Select a tool to generate its argument form automatically.',
+    editAsJson: 'Edit as JSON',
+    expectedJsonObject: 'Tool arguments must be a JSON object.',
+    itemLabel: 'Item {{index}}',
     loadingTools: 'Loading servers',
     noArguments: 'This tool does not require preset arguments.',
     notSet: 'Not set',
+    removeItem: 'Remove item',
     selectServer: 'Select an MCP server',
     selectTool: 'Select a tool',
     selectValue: 'Select a value',

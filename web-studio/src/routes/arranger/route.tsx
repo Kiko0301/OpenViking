@@ -11,6 +11,7 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTheme } from 'next-themes'
 import { useTranslation } from 'react-i18next'
+import type { RJSFValidationError } from '@rjsf/utils'
 import {
   CableIcon,
   ChevronDownIcon,
@@ -63,10 +64,8 @@ import { AddResourceForm } from '#/routes/resources/-components/add-resource-pag
 import { ResourceUploadProvider } from '#/routes/resources/-hooks/use-resource-upload'
 import type { VikingFsEntry } from '#/routes/resources/-types/viking-fm'
 
-import {
-  LiveContextInspector,
-  SchemaArgumentsForm,
-} from './-components/live-context'
+import { LiveContextInspector } from './-components/live-context'
+import { SchemaArgumentsForm } from './-components/schema-arguments-form'
 import {
   createDirectory,
   createText,
@@ -92,11 +91,8 @@ import type {
   MountInput,
   MutationKind,
 } from './-lib/model'
-import {
-  argumentsToInputValues,
-  initialSchemaArguments,
-  validateSchemaArguments,
-} from './-lib/schema'
+import { initialSchemaArguments, validateSchemaArguments } from './-lib/schema'
+import type { SchemaFormObject } from './-lib/schema'
 import {
   joinVikingUri,
   mcpServerNameFromToolUri,
@@ -1013,6 +1009,7 @@ function TextInspector({
 
   useEffect(() => {
     if (!documentQuery.data) return
+    if (latestRef.current !== committedRef.current) return
     setDraft(documentQuery.data.content)
     latestRef.current = documentQuery.data.content
     committedRef.current = documentQuery.data.content
@@ -1031,12 +1028,18 @@ function TextInspector({
           await saveText(entry.uri, snapshot, hashRef.current)
         } catch (error) {
           if (mountedRef.current) {
-            const statusCode =
-              error &&
-              typeof error === 'object' &&
-              'statusCode' in error &&
-              (error as { statusCode?: number }).statusCode
-            setStatus(statusCode === 409 ? 'conflict' : 'error')
+            setStatus(
+              isOvClientError(error) &&
+                error.statusCode === 409 &&
+                !(
+                  error.details &&
+                  typeof error.details === 'object' &&
+                  'retryable' in error.details &&
+                  error.details.retryable === true
+                )
+                ? 'conflict'
+                : 'error',
+            )
           }
           return
         }
@@ -1170,11 +1173,9 @@ function ActionDialog({
   const [description, setDescription] = useState('')
   const [timeout, setTimeoutValue] = useState('60')
   const [tags, setTags] = useState('')
-  const [argumentValues, setArgumentValues] = useState<Record<string, string>>(
-    {},
-  )
-  const [argumentErrors, setArgumentErrors] = useState<Record<string, string>>(
-    {},
+  const [argumentValues, setArgumentValues] = useState<SchemaFormObject>({})
+  const [argumentErrors, setArgumentErrors] = useState<RJSFValidationError[]>(
+    [],
   )
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -1222,9 +1223,7 @@ function ActionDialog({
       selectedTool.tool.inputSchema,
       mount.arguments,
     )
-    setArgumentValues(
-      argumentsToInputValues(selectedTool.tool.inputSchema, values),
-    )
+    setArgumentValues(values)
   }, [action.source, liveIndex.mounts, selectedTool])
 
   const submit = async () => {
@@ -1253,7 +1252,7 @@ function ActionDialog({
           argumentValues,
         )
         setArgumentErrors(validated.errors)
-        if (Object.keys(validated.errors).length) {
+        if (validated.errors.length) {
           throw new Error(t('validation.invalidArguments'))
         }
         const input: MountInput = {
@@ -1375,7 +1374,7 @@ function ActionDialog({
                       setServerName(value === null ? '' : String(value))
                       setToolUri('')
                       setArgumentValues({})
-                      setArgumentErrors({})
+                      setArgumentErrors([])
                     }}
                   >
                     <SelectTrigger className="w-full">
@@ -1410,14 +1409,12 @@ function ActionDialog({
                         (item) => item.uri === uri,
                       )
                       setToolUri(uri)
-                      setArgumentErrors({})
+                      setArgumentErrors([])
                       if (!tool) return
                       const defaults = initialSchemaArguments(
                         tool.tool.inputSchema,
                       )
-                      setArgumentValues(
-                        argumentsToInputValues(tool.tool.inputSchema, defaults),
-                      )
+                      setArgumentValues(defaults)
                     }}
                   >
                     <SelectTrigger className="w-full">
@@ -1497,16 +1494,9 @@ function ActionDialog({
                     schema={selectedTool.tool.inputSchema}
                     values={argumentValues}
                     errors={argumentErrors}
-                    onChange={(field, value) => {
-                      setArgumentValues((current) => ({
-                        ...current,
-                        [field]: value,
-                      }))
-                      setArgumentErrors((current) => {
-                        const next = { ...current }
-                        delete next[field]
-                        return next
-                      })
+                    onChange={(value) => {
+                      setArgumentValues(value)
+                      setArgumentErrors([])
                     }}
                   />
                 ) : (
