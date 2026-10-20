@@ -712,6 +712,14 @@ class BotCompileService:
         request: SanitizedCompileRequest,
         connection: dict[str, Any],
     ) -> None:
+        snapshot = (request.changes or {}).get("skill_snapshot")
+        if snapshot is not None:
+            if not isinstance(snapshot, dict) or snapshot.get("uri") != request.skill:
+                raise CompileFailure(
+                    "SKILL_INVALID", "Invalid Compile Skill snapshot", stage="agent"
+                )
+            # Task-local connection follows existing parent, child and tool client propagation.
+            connection = {**connection, "skill_snapshot": snapshot}
         target_type = classify_uri(request.to).context_type
         session_key = SessionKey(type="compile", channel_id=task_id, chat_id=task_id)
         task_config = self.config.model_copy(
@@ -746,14 +754,27 @@ class BotCompileService:
             client = await VikingClient.create(connection=connection, config=self.config)
             source_files = None
             source_request = request
-            if request.changes is not None:
+            execution = (request.changes or {}).get("execution") or {}
+            full_execution = execution.get("mode") == "full" or (
+                not execution and request.instruction_provided
+            )
+            if full_execution:
+                source_files = await self._list_source_files(
+                    client, request.from_, allow_empty=True
+                )
+                source_request = request.model_copy(update={"last_compile_time": None})
+            elif request.changes is not None:
                 source_files = await self._list_changed_files(client, request.changes)
             elif request.last_compile_time is not None:
                 source_files = await self._list_source_files(
                     client, request.from_, cutoff=request.last_compile_time
                 )
             if source_files is not None:
-                if not source_files and not (request.changes or {}).get("scopes"):
+                if (
+                    not full_execution
+                    and not source_files
+                    and not (request.changes or {}).get("scopes")
+                ):
 
                     def complete_without_sources(task: CompileTask) -> None:
                         """Finish an incremental no-op without model calls or target writes."""
@@ -767,7 +788,7 @@ class BotCompileService:
 
                     await self.store.update(task_id, complete_without_sources)
                     return
-                source_request = request.model_copy(update={"from_": source_files})
+                source_request = source_request.model_copy(update={"from_": source_files})
             skill_text = await client.read_raw(f"{request.skill}/SKILL.md")
             if not skill_text.strip():
                 raise ValueError("Compile Skill is empty")
@@ -933,6 +954,7 @@ class BotCompileService:
                         operations=rendered.operations,
                         wait=False,
                         defer_processing=True,
+                        edit_source="compile",
                     )
                 except OpenVikingError as exc:
                     if exc.code == "CONFLICT":
@@ -1128,6 +1150,7 @@ class BotCompileService:
                     wait=False,
                     skip_conflicts=True,
                     defer_processing=True,
+                    edit_source="compile",
                 )
             conflicts = result.get("conflicts", [])
             for conflict in conflicts:
@@ -1444,12 +1467,17 @@ class BotCompileService:
         return registry
 
     async def _list_source_files(
-        self, client: VikingClient, roots: list[str], *, cutoff: datetime | None = None
+        self,
+        client: VikingClient,
+        roots: list[str],
+        *,
+        cutoff: datetime | None = None,
+        allow_empty: bool = False,
     ) -> list[str]:
         """List unique sources, excluding files strictly older than the UTC cutoff.
 
         Unknown file times are retained; directory times never prune descendants.
-        Listing failures propagate. Empty sources raise only without a cutoff.
+        Listing failures propagate. Full reprocessing allows empty roots to reconcile removed inputs.
         """
 
         async def inventory(root: str) -> list[dict[str, Any]]:
@@ -1494,13 +1522,11 @@ class BotCompileService:
                     except ValueError:
                         pass
                 files.add(uri)
-        if not files and cutoff is None:
+        if not files and cutoff is None and not allow_empty:
             raise ValueError("Compile sources contain no files")
         return sorted(files)
 
-    async def _list_changed_files(
-        self, client: VikingClient, changes: dict[str, Any]
-    ) -> list[str]:
+    async def _list_changed_files(self, client: VikingClient, changes: dict[str, Any]) -> list[str]:
         """Expand the kernel's change scopes into existing source files to read.
 
         Deleted files are gone from the source tree; the prompt reports them so
@@ -1738,8 +1764,12 @@ class BotCompileService:
                 if "deleted" in {scope.get("change_type"), *(scope.get("change_types") or [])}
             ]
             system += (
-                "\nThis is an incremental Compile: the from list holds only changed sources. "
-                "Update existing pages in the target instead of rewriting it; you may read "
+                (
+                    "\nThis Compile processes all sources. "
+                    if (request.changes.get("execution") or {}).get("mode") == "full"
+                    else "\nThis is an incremental Compile: the from list holds only changed sources. "
+                )
+                + "Update existing pages in the target instead of rewriting it; you may read "
                 "other target pages when needed."
                 + (
                     " These sources were deleted; remove or revise content derived from them: "

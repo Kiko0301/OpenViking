@@ -5,14 +5,16 @@ run, so it checks the kernel half (registry, snapshots, change plan, finish).
 """
 
 import asyncio
+import base64
 from datetime import datetime
 from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.compile_scheduler import TZ, current_slot, next_slot
-from openviking.service.compile_service import CompileRequest
+from openviking.service.compile_service import CompileConfigUpdate, CompileRequest
 from openviking.service.compile_targets import CompileStore, CompileVersions, parse_schedule
 from openviking.service.external_task_service import ExternalTaskSnapshot
 from openviking.service.task_tracker import get_task_tracker
@@ -65,16 +67,29 @@ def compile_write(service, request):
             operations=[{"uri": uri, "content": content}],
             ctx=ctx,
             defer_processing=True,
+            edit_source="compile",
         )
 
     return write
 
 
-async def _run(service, ctx, *, write_page=None, to=TO):
+async def _run(
+    service, ctx, *, write_page=None, to=TO, scheduled=False, status="completed", **request_fields
+):
     compile_service = service.compile
     compile_service.configure_local_backend("http://127.0.0.1:1", "")
-    request = CompileRequest.model_validate({"from": [SRC], "to": to, "skill": SKILL})
-    task = await compile_service.create(request, connection={}, ctx=ctx)
+    if scheduled:
+        store = compile_service.lifecycle.store
+        record = await store.get_by_to(ctx.account_id, to)
+        async with store.edit(ctx.account_id, record["id"]) as record:
+            task = await compile_service.create_scheduled(
+                record, ctx=ctx, connection={}, idempotency_key=f"schedule-test-{uuid4().hex}"
+            )
+    else:
+        request = CompileRequest.model_validate(
+            {"from": [SRC], "to": to, "skill": SKILL, **request_fields}
+        )
+        task = await compile_service.create(request, connection={}, ctx=ctx)
     task = await get_task_tracker().get(task.task_id, ctx.account_id, ctx.user.user_id)
     started = await compile_service.on_start(task)
     changes = None
@@ -84,7 +99,14 @@ async def _run(service, ctx, *, write_page=None, to=TO):
         )
         if write_page:
             await _write(service, f"{to}/page.md", write_page, ctx)
-        await compile_service.on_finish(task, ExternalTaskSnapshot(status="completed"))
+    await compile_service._tasks._apply_snapshot(
+        started
+        if isinstance(started, ExternalTaskSnapshot)
+        else ExternalTaskSnapshot(status=status),
+        task_id=task.task_id,
+        account_id=ctx.account_id,
+        user_id=ctx.user.user_id,
+    )
     return started, changes
 
 
@@ -101,6 +123,40 @@ def test_schedule_slots():
     sunday = parse_schedule({"frequency": "weekly", "weekday": 7, "hour": 23, "minute": 59})
     assert current_slot(sunday, at(13, 1, 0)) == at(11, 23, 59)
     assert next_slot(sunday, at(13, 1, 0)) == at(18, 23, 59)
+
+
+@pytest.mark.asyncio
+async def test_operation_history_pagination(service, monkeypatch):
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    store = service.compile.lifecycle.store
+    target_id = await store.register(ctx.account_id, TO)
+    operations = [
+        {"operation_id": "op_b", "created_at": 2},
+        {"operation_id": "op_missing"},
+        {"operation_id": "op_latest", "created_at": 3},
+        {"operation_id": "op_a", "created_at": 2},
+        {"operation_id": "op_none", "created_at": None},
+        {"operation_id": "op_old", "created_at": 0},
+    ]
+    for operation in operations:
+        await store.put_operation(ctx.account_id, target_id, operation)
+    expected = ["op_latest", "op_b", "op_a", "op_old", "op_none", "op_missing"]
+    all_operations = await store.list_operations(ctx.account_id, target_id)
+    assert [item["operation_id"] for item in all_operations] == expected
+    page = await service.compile.list_operations(TO, ctx, limit=4, cursor=None)
+    assert [item["operation_id"] for item in page["operations"]] == expected[:4]
+    assert page["next_cursor"] == expected[3]
+    page = await service.compile.list_operations(TO, ctx, limit=4, cursor=page["next_cursor"])
+    assert [item["operation_id"] for item in page["operations"]] == expected[4:]
+    assert page["next_cursor"] is None
+    read_json = AsyncMock(wraps=store.read_json)
+    monkeypatch.setattr(store, "read_json", read_json)
+    for cursor in (expected[-1], "unknown", "../state"):
+        assert await service.compile.list_operations(TO, ctx, limit=2, cursor=cursor) == {
+            "operations": [],
+            "next_cursor": None,
+        }
+    assert all("/../" not in call.args[0] for call in read_json.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -159,6 +215,127 @@ async def test_incremental_compile_on_real_git(service):
     assert config["content_updated_at"] > updated_at
     runs = await service.compile.list_operations(TO, ctx, limit=10, cursor=None)
     assert [run["result"] for run in runs["operations"] if run["result"]][0]["updated"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["instruction", "clear", "skill_uri", "content", "attachment"])
+async def test_compile_inputs_and_skill_snapshots(service, changed):
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    for uri in (f"{SRC}/a.md", f"{SKILL}/SKILL.md"):
+        await _write(service, uri, "original", ctx)
+    params = {"instruction": "refresh" if changed == "clear" else None}
+    await _run(service, ctx, write_page="v1", **params)
+    if changed in {"instruction", "clear"}:
+        params["instruction"] = " \n " if changed == "clear" else " refresh "
+    else:
+        if changed == "skill_uri":
+            params["skill"] = f"{SKILL}-other"
+        path = "references/rules.md" if changed == "attachment" else "SKILL.md"
+        await _write(service, f"{params.get('skill', SKILL)}/{path}", "changed", ctx)
+    started, changes = await _run(service, ctx, write_page="v2", **params)
+    assert started == "proceed" and changes["execution"] == {"mode": "full"}
+    assert changes["scopes"] == [{"uri": SRC, "change_type": "added", "recursive": True}]
+    snapshot = changes["skill_snapshot"]
+    assert set(snapshot) == {"uri", "snapshot_id"}
+    assert await service.viking_fs.show(
+        snapshot["snapshot_id"], path=f"{snapshot['uri']}/SKILL.md", ctx=ctx
+    ) == (b"changed" if changed in {"skill_uri", "content"} else b"original")
+    operation = (await service.compile.list_operations(TO, ctx, limit=1, cursor=None))[
+        "operations"
+    ][0]
+    assert operation["skill_snapshot"] == snapshot
+    assert operation["params"]["args"]["mode"] == "incremental" and operation["head"]
+    versions = await service.compile.file_versions(f"{TO}/page.md", ctx, limit=10, before=None)
+    assert [v["source"] for v in versions["versions"]] == ["compile", "compile"]
+    for instruction in [None, "", " \t\n "] if changed == "clear" else [params["instruction"]]:
+        started, _ = await _run(service, ctx, **{**params, "instruction": instruction})
+        assert isinstance(started, ExternalTaskSnapshot) and started.status == "completed"
+    if changed == "clear":
+        started, _ = await _run(service, ctx)
+        assert isinstance(started, ExternalTaskSnapshot) and started.status == "completed"
+    await _write(service, f"{SRC}/a.md", "a2", ctx)
+    started, changes = await _run(service, ctx, **params)
+    assert started == "proceed" and changes["execution"]["mode"] == "incremental"
+    assert changes["scopes"] == [
+        {"uri": f"{SRC}/a.md", "change_type": "modified", "recursive": False}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_compile_keeps_its_config_and_successful_baseline(service, monkeypatch):
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    other_skill = f"{SKILL}-other"
+    for uri in (f"{SRC}/a.md", f"{SRC}_other/a.md", f"{SKILL}/SKILL.md", f"{other_skill}/SKILL.md"):
+        await _write(service, uri, "original", ctx)
+    lifecycle = service.compile.lifecycle
+    monkeypatch.setattr(lifecycle, "save_credential", AsyncMock(return_value=({}, "credential")))
+    await _run(service, ctx, instruction="scheduled", args={"auto_update": True})
+    started, changes = await _run(service, ctx, scheduled=True)
+    assert started == "proceed" and changes["execution"]["mode"] == "full"
+    before = await lifecycle.store.get_by_to(ctx.account_id, TO)
+    await _run(service, ctx, skill=other_skill, instruction="manual", **{"from": [f"{SRC}_other"]})
+    after = await lifecycle.store.get_by_to(ctx.account_id, TO)
+    assert after["from"] == [SRC]
+    assert (after["skill"], after["instruction"], after["scheduled_progress"]) == (
+        SKILL,
+        "scheduled",
+        before["scheduled_progress"],
+    )
+    started, _ = await _run(service, ctx, scheduled=True)
+    assert isinstance(started, ExternalTaskSnapshot) and started.status == "completed"
+    for change in ("skill", "instruction"):
+        if change == "skill":
+            await _write(service, f"{SKILL}/SKILL.md", "new skill", ctx)
+        else:
+            await service.compile.update_config(
+                CompileConfigUpdate.model_validate(
+                    {
+                        "to": TO,
+                        "from": [SRC],
+                        "skill": SKILL,
+                        "instruction": "new instruction",
+                        "auto_update": True,
+                        "update_schedule": {"frequency": "daily"},
+                    }
+                ),
+                ctx,
+            )
+        started, changes = await _run(service, ctx, scheduled=True, write_page=change)
+        assert started == "proceed" and changes["execution"]["mode"] == "full"
+        operation = (await service.compile.list_operations(TO, ctx, limit=1, cursor=None))[
+            "operations"
+        ][0]
+        assert operation["operation_type"] == "schedule_compile" and operation["head"]
+        started, _ = await _run(service, ctx, scheduled=True)
+        assert isinstance(started, ExternalTaskSnapshot) and started.status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "cancelled", "legacy"])
+async def test_compile_retries_and_missing_successful_baseline(service, status):
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    for uri in (f"{SRC}/a.md", f"{SKILL}/SKILL.md"):
+        await _write(service, uri, "original", ctx)
+    await _run(service, ctx)
+    store = service.compile.lifecycle.store
+    record = await store.get_by_to(ctx.account_id, TO)
+    first = await get_task_tracker().get(
+        record["last_run"]["task_id"], ctx.account_id, ctx.user.user_id
+    )
+    if status == "legacy":
+        async with store.edit(ctx.account_id, record["id"]) as record:
+            record["progress"].pop("skill_snapshot")
+    else:
+        await _run(service, ctx, instruction="refresh", status=status)
+        assert (await store.get_by_to(ctx.account_id, TO))["progress"] == record["progress"]
+    instruction = None if status == "legacy" else "refresh"
+    started, changes = await _run(service, ctx, instruction=instruction)
+    assert started == "proceed" and changes["execution"]["mode"] == "full"
+    successful = (await store.get_by_to(ctx.account_id, TO))["progress"]
+    await service.compile.on_finish(first, await service.compile.on_start(first))
+    assert (await store.get_by_to(ctx.account_id, TO))["progress"] == successful
+    started, _ = await _run(service, ctx, instruction=instruction)
+    assert isinstance(started, ExternalTaskSnapshot) and started.status == "completed"
 
 
 @pytest.mark.asyncio
@@ -265,6 +442,11 @@ async def test_queued_cancel_finishes_history_without_releasing_running_task(
     monkeypatch.setattr(compile_service, "get", poll)
     worker = asyncio.create_task(queue.dequeue())
     await asyncio.wait_for(entered.wait(), 5)
+    store = compile_service.lifecycle.store
+    target_id = first.meta["request"]["compile"]["target_id"]
+    protection = {"task_id": first.task_id, "uris": [f"{TO}/removed.md"]}
+    async with store.edit(ctx.account_id, target_id) as record:
+        record["rollback_deletions"] = protection
     try:
         request = CompileRequest.model_validate(
             {"from": [SRC], "to": TO, "skill": SKILL, "instruction": "refresh"}
@@ -286,12 +468,11 @@ async def test_queued_cancel_finishes_history_without_releasing_running_task(
         await queue.dequeue()
         current = await tracker.get(queued.task_id, ctx.account_id, ctx.user.user_id)
         assert current.status == "cancelled"
-        store = compile_service.lifecycle.store
-        target_id = first.meta["request"]["compile"]["target_id"]
         run = await store.get_operation(ctx.account_id, target_id, queued.task_id)
         assert run["status"] == "cancelled" and run["finished_at"] is not None
         assert run["started_at"] is None
         assert (await store.get(ctx.account_id, target_id))["active_task_id"] == first.task_id
+        assert (await store.get(ctx.account_id, target_id))["rollback_deletions"] == protection
     finally:
         release.set()
         await asyncio.wait_for(worker, 10)
@@ -299,6 +480,7 @@ async def test_queued_cancel_finishes_history_without_releasing_running_task(
         await tracker.get(first.task_id, ctx.account_id, ctx.user.user_id)
     ).status == "completed"
     assert (await store.get(ctx.account_id, target_id))["active_task_id"] is None
+    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"] is None
     submit.assert_awaited_once()
 
 
@@ -365,7 +547,7 @@ async def test_cancel_waits_for_output_lock_before_releasing_target(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["commit", "reindex", "outputs", "git_disabled"])
+@pytest.mark.parametrize("failure", ["commit", "reindex", "outputs", "git_disabled", "release"])
 async def test_finish_commits_then_reindexes_and_resumes(
     service, monkeypatch, compile_task, failure
 ):
@@ -373,23 +555,37 @@ async def test_finish_commits_then_reindexes_and_resumes(
 
     ctx, task = compile_task
     compile_service = service.compile
+    queue = get_queue_manager().get_queue("ExternalTask")
+    delivery = await queue.dequeue_raw()
     if failure == "git_disabled":
         monkeypatch.setattr(
             service.viking_fs, "commit", AsyncMock(side_effect=AGFSNotSupportedError("disabled"))
         )
     await compile_service.on_start(task)
-    await service.fs.write(f"{TO}/page.md", "published", ctx, edit_source="compile", wait=True)
-    assert isinstance((await compile_service.get_config(TO, ctx))["content_updated_at"], float)
     lifecycle = compile_service.lifecycle
+    write_json = AsyncMock(wraps=lifecycle.store.write_json)
+    monkeypatch.setattr(lifecycle.store, "write_json", write_json)
+    for content in ("before", "published", "before", "published"):
+        await service.fs.write(f"{TO}/page.md", content, ctx, edit_source="compile", wait=True)
+    assert (await compile_service.get_config(TO, ctx))["content_updated_at"] is None
+    assert not any(
+        call.args[0].endswith(("/state.json", "/target_folders.json"))
+        for call in write_json.await_args_list
+    )
+    if failure != "git_disabled":
+        write_json.assert_awaited_once()
     commit_spy = AsyncMock(wraps=lifecycle._commit)
     monkeypatch.setattr(lifecycle, "_commit", commit_spy)
     merge_outputs = lifecycle.store.merge_outputs
+    release = lifecycle._release
     if failure == "commit":
         commit_spy.side_effect = OSError("commit failed")
     elif failure == "outputs":
         monkeypatch.setattr(
             lifecycle.store, "merge_outputs", AsyncMock(side_effect=OSError("outputs failed"))
         )
+    elif failure == "release":
+        monkeypatch.setattr(lifecycle, "_release", AsyncMock(side_effect=OSError("release failed")))
     else:
         service.reindex.side_effect = OSError("reindex failed")
     snapshot = ExternalTaskSnapshot(status="completed", meta={"commit_oid": "ignored"})
@@ -398,18 +594,28 @@ async def test_finish_commits_then_reindexes_and_resumes(
     run = await lifecycle.store.get_operation(
         ctx.account_id, task.meta["request"]["compile"]["target_id"], task.task_id
     )
-    assert run["finished_at"] is None
+    assert (run["finished_at"] is not None) == (failure == "release")
     resumed = await compile_service.on_start(task)
     assert isinstance(resumed, ExternalTaskSnapshot) and resumed.status == "completed"
     if failure == "commit":
         service.reindex.assert_not_awaited()
     else:
         assert run["snapshot_committed"] is True
+    if failure == "release":
+        await service.fs.write(f"{TO}/page.md", "ordinary", ctx, edit_source="manual", wait=True)
+        ordinary_updated_at = (await compile_service.get_config(TO, ctx))["content_updated_at"]
     commit_spy.side_effect = None
     monkeypatch.setattr(lifecycle.store, "merge_outputs", merge_outputs)
+    monkeypatch.setattr(lifecycle, "_release", release)
     service.reindex.side_effect = None
     await compile_service.on_finish(task, snapshot)
+    updated_at = (await compile_service.get_config(TO, ctx))["content_updated_at"]
+    assert isinstance(updated_at, float)
+    if failure == "release":
+        assert updated_at == ordinary_updated_at
+        assert await service.viking_fs.read_file(f"{TO}/page.md", ctx=ctx) == "ordinary"
     await compile_service.on_finish(task, snapshot)
+    assert (await compile_service.get_config(TO, ctx))["content_updated_at"] == updated_at
     assert commit_spy.await_count == (2 if failure == "commit" else 1)
     kwargs = service.reindex.await_args.kwargs
     assert {k: kwargs[k] for k in ("uri", "mode", "force", "recursive", "wait")} == {
@@ -419,7 +625,9 @@ async def test_finish_commits_then_reindexes_and_resumes(
         "recursive": True,
         "wait": False,
     }
-    run = (await compile_service.list_operations(TO, ctx, limit=1, cursor=None))["operations"][0]
+    run = await lifecycle.store.get_operation(
+        ctx.account_id, task.meta["request"]["compile"]["target_id"], task.task_id
+    )
     assert run["status"] == "completed" and run["reindex_task_id"] == kwargs["task_id"]
     outputs = await compile_service.operation_outputs(TO, task.task_id, ctx, limit=10, cursor=None)
     assert len(outputs["outputs"]) == 1
@@ -429,6 +637,34 @@ async def test_finish_commits_then_reindexes_and_resumes(
     if failure != "git_disabled":
         versions = await compile_service.file_versions(f"{TO}/page.md", ctx, limit=5, before=None)
         assert sum(v["source"] == "compile" for v in versions["versions"]) == 1
+    await queue.ack(delivery["id"], delivery)
+
+
+@pytest.mark.parametrize(
+    "git_enabled,status", [(True, "completed"), (False, "failed"), (False, "cancelled")]
+)
+async def test_compile_timestamp_defers_round_trip_writes(
+    service, compile_task, compile_write, monkeypatch, git_enabled, status
+):
+    """Reverted writes retain deferred timestamps across task recovery, with or without Git."""
+    from openviking.pyagfs.exceptions import AGFSNotSupportedError
+    from openviking.service.compile_targets import CompileLifecycle
+
+    ctx, task = compile_task
+    queue = get_queue_manager().get_queue("ExternalTask")
+    delivery = await queue.dequeue_raw()
+    if not git_enabled:
+        monkeypatch.setattr(
+            service.viking_fs, "commit", AsyncMock(side_effect=AGFSNotSupportedError("disabled"))
+        )
+    await service.compile.on_start(task)
+    for content in ("changed", "before"):
+        await compile_write(ctx, f"{TO}/page.md", content)
+    assert (await service.compile.get_config(TO, ctx))["content_updated_at"] is None
+    restarted = CompileLifecycle(service.compile.lifecycle.store, service.viking_fs)
+    await restarted.on_finish(task, ExternalTaskSnapshot(status=status))
+    assert isinstance((await service.compile.get_config(TO, ctx))["content_updated_at"], float)
+    await queue.ack(delivery["id"], delivery)
 
 
 @pytest.mark.asyncio
@@ -448,6 +684,7 @@ async def test_finish_accepts_async_reindex_before_completing_task(
         operations=[{"uri": f"{TO}/page.md", "content": "published"}],
         ctx=ctx,
         defer_processing=True,
+        edit_source="compile",
     )
     assert await service.viking_fs.read_file(f"{TO}/page.md", ctx=ctx) == "published"
     await _write(service, f"{TO}/page.md", "published", ctx)
@@ -494,7 +731,12 @@ async def test_unsuccessful_compile_preserves_ordinary_versions(
     for name in ("page.md", "ordinary-new.md", "compile-only.md", "new.md"):
         await compile_write(ctx, f"{TO}/{name}", "compiled")
     # Returning to start bytes must still restore the latest ordinary version.
-    await service.fs.write(f"{TO}/page.md", "ordinary latest", ctx, edit_source="manual", wait=True)
+    await service.fs.batch_write(
+        root_uri=TO,
+        operations=[{"uri": f"{TO}/page.md", "content": "ordinary latest"}],
+        ctx=ctx,
+        defer_processing=True,
+    )
     await compile_write(ctx, f"{TO}/page.md", "before")
     await service.fs.write(f"{TO}/last.md", "ordinary last", ctx, wait=True)
     await service.compile.on_finish(task, ExternalTaskSnapshot(status=status))
@@ -505,7 +747,7 @@ async def test_unsuccessful_compile_preserves_ordinary_versions(
         assert await service.viking_fs.read_file(uri, ctx=ctx) == expected
         history = await service.compile.file_versions(uri, ctx, limit=10, before=None)
         latest = history["versions"][0]
-        assert latest["source"] == "manual"
+        assert latest["source"] == ("agent" if name == "page.md" else "manual")
         assert latest["provenance"]["source_roots"] == [uri]
         assert (
             await service.viking_fs.show(latest["snapshot_id"], path=uri, ctx=ctx)
@@ -524,6 +766,91 @@ async def test_unsuccessful_compile_preserves_ordinary_versions(
             b"before",
         )
     service.reindex.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+@pytest.mark.parametrize("directory,ordinary", [(False, False), (True, False), (True, True)])
+async def test_compile_rollback_preserves_user_deletions(
+    service, compile_task, monkeypatch, status, directory, ordinary
+):
+    """Deleted scopes stay deleted while subsequent ordinary recreations survive rollback."""
+    ctx, task = compile_task
+    monkeypatch.setattr(
+        service.viking_fs, "_schedule_restore_reindex_for_paths", AsyncMock(return_value=None)
+    )
+    scope = f"{TO}/removed" if directory else f"{TO}/page.md"
+    page = f"{scope}/page.md" if directory else scope
+    sibling, compiled_delete = f"{scope}-sibling.md", f"{TO}/compile-deleted.md"
+    for uri in (page, sibling, compiled_delete):
+        await _write(service, uri, "before", ctx)
+    await service.compile.on_start(task)
+    await service.fs.rm(scope + "/" if directory else scope, ctx, recursive=directory, wait=True)
+    kept = f"{scope}/kept.md"
+    if ordinary:
+        await service.fs.write(kept, "ordinary", ctx, edit_source="manual", wait=True)
+    await service.fs.batch_write(
+        root_uri=TO,
+        operations=[{"uri": page, "content": "before"}]
+        + ([{"uri": kept, "content": "compiled"}] if ordinary else []),
+        ctx=ctx,
+        defer_processing=True,
+        edit_source="compile",
+    )
+    if directory:
+        await _write(service, f"{scope}/generated/.overview.md", "generated", ctx)
+    await service.viking_fs.rm(compiled_delete, ctx=ctx)
+    store, target_id = service.compile.lifecycle.store, task.meta["request"]["compile"]["target_id"]
+    run = await store.get_operation(ctx.account_id, target_id, task.task_id)
+    await service.compile.lifecycle._rollback(TO, run, ctx)
+    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"]["uris"] == [scope]
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status=status))
+    assert not await service.viking_fs.exists(page, ctx=ctx)
+    if ordinary:
+        assert await service.viking_fs.read_file(kept, ctx=ctx) == "ordinary"
+        assert not await service.viking_fs.exists(f"{scope}/generated", ctx=ctx)
+    else:
+        assert not await service.viking_fs.exists(scope, ctx=ctx)
+    assert await service.viking_fs.read_file(sibling, ctx=ctx) == "before"
+    assert await service.viking_fs.read_file(compiled_delete, ctx=ctx) == "before"
+    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"] is None
+
+
+@pytest.mark.asyncio
+async def test_compile_delete_failure_and_cancellation(service, compile_task, monkeypatch):
+    """Deletion failures leave no marker; cancellation saves successful deletions under the lease."""
+    from openviking.storage.errors import LockAcquisitionError
+
+    ctx, task = compile_task
+    uri = f"{TO}/page.md"
+    await service.compile.on_start(task)
+    store, target_id = service.compile.lifecycle.store, task.meta["request"]["compile"]["target_id"]
+    with monkeypatch.context() as patch:
+        patch.setattr(service.viking_fs, "rm", AsyncMock(side_effect=OSError("delete failed")))
+        with pytest.raises(OSError, match="delete failed"):
+            await service.fs.rm(uri, ctx)
+    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"] is None
+    entered, proceed = asyncio.Event(), asyncio.Event()
+    after_remove = service.fs.compile_versions.after_remove
+
+    async def pause_metadata(*args):
+        entered.set()
+        await proceed.wait()
+        await after_remove(*args)
+
+    monkeypatch.setattr(service.fs.compile_versions, "after_remove", pause_metadata)
+    deleting = asyncio.create_task(service.fs.rm(uri, ctx))
+    await asyncio.wait_for(entered.wait(), 5)
+    agfs = service.viking_fs._async_agfs
+    with pytest.raises(LockAcquisitionError):
+        await agfs.pathlock_acquire_tree(service.viking_fs._uri_to_path(TO, ctx=ctx))
+    deleting.cancel()
+    proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await deleting
+    assert (await store.get(ctx.account_id, target_id))["rollback_deletions"]["uris"] == [uri]
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status="failed"))
+    assert not await service.viking_fs.exists(uri, ctx=ctx)
 
 
 @pytest.mark.parametrize(
@@ -549,8 +876,14 @@ async def test_finish_compares_final_content(
             await service.fs.write(uri, content, ctx, edit_source=source, wait=True)
     before = await service.compile.file_versions(uri, ctx, limit=10, before=None)
     assert [v["source"] for v in before["versions"]] == ["manual", "external"]
+    updated_at = (await service.compile.get_config(TO, ctx))["content_updated_at"]
     for _ in range(2):
         await service.compile.on_finish(task, ExternalTaskSnapshot(status="completed"))
+    final_updated_at = (await service.compile.get_config(TO, ctx))["content_updated_at"]
+    if edits == [("manual", "A"), ("compile", "A")]:
+        assert final_updated_at == updated_at
+    else:
+        assert final_updated_at > updated_at
     history = (await service.compile.file_versions(uri, ctx, limit=10, before=None))["versions"]
     assert history[0]["source"] == latest_source
     outputs = await service.compile.operation_outputs(TO, task.task_id, ctx, limit=10, cursor=None)
@@ -677,6 +1010,30 @@ async def test_retry_does_not_publish_saved_snapshot_over_new_ordinary_version(
 
 
 @pytest.mark.asyncio
+async def test_restore_binary_file_version(service, compile_task):
+    """Restore PNG bytes from a version retained across Compile publication."""
+    ctx, task = compile_task
+    uri, original = f"{TO}/diagram.png", b"\x89PNG\r\n\x1a\nv1"
+    await service.viking_fs.write_file_bytes(uri, original, ctx=ctx)
+    await service.compile.on_start(task)
+    await service.fs.batch_write(
+        root_uri=TO,
+        operations=[
+            {"uri": uri, "content_base64": base64.b64encode(original + b" changed").decode()}
+        ],
+        ctx=ctx,
+        defer_processing=True,
+        edit_source="compile",
+    )
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status="completed"))
+
+    restored = await service.compile.restore_file_version(uri, "v1", "v2", ctx)
+    await service.resources.wait_processed()
+    assert await service.fs.read_file_bytes(uri, ctx) == original
+    assert (restored["version_id"], restored["meta"]["restored_from"]) == ("v3", "v1")
+
+
+@pytest.mark.asyncio
 async def test_versions_edit_and_single_file_restore(service, monkeypatch):
     ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
     page = f"{TO}/page.md"
@@ -689,7 +1046,7 @@ async def test_versions_edit_and_single_file_restore(service, monkeypatch):
 
     await _write(service, f"{SRC}/a.md", "a2", ctx)
     _, changes = await _run(service, ctx, write_page="v2")
-    assert set(changes) == {"base", "head", "scopes"}
+    assert set(changes) == {"base", "head", "scopes", "skill_snapshot", "execution"}
 
     first = await service.compile.file_versions(page, ctx, limit=1, before=None)
     older = await service.compile.file_versions(
@@ -727,7 +1084,7 @@ async def test_versions_edit_and_single_file_restore(service, monkeypatch):
     ]
     await _write(service, f"{SRC}/a.md", "a3", ctx)
     _, changes = await _run(service, ctx)
-    assert set(changes) == {"base", "head", "scopes"}
+    assert set(changes) == {"base", "head", "scopes", "skill_snapshot", "execution"}
 
     # Single-file restore writes v1 back as a new version; a stale expectation conflicts.
     from openviking_cli.exceptions import ConflictError
@@ -872,6 +1229,7 @@ async def test_moving_and_removing_target_keeps_registry_consistent(service, cli
     assert updated_at > before
     await service.fs.rm(f"{TO}/page.md", ctx)
     assert (await service.compile.get_config(TO, ctx))["content_updated_at"] > updated_at
+    await service.resources.wait_processed()
     await service.fs.rm(TO, ctx, recursive=True)
     await service.fs.rm(moved, ctx, recursive=True)
     assert {item["status"] for item in await service.compile.list_configs(ctx)} == {"deleted"}
@@ -883,6 +1241,7 @@ async def test_moving_and_removing_target_keeps_registry_consistent(service, cli
     assert (await store.get(ctx.account_id, target_id))["status"] == "deleted"
     assert await store.register(ctx.account_id, moved) == target_id
     record = await store.get(ctx.account_id, target_id)
+    assert record["rollback_deletions"] is None
     assert not record["initialized"] and record["progress"]["source_commit"] is None
     assert not record["progress"]["processed_roots"] and record["versions_head"] is None
     assert await service.compile.list_operations(moved, ctx, limit=10, cursor=None) == history
@@ -909,7 +1268,9 @@ async def test_operation_history_batch_and_restore(service, client, monkeypatch,
         await _write(service, uri, "original", ctx)
     snapshot = await service.fs.commit(message="operation history", paths=[root], ctx=ctx)
     writes = [{"uri": uri, "content": "compiled"} for uri in uris]
-    await service.fs.batch_write(root_uri=root, operations=writes, ctx=ctx, defer_processing=True)
+    await service.fs.batch_write(
+        root_uri=root, operations=writes, ctx=ctx, defer_processing=True, edit_source="compile"
+    )
     assert (await service.compile.list_operations(targets[0], ctx, limit=10, cursor=None))[
         "operations"
     ] == []

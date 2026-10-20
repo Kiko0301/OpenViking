@@ -87,7 +87,7 @@ class BatchWriteRequest(BaseModel):
     # Save content without semantic or vector work; the caller schedules processing.
     defer_processing: bool = False
     processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
-    edit_source: Literal["manual", "agent", "compile"] = "compile"
+    edit_source: Literal["manual", "agent", "compile"] = "agent"
 
 
 class SetTagsRequest(BaseModel):

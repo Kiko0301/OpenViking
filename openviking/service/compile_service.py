@@ -658,11 +658,8 @@ class CompileService:
         """Return one target's newest operations, continuing after the operation-ID cursor."""
         record = await self._target(to, ctx, include_deleted=True)
         operations = await self._require_lifecycle().store.list_operations(
-            ctx.account_id, record["id"]
+            ctx.account_id, record["id"], limit=limit + 1, cursor=cursor
         )
-        if cursor:
-            ids = [operation["operation_id"] for operation in operations]
-            operations = operations[ids.index(cursor) + 1 :] if cursor in ids else []
         page = operations[:limit]
         public = [
             {
@@ -679,6 +676,8 @@ class CompileService:
                     "finished_at",
                     "reindex_task_id",
                     "params",
+                    "execution",
+                    "skill_snapshot",
                     "base",
                     "head",
                     "result",
@@ -742,9 +741,13 @@ class CompileService:
 
         async def write(content: bytes, commit_content: Any) -> None:
             # Use normal refresh while recording a restore version.
+            try:
+                body: str | bytes = content.decode("utf-8")
+            except UnicodeDecodeError:
+                body = content
             await self._fs.write(
                 uri,
-                content.decode("utf-8"),
+                body,
                 ctx,
                 edit_source="compile",
                 record_version=False,

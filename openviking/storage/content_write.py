@@ -267,7 +267,7 @@ class ContentWriteCoordinator:
         self,
         *,
         uri: str,
-        content: str,
+        content: str | bytes,
         ctx: RequestContext,
         mode: str = "replace",
         wait: bool = False,
@@ -311,7 +311,7 @@ class ContentWriteCoordinator:
         self,
         *,
         uri: str,
-        content: str,
+        content: str | bytes,
         ctx: RequestContext,
         mode: str = "replace",
         wait: bool = False,
@@ -328,7 +328,8 @@ class ContentWriteCoordinator:
         )
         self._ensure_content_write_policy(normalized_uri)
         await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
-        content = await self._sanitize_text(content, uri=normalized_uri, ctx=ctx)
+        if isinstance(content, str):
+            content = await self._sanitize_text(content, uri=normalized_uri, ctx=ctx)
         ingest_options = IngestOptions.from_search_tags(tags, mode=tag_mode)
         if acl is not None:
             ingest_options = replace(
@@ -1591,7 +1592,7 @@ class ContentWriteCoordinator:
         *,
         uri: str,
         root_uri: str,
-        content: str,
+        content: str | bytes,
         mode: str,
         response_mode: str,
         context_type: str,

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import json
 import random
 import sys
@@ -54,11 +55,13 @@ from openviking.pyagfs.exceptions import (
     AGFSNotSupportedError,
     GitConcurrentCommitError,
 )
+from openviking.resource.uri_mutation_coordinator import uri_matches_prefix
 from openviking.server.identity import RequestContext, Role
 from openviking.service.external_task_service import ExternalTaskSnapshot
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.storage.acl import AclAction
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
+from openviking.storage.viking_fs._base import LS_ALL_NODES
 from openviking_cli.exceptions import (
     ConflictError,
     FailedPreconditionError,
@@ -110,14 +113,17 @@ def new_record(target_id: str, to: str) -> Dict[str, Any]:
         "instruction": None,
         "initialized": False,
         "auto_update": False,
+        "schedule_configured": False,  # Explicit schedule settings survive ordinary submissions.
         "update_schedule": dict(DEFAULT_SCHEDULE),
         "auto_update_enabled_at": None,
         "last_triggered_slot": None,
         "last_error": None,
         "progress": {"source_commit": None, "processed_roots": []},
+        "scheduled_progress": {},  # Successful scheduled inputs and source progress, isolated from manual runs.
         # Snapshot the per-file version indexes were last synced to.
         "versions_head": None,
         "active_task_id": None,
+        "rollback_deletions": None,  # User-deleted scopes for one task; None without protection.
         "last_run": None,
         "initial_operation_id": None,  # First registered Compile task; missing on legacy targets.
         "content_updated_at": None,  # Business-file change time in Unix seconds; None when unknown.
@@ -162,7 +168,14 @@ class CompileStore(Protocol):
     async def put_operation(
         self, account_id: str, target_id: str, operation: Dict[str, Any]
     ) -> None: ...
-    async def list_operations(self, account_id: str, target_id: str) -> List[Dict[str, Any]]: ...
+    async def list_operations(
+        self,
+        account_id: str,
+        target_id: str,
+        *,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> List[Dict[str, Any]]: ...
     def lock_operation(
         self,
         account_id: str,
@@ -181,6 +194,7 @@ class CompileStore(Protocol):
         outputs: List[dict],
         *,
         versions_available: bool = True,
+        content_changed: bool = False,
     ) -> None: ...
 
     async def get_version_index(
@@ -334,8 +348,11 @@ class CompileStateStore:
                     "status",
                     "initialized",
                     "progress",
+                    "scheduled_progress",
+                    "schedule_configured",
                     "versions_head",
                     "active_task_id",
+                    "rollback_deletions",
                     "last_run",
                     "content_updated_at",
                     "conflicts_num",
@@ -399,20 +416,31 @@ class CompileStateStore:
         outputs: List[dict],
         *,
         versions_available: bool = True,
+        content_changed: bool = False,
     ) -> None:
         """Persist one reference per output URI; retries preserve already recorded outputs.
 
         Null version/snapshot references indicate unavailable versions. URI paths
         stay fixed at production time so moving a live file cannot change history.
+        content_changed durably marks actual writes once without adding output references.
         """
         path = self._outputs_path(account_id, target_id, operation_id)
         async with self.locked(path) as lease:
             data = await self.read_json(path) or {"outputs": []}
+            if (
+                content_changed
+                and data.get("content_changed")
+                and not outputs
+                and versions_available
+            ):
+                return
             merged = {item["uri"]: item for item in data["outputs"]}
             merged.update((item["uri"], item) for item in outputs)
             data["outputs"] = [merged[uri] for uri in sorted(merged)]
             if not versions_available or any(item["snapshot_id"] is None for item in outputs):
                 data["versions_available"] = False
+            if content_changed:
+                data["content_changed"] = True
             await self.write_json(path, data, lease)
 
     async def list_dir(self, directory: str) -> List[str]:
@@ -433,18 +461,44 @@ class CompileStateStore:
         except (AGFSNotFoundError, FileNotFoundError):
             pass
 
-    async def list_operations(self, account_id: str, target_id: str) -> List[Dict[str, Any]]:
+    async def list_operations(
+        self,
+        account_id: str,
+        target_id: str,
+        *,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return newest records after cursor; limit bounds memory, not JSON reads."""
+        if limit is not None and limit <= 0:
+            return []
         directory = f"{self._target_dir(account_id, target_id)}/operations"
-        operations = []
-        for name in await self.list_dir(directory):
+        names = await self.list_dir(directory)
+        before = None
+        cursor_name = f"{cursor}.json" if cursor else None
+        if cursor_name is not None:
+            if cursor_name not in names:
+                return []
+            operation = await self.read_json(f"{directory}/{cursor_name}")
+            if operation is None:
+                return []
+            before = (operation.get("created_at") or 0, operation["operation_id"])
+        heap: list[tuple[float, str, Dict[str, Any]]] = []
+        for name in names:
+            if name == cursor_name:
+                continue
             operation = await self.read_json(f"{directory}/{name}")
-            if operation is not None:
-                operations.append(operation)
-        operations.sort(
-            key=lambda operation: (operation.get("created_at") or 0, operation["operation_id"]),
-            reverse=True,
-        )
-        return operations
+            if operation is None:
+                continue
+            key = (operation.get("created_at") or 0, operation["operation_id"])
+            if before is not None and key >= before:
+                continue
+            candidate = (*key, operation)
+            if limit is None or len(heap) < limit:
+                heapq.heappush(heap, candidate)
+            elif key > heap[0][:2]:
+                heapq.heapreplace(heap, candidate)
+        return [item[2] for item in sorted(heap, reverse=True)]
 
     async def list_accounts(self) -> List[str]:
         try:
@@ -657,6 +711,7 @@ def new_compile_operation(task: Any, record: Dict[str, Any]) -> Dict[str, Any]:
         "target_base": None,
         "target_head": None,
         "snapshot_committed": False,
+        "content_changed": False,  # Untracked output changes requiring a timestamp at finalization.
         "reindex_task_id": None,
         "base": None,
         "head": None,
@@ -724,18 +779,20 @@ class CompileLifecycle:
         await self.validate_layout(ctx.account_id, to, sources)
         target_id = await self._store.register(ctx.account_id, to)
         async with self._store.edit(ctx.account_id, target_id) as record:
-            if record["auto_update"] and record["skill"] not in {None, payload["skill"]}:
-                raise ConflictError(
-                    "Skill differs from the scheduled target; change it in update settings",
-                    resource="COMPILE_SKILL_MISMATCH",
-                )
-            self.apply_sources(record, sources, payload["skill"])
-            if instruction_set and ("auto_update" in control or "update_schedule" in control):
-                record["instruction"] = payload.get("instruction") or None
-            persisted = {k: v for k, v in runtime_args.items() if k != "last_compile_time"}
-            if persisted:
-                record["execution_context"]["args"] = persisted
-            if "auto_update" in control or "update_schedule" in control:
+            configures_schedule = "auto_update" in control or "update_schedule" in control
+            # Legacy targets can hold disabled schedule settings without a configuration marker.
+            has_schedule = (
+                record.get("schedule_configured", record["skill"] is not None)
+                or record["auto_update"]
+            )
+            if configures_schedule or not has_schedule:
+                self.apply_sources(record, sources, payload["skill"])
+                if instruction_set and configures_schedule:
+                    record["instruction"] = payload.get("instruction") or None
+                persisted = {k: v for k, v in runtime_args.items() if k != "last_compile_time"}
+                if persisted:
+                    record["execution_context"]["args"] = persisted
+            if configures_schedule:
                 await self.apply_schedule(
                     record,
                     ctx,
@@ -756,11 +813,7 @@ class CompileLifecycle:
 
     @staticmethod
     def apply_sources(record: Dict[str, Any], sources: List[str], skill: str) -> None:
-        if record["skill"] not in {None, skill}:
-            record["progress"]["processed_roots"] = []
-        record["progress"]["processed_roots"] = [
-            root for root in record["progress"]["processed_roots"] if root in sources
-        ]
+        """Save configured sources and Skill without advancing successful execution progress."""
         record["from"] = list(sources)
         record["skill"] = skill
 
@@ -791,6 +844,7 @@ class CompileLifecycle:
         if changed:
             record["auto_update_enabled_at"] = now_iso() if auto_update else None
         record["auto_update"] = auto_update
+        record["schedule_configured"] = True
         record["update_schedule"] = schedule
 
     async def record_created(self, task: Any) -> None:
@@ -876,11 +930,17 @@ class CompileLifecycle:
                 return ExternalTaskSnapshot(
                     status="cancelled", error_message="Compile target was deleted"
                 )
+            run = await self._store.get_operation(account_id, target_id, task.task_id)
+            if run and run["status"] in TERMINAL and run["finished_at"] is not None:
+                # Replayed completions must not claim the target and restore an older baseline.
+                return ExternalTaskSnapshot(status=run["status"], result=run.get("result") or {})
             owner = record["active_task_id"]
             if owner and owner != task.task_id:
                 other = await self._store.get_operation(account_id, target_id, owner)
                 if other is not None and other["status"] not in TERMINAL:
                     return "busy"
+            if owner != task.task_id:
+                record["rollback_deletions"] = None
             record["active_task_id"] = task.task_id
             await self.record_queued(task, locked_record=record)
         run = await self._store.get_operation(account_id, target_id, task.task_id)
@@ -907,7 +967,43 @@ class CompileLifecycle:
         run["actor"] = task.user_id
         run["status"] = "running"
         run["started_at"] = time.time()
-        paths = [request["to"], *(request["from"] if incremental else [])]
+        async with self._locked_output(request["skill"], ctx) as lease:
+            run["skill_snapshot"] = {
+                "uri": request["skill"],
+                "snapshot_id": await commit_snapshot(
+                    self._fs,
+                    [request["skill"]],
+                    f"compile {task.task_id} skill",
+                    ctx,
+                    wait_busy=False,
+                    lease_ref=lease,
+                ),
+            }
+        progress_key = "scheduled_progress" if meta["trigger"] == "scheduled" else "progress"
+        progress = record.get(progress_key) or {}
+        previous_skill = progress.get("skill_snapshot") or {}
+        mode = "full"
+        skill_base = previous_skill.get("snapshot_id")
+        skill_head = run["skill_snapshot"]["snapshot_id"]
+        if (
+            incremental
+            and (request.get("instruction") or "").strip() == progress.get("instruction")
+            and previous_skill.get("uri") == request["skill"]
+            and skill_base
+            and skill_head
+        ):
+            # Skill dependencies include package files filtered from ordinary source diffs.
+            skill_changes = await self._fs._async_agfs.run(
+                "git_diff_paths",
+                account=ctx.account_id,
+                base=skill_base,
+                head=skill_head,
+                paths=[self._fs._uri_to_tree_path(request["skill"], ctx=ctx)],
+            )
+            if not skill_changes:
+                mode = "incremental"
+        run["execution"] = {"mode": mode}
+        paths = [request["to"], *request["from"]]
         async with self._locked_output(request["to"], ctx) as lease:
             run["target_base"] = await commit_snapshot(
                 self._fs,
@@ -918,19 +1014,22 @@ class CompileLifecycle:
                 lease_ref=lease,
             )
             await self.versions.record_external(task.account_id, record, run["target_base"])
-            if incremental:
-                run.update(await self._plan(record, request["from"], run["target_base"], ctx))
-                idle = not run["changes"]["scopes"] and not request.get("instruction")
-                if idle and record["initialized"]:
-                    run["status"] = "completed"
+            run.update(
+                await self._plan(
+                    {} if mode == "full" else progress, request["from"], run["target_base"], ctx
+                )
+            )
+            if mode == "incremental" and not run["changes"]["scopes"] and record["initialized"]:
+                run["status"] = "completed"
             await self._store.put_operation(task.account_id, meta["target_id"], run)
         return run
 
     async def _plan(
-        self, record: Dict[str, Any], sources: List[str], head: Optional[str], ctx: RequestContext
+        self, progress: Dict[str, Any], sources: List[str], head: Optional[str], ctx: RequestContext
     ) -> Dict[str, Any]:
-        base = record["progress"]["source_commit"]
-        processed = set(record["progress"]["processed_roots"])
+        """Compare source roots against one trigger's successful baseline; empty progress scans all roots."""
+        base = progress.get("source_commit")
+        processed = set(progress.get("processed_roots") or [])
         compared = [source for source in sources if base and source in processed]
         added_roots = [source for source in sources if source not in compared]
         changes = (
@@ -959,9 +1058,9 @@ class CompileLifecycle:
     async def runtime_changes(
         self, payload: Mapping[str, Any], account_id: str, task_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Return ``args.changes`` for an incremental task, read from its run record."""
+        """Return the frozen Skill and effective execution mode with the persisted source plan."""
         meta = payload.get("compile")
-        if not meta or meta["mode"] != "incremental":
+        if not meta:
             return None
         run = await self._store.get_operation(account_id, meta["target_id"], task_id)
         if run is None or run.get("changes") is None:
@@ -970,6 +1069,8 @@ class CompileLifecycle:
             "base": run["base"],
             "head": run["head"],
             "scopes": run["changes"]["scopes"],
+            "execution": run.get("execution"),
+            "skill_snapshot": run.get("skill_snapshot"),
         }
 
     async def on_finish(self, task: Any, snapshot: ExternalTaskSnapshot) -> ExternalTaskSnapshot:
@@ -1037,7 +1138,7 @@ class CompileLifecycle:
                                 any(is_versioned(change["uri"]) for change in changes)
                                 and (record.get("content_updated_at") or 0) < run["started_at"]
                             ):
-                                await self._store.mark_content_updated(account_id, target_id)
+                                run["content_changed"] = True
                     reindex_id = run.get("reindex_task_id")
                     previous = (
                         await get_task_tracker().get(
@@ -1092,13 +1193,25 @@ class CompileLifecycle:
                     "finished_at": run["finished_at"],
                     "error": run.get("error"),
                 }
+                outputs = await self._store.get_outputs(account_id, target_id, task_id)
+                if run["finished_at"] is not None and (
+                    run.get("content_changed") or (outputs or {}).get("content_changed")
+                ):
+                    record["content_updated_at"] = max(
+                        record.get("content_updated_at") or 0, run["finished_at"]
+                    )
                 if run["status"] == "completed":
                     first_success = not record["initialized"]
                     record["initialized"] = True
                     if run.get("head"):
-                        record["progress"] = {
+                        progress_key = (
+                            "scheduled_progress" if run["trigger"] == "scheduled" else "progress"
+                        )
+                        record[progress_key] = {
                             "source_commit": run["head"],
                             "processed_roots": list(run["params"]["from"]),
+                            "instruction": (run["params"].get("instruction") or "").strip(),
+                            "skill_snapshot": run.get("skill_snapshot"),
                         }
                 # Rollback snapshots include the ordinary edits retained by the run.
                 synced = run.get("target_head") or run.get("target_base")
@@ -1106,6 +1219,12 @@ class CompileLifecycle:
                     record["versions_head"] = synced
             if record["active_task_id"] == task_id:
                 record["active_task_id"] = None
+            if (
+                run is not None
+                and run["finished_at"] is not None
+                and (record.get("rollback_deletions") or {}).get("task_id") == task_id
+            ):
+                record["rollback_deletions"] = None
         if first_success and self.reschedule is not None:
             await self.reschedule(account_id, record)
 
@@ -1123,6 +1242,9 @@ class CompileLifecycle:
                 )
                 if not head:
                     return
+                record = await self._store.get(ctx.account_id, target_id)
+                protection = record.get("rollback_deletions") or {}
+                scopes = protection["uris"] if protection.get("task_id") == run["task_id"] else []
                 changes = {
                     change["uri"]: change["change_type"]
                     for change in await self._fs.diff_paths(
@@ -1140,7 +1262,7 @@ class CompileLifecycle:
                 }
                 await self.versions.record_compile(
                     ctx.account_id,
-                    await self._store.get(ctx.account_id, target_id),
+                    record,
                     run,
                     head,
                     [
@@ -1154,9 +1276,26 @@ class CompileLifecycle:
                     for index in await self.versions._indexes(ctx.account_id, target_id)
                 }
                 changed = False
+                pending = list(scopes)
+                while pending:
+                    uri = pending.pop()
+                    if uri in ordinary or not await self._fs.exists(uri, ctx=ctx):
+                        continue
+                    if any(uri_matches_prefix(path, uri) for path in ordinary):
+                        pending.extend(
+                            entry["uri"]
+                            for entry in await self._fs.ls(
+                                uri, show_all_hidden=True, node_limit=LS_ALL_NODES, ctx=ctx
+                            )
+                        )
+                    else:
+                        await self._fs.rm(uri, recursive=True, ctx=ctx, lease_ref=lease)
+                        changed = True
                 for uri in changes.keys() | ordinary.keys():
                     version = ordinary.get(uri)
-                    if version is None and changes[uri] == "added":
+                    if version is None and any(uri_matches_prefix(uri, scope) for scope in scopes):
+                        continue
+                    if version is None and changes.get(uri) == "added":
                         await self._fs.rm(uri, ctx=ctx, lease_ref=lease)
                     else:
                         source = version["snapshot_id"] if version else run["target_base"]
@@ -1578,7 +1717,10 @@ class CompileVersions:
             if (version := self._ordinary_version(index, run["task_id"]))
         }
         changes = {change["uri"]: change["change_type"] for change in changes}
-        full = run["params"]["args"]["mode"] == "full"
+        full = (
+            run.get("execution", {}).get("mode") == "full"
+            or run["params"]["args"]["mode"] == "full"
+        )
         manifest = await self._store.get_outputs(account_id, record["id"], run["operation_id"])
         outputs = list((manifest or {}).get("outputs", [])) + [
             {
@@ -1725,6 +1867,7 @@ class CompileVersions:
         """Write under the content lease and register ordinary versions with provenance.
 
         Unversioned writes still record actual content changes.
+        Active Compile writes defer the directory timestamp to task finalization.
         Run IDs select rollback content; after_compile_snapshot protects newer
         ordinary versions from a retry of the frozen finish snapshot.
         """
@@ -1754,7 +1897,30 @@ class CompileVersions:
             if not targets:
                 continue
             changed[target_id] = targets
-            if write is not None:
+            run = None
+            if edit_source == "compile":
+                record = await self._store.get(ctx.account_id, target_id)
+                run = (
+                    await self._store.get_operation(
+                        ctx.account_id, target_id, record["active_task_id"]
+                    )
+                    if record["active_task_id"]
+                    else None
+                )
+                if run and run["started_at"] is not None and run["finished_at"] is None:
+                    await self._store.merge_outputs(
+                        ctx.account_id,
+                        target_id,
+                        run["operation_id"],
+                        [{"uri": uri, "version_id": None, "snapshot_id": None} for uri in targets]
+                        if run["target_base"] is None
+                        else [],
+                        versions_available=run["target_base"] is not None,
+                        content_changed=True,
+                    )
+                else:
+                    run = None
+            if write is not None and run is None:
                 await self._store.mark_content_updated(ctx.account_id, target_id)
             if context and context["account_id"] == ctx.account_id:
                 context["changed"].update(targets)
@@ -1766,27 +1932,6 @@ class CompileVersions:
                             "snapshot_id": None,
                         }
         if not record_version:
-            if edit_source == "compile":
-                for target_id, targets in changed.items():
-                    record = await self._store.get(ctx.account_id, target_id)
-                    run = (
-                        await self._store.get_operation(
-                            ctx.account_id, target_id, record["active_task_id"]
-                        )
-                        if record["active_task_id"]
-                        else None
-                    )
-                    if run and run["started_at"] is not None and run["target_base"] is None:
-                        await self._store.merge_outputs(
-                            ctx.account_id,
-                            target_id,
-                            run["operation_id"],
-                            [
-                                {"uri": uri, "version_id": None, "snapshot_id": None}
-                                for uri in targets
-                            ],
-                            versions_available=False,
-                        )
             return written
         if not changed:
             return written
@@ -1932,11 +2077,29 @@ class CompileVersions:
                     f"Compile is running on {item['to']}", resource="COMPILE_RUNNING"
                 )
 
-    async def before_remove(self, uri: str, ctx: RequestContext) -> None:
+    @asynccontextmanager
+    async def before_remove(self, uri: str, ctx: RequestContext) -> AsyncIterator[Any]:
+        """Hold a managed descendant's content lease through deletion and metadata updates."""
+        uri = uri.rstrip("/")
         await self._reject_running(ctx.account_id, uri)
+        record = await self.owning_target(ctx.account_id, uri)
+        if record is None or record["to"] == uri:
+            yield None
+            return
+        try:
+            lease = await self._fs._async_agfs.pathlock_acquire_tree(
+                self._fs._uri_to_path(uri, ctx=ctx)
+            )
+        except LockAcquisitionError as exc:
+            raise ResourceBusyError("Resource is being processed", uri=uri) from exc
+        try:
+            yield lease
+        finally:
+            await self._fs._async_agfs.pathlock_release(lease)
 
     async def after_remove(self, uri: str, ctx: RequestContext) -> None:
         """Whole targets become ``deleted`` (runs kept); a single file loses its index."""
+        uri = uri.rstrip("/")
         removed = await self._targets_under(ctx.account_id, uri)
         for item in removed:
             async with self._store.edit(ctx.account_id, item["id"]) as record:
@@ -1944,6 +2107,7 @@ class CompileVersions:
                 record["deleted_at"] = time.time()
                 record["auto_update"] = False
                 record["active_task_id"] = None
+                record["rollback_deletions"] = None
                 record["execution_context"]["credential"] = None
                 await self.drop_all(ctx.account_id, item["id"])
             if self.reschedule is not None:
@@ -1957,7 +2121,25 @@ class CompileVersions:
                             ctx.account_id, record["id"], index["uri"]
                         )
                 if is_versioned(uri):
-                    await self._store.mark_content_updated(ctx.account_id, record["id"])
+                    async with self._store.edit(ctx.account_id, record["id"]) as record:
+                        owner = record["active_task_id"]
+                        run = (
+                            await self._store.get_operation(ctx.account_id, record["id"], owner)
+                            if owner
+                            else None
+                        )
+                        if run and run["started_at"] is not None and run["finished_at"] is None:
+                            protection = record.get("rollback_deletions") or {}
+                            uris = (
+                                protection.get("uris", [])
+                                if protection.get("task_id") == owner
+                                else []
+                            )
+                            record["rollback_deletions"] = {
+                                "task_id": owner,
+                                "uris": sorted(set(uris) | {uri}),
+                            }
+                        record["content_updated_at"] = time.time()
 
     async def before_move(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
         await self._reject_running(ctx.account_id, from_uri)

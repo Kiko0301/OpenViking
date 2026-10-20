@@ -27,6 +27,7 @@ from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
 from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
+from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import get_enqueued_work_ids, get_task_context
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.content_visibility import visible_content
@@ -499,10 +500,21 @@ class FSService:
         refresh_parent_uri = self._semantic_refresh_parent_uri(uri, context_type)
         memory_overview_uri = self._memory_overview_parent_uri(uri, context_type)
         if self.compile_versions is not None:
-            await self.compile_versions.before_remove(uri, ctx)
-        result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
-        if self.compile_versions is not None:
-            await self.compile_versions.after_remove(uri, ctx)
+            async with self.compile_versions.before_remove(uri, ctx) as lease:
+
+                async def remove():
+                    result = await viking_fs.rm(
+                        uri,
+                        recursive=recursive,
+                        ctx=ctx,
+                        **({"lease_ref": lease} if lease is not None else {}),
+                    )
+                    await self.compile_versions.after_remove(uri, ctx)
+                    return result
+
+                result = await run_to_completion(remove) if lease is not None else await remove()
+        else:
+            result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
         await self._sync_watch_after_rm(uri, account_id=ctx.account_id, context_type=context_type)
         # A refresh on a parent that no longer exists would lock its sidecar
         # paths and thereby recreate the deleted directory. Nothing to
@@ -1268,7 +1280,7 @@ class FSService:
     async def write(
         self,
         uri: str,
-        content: str,
+        content: str | bytes,
         ctx: RequestContext,
         mode: str = "replace",
         wait: bool = False,
@@ -1326,7 +1338,7 @@ class FSService:
         skip_conflicts: bool = False,
         defer_processing: bool = False,
         processing_mode: str = "semantic_and_vectors",
-        edit_source: Literal["manual", "agent", "compile"] = "compile",
+        edit_source: Literal["manual", "agent", "compile"] = "agent",
     ) -> Dict[str, Any]:
         """Apply multiple file writes and aggregate downstream refresh."""
         viking_fs = self._ensure_initialized()

@@ -120,6 +120,7 @@ async def test_batch_write_forwards_processing_mode_and_operation_metadata(monke
 
     assert seen["processing_mode"] == "vectors_only"
     assert seen["defer_processing"] is True
+    assert seen["edit_source"] == "agent"
     operation = seen["operations"][0]
     assert operation["tags"] == ["team=search"]
     assert operation["tag_mode"] == "append"
