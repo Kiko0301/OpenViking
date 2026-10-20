@@ -148,6 +148,8 @@ class Case:
     Dataset CaseSpecs describe concrete executable tasks. Persisted ``cases``
     memories use the same shape for reusable scenarios, shared by multiple tasks;
     they are not a substitute for each task's original input and evaluation.
+    Memory ``domain`` maps to ``task_signature`` and ``description`` to
+    ``input["summary"]`` internally; model-facing memory views use the schema names.
     """
 
     name: str

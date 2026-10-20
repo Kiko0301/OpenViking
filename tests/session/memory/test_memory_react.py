@@ -402,7 +402,7 @@ class TestExtractLoopFinalJsonRetry:
         # assert "decision_reasoning" not in merge_fields
 
     @pytest.mark.asyncio
-    async def test_patch_validation_uses_plain_and_sequential_content(self):
+    async def test_patch_validation_uses_plain_original_content_for_every_edit(self):
         target_uri = "viking://user/default/memories/profile.md"
         old_file = MemoryFile(
             uri=target_uri,
@@ -441,11 +441,15 @@ class TestExtractLoopFinalJsonRetry:
                 "uri": target_uri,
                 "page_id": None,
                 "field": "content",
-                "block_index": 3,
-                "search": "- Missing",
-                "replace": "- Added",
-                "reason": "not_found",
-                "match_count": 0,
+                "block_index": 2,
+                "search": "- Shared",
+                "replace": "- B-only",
+                "reason": "non_unique",
+                "match_count": 2,
+                "error": (
+                    f"Found 2 occurrences of edits[1] in {target_uri}#content. "
+                    "Each search must be unique. Please provide more context to make it unique."
+                ),
                 "found_in_other_uris": [],
             }
         ]

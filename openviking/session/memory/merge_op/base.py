@@ -55,26 +55,21 @@ class SearchReplaceBlock(BaseModel):
 
     search: str = Field(
         ...,
-        description="The text to replace. Use the smallest unique fragment - usually 2-4 adjacent lines is sufficient. Only include the exact lines that need to change, never the entire section. Preserve the exact indentation from the original. Must be unique in the file. Choose page_id first. SEARCH must be copied exactly from the read result of the file bound to that page_id. Never use SEARCH text from another memory or page. If the read result includes `line_number<TAB>` prefixes, exclude those prefixes from SEARCH. Multi-line SEARCH must be contiguous; split non-adjacent edits into separate blocks.",
+        description="Exact, unique text in the original field; must not overlap another block.",
     )
     replace: str = Field(
         ...,
-        description="Replacement text (must differ from search). Use a DELETE block for complete-line deletion. Never include `line_number<TAB>` prefixes.",
+        description="Replacement text for this targeted edit.",
     )
 
 
 class DeleteBlock(BaseModel):
-    """Delete one or more complete, contiguous lines from a string field."""
+    """Pi deletion: replace the selected literal text with an empty string."""
 
     delete: str = Field(
         ...,
         min_length=1,
-        description=(
-            "Exact, unique text of complete, contiguous lines from the target page. Use this "
-            "when other content must remain; delete_ids deletes the whole item. Omit "
-            "`line_number<TAB>` prefixes and surrounding newlines; use separate blocks for "
-            "non-contiguous lines."
-        ),
+        description="Exact, unique text to remove. Include the newline to remove a complete line.",
     )
 
     @property
@@ -89,19 +84,11 @@ class DeleteBlock(BaseModel):
 
 
 class StrPatch(BaseModel):
-    """String patch containing SEARCH/REPLACE and DELETE blocks.
-
-    All string fields with merge_op=patch use this structure.
-
-    IMPORTANT format rules for blocks:
-    - SEARCH/REPLACE: {"search": "old text", "replace": "new text"}
-    - DELETE: {"delete": "one or more complete contiguous lines"}
-    - Each matched text must occur exactly once in the file
-    """
+    """Non-overlapping edits matched against the same original string field."""
 
     blocks: List[Union[SearchReplaceBlock, DeleteBlock]] = Field(
         default_factory=list,
-        description="SEARCH/REPLACE or DELETE blocks; use DELETE for partial line removal.",
+        description="All blocks match the original field, not earlier edits. Do not overlap or nest blocks.",
     )
 
     def get_first_replace(self) -> Optional[str]:

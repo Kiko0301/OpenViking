@@ -10,13 +10,19 @@ co-extract reusable executable skills in the same ReAct pass.
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import ResolvedOperations
 from openviking.session.memory.experience.dag import clip_evidence_summary, tool_evidence_summary
 from openviking.session.memory.experience.feedback import normalize_action_scores
-from openviking.session.memory.experience.rubric import snapshot_rubric_results
+from openviking.session.memory.experience.rubric import (
+    snapshot_rubric_results,
+    validate_external_rubric_results,
+)
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
 from openviking.session.skill.session_skill_context_provider import (
@@ -30,6 +36,37 @@ logger = get_logger(__name__)
 
 TRAJECTORY_MEMORY_TYPE = "trajectories"
 SYSTEM_STEP_MAX_CHARS = 32_768
+
+
+@dataclass(slots=True)
+class TrajectoryTarget:
+    """Server-owned destination and Case-specific context for a joint extraction."""
+
+    case: dict[str, Any]
+    trajectory_name: str = ""
+    outcome: str = "unknown"
+    target_uri: str = ""
+    task_spec: dict[str, Any] | None = None
+    external_evaluation: dict[str, Any] | None = None
+    injected_actions: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def case_name(self) -> str:
+        return self.case["name"]
+
+    @property
+    def rubric(self) -> list[dict[str, str]]:
+        return [
+            {"id": item["name"], "description": item["description"]}
+            for item in self.case.get("rubric", {}).get("criteria", [])
+        ]
+
+    @property
+    def action_score_sources(self) -> dict[str, dict[str, Any]]:
+        return {
+            item["id"]: {key: item[key] for key in ("experience_uri", "slot_name", "instruction")}
+            for item in self.injected_actions
+        }
 
 
 class AgentTrajectoryContextProvider(SessionExtractContextProvider):
@@ -56,38 +93,23 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
         *args,
         include_trajectories: bool = True,
         include_session_skills: bool = False,
-        case: dict[str, Any] | None = None,
-        task_spec: dict[str, Any] | None = None,
-        external_evaluation: dict[str, Any] | None = None,
-        trajectory_name: str = "",
-        case_name: str = "",
-        outcome: str = "",
-        target_uri: str = "",
+        targets: list[TrajectoryTarget] | None = None,
         source_steps: list[dict[str, str]] | None = None,
-        injected_actions: list[dict[str, Any]] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._include_trajectories = include_trajectories
         self._include_session_skills = include_session_skills
-        self.case = dict(case or {})
-        self.rubric = [
-            {"id": item["name"], "description": item["description"]}
-            for item in self.case.get("rubric", {}).get("criteria", [])
-        ]
-        self.case["rubric"] = self.rubric
-        self.task_spec = task_spec
-        self.external_evaluation = external_evaluation
-        self.trajectory_name = trajectory_name
-        self.case_name = case_name
-        self.outcome = outcome
-        self.target_uri = target_uri
+        targets = list(targets or [])
+        if any(not target.case_name for target in targets):
+            raise ValueError("Trajectory targets require non-empty Case names")
+        self.targets = {target.case_name: target for target in targets}
+        if len(self.targets) != len(targets):
+            raise ValueError("Trajectory targets must have unique Case names")
         self.source_steps = source_steps
-        self.injected_actions = list(injected_actions or [])
-        self.action_score_sources = {
-            item["id"]: {key: item[key] for key in ("experience_uri", "slot_name", "instruction")}
-            for item in self.injected_actions
-        }
+        self.operation_validator: (
+            Callable[[ResolvedOperations], Awaitable[list[dict[str, Any]]]] | None
+        ) = None
         self._skill_provider = SessionSkillContextProvider(*args, **kwargs)
         self._sync_skill_provider_state()
 
@@ -129,13 +151,16 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
             )
             return (
                 language_instruction + field_instructions + "\n"
-                "Create exactly one Trajectory and no other memory operation. Use:\n"
-                "sdk.create_trajectories("
+                "Jointly extract exactly one Trajectory for EACH supplied Case, and no other memory "
+                "operation. Compare the supplied Cases to assign the relevant evidence to each. "
+                "Copy each case_name exactly from cases[].case.name; do not omit, repeat or invent "
+                "a Case. Use one call per Case in the SAME reply. Use:\n"
+                "sdk.create_trajectories(case_name='<supplied Case name>', "
                 "context_rules='''<relevant verbatim rules, or empty>''', "
                 "steps='''1. `user` factual step\n...''', "
                 "evaluation_criteria=r'''<YAML list>''', action_scores=r'''<YAML list>''')\n"
-                "then sdk.commit(). The server supplies the trajectory identity, canonical Case, "
-                "outcome and lifecycle metadata. Do not generate those fields.\n"
+                "then sdk.commit(). The server supplies the trajectory filename, outcome and "
+                "lifecycle metadata. Do not generate those fields.\n"
                 "Keep context_rules and steps as separate triple-single-quoted string arguments. "
                 "Do not add section titles; the content template renders them. "
                 "System rules in source_steps are context, not dialogue steps; do not emit "
@@ -178,11 +203,16 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
                     "role": "user",
                     "content": json.dumps(
                         {
-                            "case": self.case,
-                            "task_spec": self.task_spec,
-                            "external_evaluation": self.external_evaluation,
+                            "cases": [
+                                {
+                                    "case": {**target.case, "rubric": target.rubric},
+                                    "task_spec": target.task_spec,
+                                    "external_evaluation": target.external_evaluation,
+                                    "injected_actions": target.injected_actions,
+                                }
+                                for target in self.targets.values()
+                            ],
                             "source_steps": self.source_steps,
-                            "injected_actions": self.injected_actions,
                         },
                         ensure_ascii=False,
                     ),
@@ -215,61 +245,89 @@ class AgentTrajectoryContextProvider(SessionExtractContextProvider):
         """Supply server-owned identity before the normal URI/isolation resolution."""
         if memory_type != TRAJECTORY_MEMORY_TYPE or self.source_steps is None:
             return fields
+        target = self.targets.get(fields.get("case_name"))
+        # Keep an unknown Case name intact for provider feedback. Supply only the
+        # path-template metadata so resolution can reach validation, never writing.
         return {
             **fields,
-            "trajectory_name": self.trajectory_name,
-            "case_name": self.case_name,
-            "outcome": self.outcome,
+            "trajectory_name": target.trajectory_name if target else "",
+            "outcome": target.outcome if target else "unknown",
         }
 
-    def validate_resolved_operations(self, operations: ResolvedOperations) -> list[dict[str, Any]]:
+    async def validate_resolved_operations(
+        self, operations: ResolvedOperations
+    ) -> list[dict[str, Any]]:
         if self.source_steps is None:
             return []
         errors = []
-        if operations.delete_file_contents or operations.delete_replacements:
-            errors.append({"error": "Trajectory extraction cannot delete memories"})
-        if len(operations.upsert_operations) != 1:
-            errors.append({"error": "Trajectory extraction must create exactly one memory"})
+        if operations.errors:
+            errors.append({"error": "Invalid Trajectory operations", "details": operations.errors})
+        if (
+            operations.delete_file_contents
+            or operations.delete_replacements
+            or operations.case_references
+        ):
+            errors.append(
+                {"error": "Trajectory extraction can only create the supplied Cases' trajectories"}
+            )
+        if any(op.memory_type != TRAJECTORY_MEMORY_TYPE for op in operations.upsert_operations):
+            errors.append({"error": "Every operation must create a Trajectory"})
+        counts = Counter(op.memory_fields.get("case_name") for op in operations.upsert_operations)
+        if set(counts) != set(self.targets) or any(count != 1 for count in counts.values()):
+            errors.append(
+                {
+                    "error": "Create exactly one Trajectory per supplied Case",
+                    "missing_cases": sorted(set(self.targets) - set(counts)),
+                    "unexpected_cases": sorted(
+                        str(name) for name in set(counts) - set(self.targets)
+                    ),
+                    "duplicate_cases": sorted(
+                        str(name) for name, count in counts.items() if count > 1
+                    ),
+                }
+            )
+        if errors:
             return errors
-        operation = operations.upsert_operations[0]
-        if operation.memory_type != TRAJECTORY_MEMORY_TYPE:
-            errors.append({"error": "The only operation must create a Trajectory"})
-            return errors
-        try:
+        for operation in operations.upsert_operations:
+            target = self.targets[operation.memory_fields["case_name"]]
             criteria = snapshot_rubric_results(
-                operation.memory_fields.get("evaluation_criteria", []), self.rubric
+                operation.memory_fields.get("evaluation_criteria", []), target.rubric
+            )
+            errors.extend(
+                {"case_name": target.case_name, **error}
+                for error in validate_external_rubric_results(criteria, target.external_evaluation)
             )
             scores = normalize_action_scores(
-                operation.memory_fields.get("action_scores", []),
-                self.action_score_sources,
+                operation.memory_fields.get("action_scores", []), target.action_score_sources
             )
-        except ValueError as exc:
-            return [{"error": str(exc)}]
-        operation.memory_fields.update(
-            {
-                "trajectory_name": self.trajectory_name,
-                "case_name": self.case_name,
-                "outcome": self.outcome,
-                "action_scores": scores,
-                "evaluation_criteria": criteria,
-                "action_score_sources": dict(self.action_score_sources),
-            }
-        )
-        operation.uris = [self.target_uri]
-        operation.old_memory_file_content = None
-        operations.delete_file_contents = []
-        operations.delete_replacements = {}
+            operation.memory_fields.update(
+                {
+                    "trajectory_name": target.trajectory_name,
+                    "outcome": target.outcome,
+                    "action_scores": scores,
+                    "evaluation_criteria": criteria,
+                    "action_score_sources": target.action_score_sources,
+                }
+            )
+            operation.uris = [target.target_uri]
+            operation.old_memory_file_content = None
+            operation.create_only = True
         operations.resolved_links = []
+        if errors:
+            return errors
+        if self.operation_validator is not None:
+            return await self.operation_validator(operations)
         return []
 
     @staticmethod
     def render_operation_repair(errors: list[dict[str, Any]]) -> str:
         return (
-            "The Trajectory operation was invalid. Re-emit the complete Python SDK program with "
-            "exactly one sdk.create_trajectories(...) and sdk.commit(). Keep context_rules and steps "
-            "each as a triple-single-quoted string ('''...'''). The template generates section titles; "
-            "do not change the extracted text merely to match numbering or a step count. Do not "
-            "emit raw Markdown outside the SDK call. Errors: "
+            "The joint Trajectory extraction was invalid. Re-emit the complete operations in the "
+            "active output format, with exactly one Trajectory for EACH supplied case_name and "
+            "no other Case. In Python, use one sdk.create_trajectories(case_name=..., ...) per "
+            "Case, then sdk.commit(). Keep context_rules and steps each as a triple-single-quoted "
+            "string ('''...'''). The template generates section titles; do not change the "
+            "extracted text merely to match numbering or a step count. Errors: "
             + json.dumps(errors, ensure_ascii=False)
         )
 

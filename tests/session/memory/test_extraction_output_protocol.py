@@ -18,6 +18,7 @@ from openviking.session.memory.dataclass import (
     MemoryTypeSchema,
     ResolvedOperations,
 )
+from openviking.session.memory.experience.trajectory_context import TrajectoryTarget
 from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.extraction_output_protocol import (
     ExtractionOutputContext,
@@ -341,7 +342,7 @@ def test_python_field_description_keeps_dsl_patch_instructions():
     assert (
         "content [editable string: obj.field.edit/drop/overwrite]: Write content in EN." in contract
     )
-    assert "obj.content.edit(search=..., replace=...)" in contract
+    assert "obj.field.edit(search=..., replace=...)" in contract
     assert "PATCH operation for" not in contract
     assert "Use a DELETE block" not in contract
 
@@ -781,6 +782,7 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
     from openviking.session.memory.experience.compiler import compile_dag
     from openviking.session.memory.experience.experience_context import (
         _EXPERIENCE_DAG_EXAMPLE,
+        _EXPERIENCE_STAGED_DAG_EXAMPLE,
         AgentExperienceContextProvider,
         _trajectory_model_content,
     )
@@ -860,28 +862,33 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
         "role": "user",
         "content": _trajectory_model_content(provider.trajectories[0].content),
     }
-    assert messages[3]["content"].startswith("Use exactly one SDK template")
+    assert messages[3]["content"].startswith("Use the Create/Update rules")
     assert len(messages) == 4
-    # Create/edit/overwrite are complete, directly parseable SDK examples.
-    # The separate raw DAG remains explicitly read-only input for the edit example.
-    sources = re.findall(r"```text\n(.*?)\n```", instruction, re.DOTALL)
-    assert sources == [_EXPERIENCE_DAG_EXAMPLE]
-    assert instruction.count(_EXPERIENCE_DAG_EXAMPLE) == 2
-    assert "read-only context, not the SDK reply" in instruction
+    # Graph examples do not choose a write method; Edit usage stays in the shared contract.
+    dag_examples = re.findall(r"```text\n(.*?)\n```", instruction, re.DOTALL)
+    assert dag_examples == [_EXPERIENCE_STAGED_DAG_EXAMPLE]
+    assert "DAG structure example (content only, not the SDK reply)" in instruction
+    assert instruction.index(dag_examples[0]) < instruction.index("## Final response:")
+    assert "experience.content.overwrite(" not in instruction
+    assert "experience.content.edit(" not in instruction
+    assert instruction.count(_EXPERIENCE_DAG_EXAMPLE) == 1
+    assert "read-only context, not the SDK reply" not in instruction
+    assert "shared Edit instructions in the output contract" in instruction
     examples = re.findall(r"```python\n(.*?)\n```", instruction, re.DOTALL)
-    assert len(examples) == 3
+    assert len(examples) == 1
     assert "<complete DAG source>" not in instruction
     assert "sdk.create_experiences(" in examples[0]
     assert "content='''" in examples[0]
     assert 'dag = workflow("""' in examples[0]
-    assert "search='''" in examples[1] and "replace='''" in examples[1]
-    assert "experience.content.overwrite('''" in examples[2]
-    assert sources[0].startswith('dag = workflow("""')
     assert "For no change, return only `sdk.commit()`." in instruction
     programs = {
         "create": examples[0],
-        "edit": examples[1],
-        "overwrite": examples[2],
+        "edit": (
+            'experience.content.edit(search="whether the available records cover that scope.", '
+            'replace="whether the available records cover that scope, and which records are missing.")'
+            "\nsdk.commit()"
+        ),
+        "overwrite": f"experience.content.overwrite({dag_examples[0]!r})\nsdk.commit()",
         "noop": "sdk.commit()",
     }
     program = programs[method]
@@ -941,8 +948,8 @@ async def test_experience_prompt_templates_parse_with_real_prefetch_bindings(
     assert "even when it is an error" in instruction
     assert "permission, network or other read error" in instruction
     assert "Do not return a bare DAG" in messages[-1]["content"]
-    assert "experience.content.overwrite(...)" in messages[-1]["content"]
-    assert "sdk.create_experiences(...)" in messages[-1]["content"]
+    assert "experience.content.overwrite(...)" not in messages[-1]["content"]
+    assert "sdk.create_experiences(...)" not in messages[-1]["content"]
 
 
 def test_experience_schema_allows_focused_node_types_and_tell_successors():
@@ -963,9 +970,11 @@ def test_experience_schema_allows_focused_node_types_and_tell_successors():
     assert "Only the system may emit sdk.existing() or sdk.error()." in contract
     assert "Never overwrite an existing binding." in contract
     assert "existing_experience" not in contract
-    assert "obj.content.edit(search=..., replace=...)" in contract
-    assert "obj.content.drop(text=...)" in contract
-    assert "must occur exactly once" in contract
+    assert "obj.field.edit(search=..., replace=...)" in contract
+    assert "obj.field.drop(text=...)" in contract
+    assert (
+        "Every search must match a unique, non-overlapping region of the original field" in contract
+    )
     assert "The final SDK program is write-only." in contract
     assert "the stored result must still be a complete valid DAG" in contract
     assert "Do not map every Case requirement or every observed tool call into a node" in contract
@@ -1054,18 +1063,20 @@ def test_experience_evidence_rules_are_shared_by_synthesis_and_merge(phase):
     assert _NESTED_STRING_GUIDANCE in contract
 
     instruction = provider.instruction()
-    assert "prefer edit()/drop()" in instruction
-    assert "overwrite() only when most of the DAG needs rewriting" in instruction
+    assert "shared Edit instructions in the output contract" in instruction
+    assert "prefer edit()/drop()" not in instruction
     assert "one complete valid DAG" in instruction
     assert "Replace the whole content field" not in instruction
     assert "not a snippet patch" not in instruction
     assert "Return one full standalone Python DAG" not in instruction
-    assert "must occur exactly once" in contract
+    assert (
+        "Every search must match a unique, non-overlapping region of the original field" in contract
+    )
     assert "SDK content editing rules" not in contract
     assert "Only the system may emit sdk.existing() or sdk.error()." in contract
     assert "Never overwrite an existing binding." in contract
     assert "The final SDK program is write-only." in contract
-    assert "prefer the smallest unique edit()/drop()" in contract
+    assert "Keep search as small as possible" in contract
     assert "Keep all still-valid existing constraints." in contract
     assert "Missing user information belongs in ask" in contract
     assert "Do not repeat questions or tool calls already satisfied" in contract
@@ -1149,13 +1160,14 @@ def test_python_trajectory_output_exposes_only_extracted_fields():
 
     contract = protocol.render_contract(context)
     operations, error = protocol.parse(
-        "sdk.create_trajectories(context_rules='', steps='Observed steps')\nsdk.commit()",
+        "sdk.create_trajectories(case_name='case_a', context_rules='', steps='Observed steps')\nsdk.commit()",
         context,
     )
 
     assert error is None
     assert operations is not None
     assert {field.name for field in schema.fields} == {
+        "case_name",
         "context_rules",
         "steps",
         "evaluation_criteria",
@@ -1163,7 +1175,6 @@ def test_python_trajectory_output_exposes_only_extracted_fields():
     }
     for name in [
         "trajectory_name",
-        "case_name",
         "task_spec",
         "outcome",
         "trajectory_format",
@@ -1175,6 +1186,7 @@ def test_python_trajectory_output_exposes_only_extracted_fields():
     item = operations.model_dump()["trajectories"][0]
     assert set(item) == {
         "page_id",
+        "case_name",
         "context_rules",
         "steps",
         "evaluation_criteria",
@@ -2381,11 +2393,12 @@ def test_python_overwrite_guidance_explains_loss_and_preservation():
     contract = protocol.render_contract(_context([_preference_schema()]))
     repair = protocol.render_patch_repair([])
 
-    assert "obj.content.overwrite(new_value)" in contract
+    assert "obj.field.overwrite(new_value)" in contract
     assert "All old content omitted from the new string is removed from this field" in contract
     assert "Keep all still-valid existing constraints" in contract
-    assert "obj.field.overwrite(complete_new_value)" in repair
-    assert "preserving all still-valid existing content" in repair
+    assert "Regenerate the complete SDK program" in repair
+    assert "source associations" in repair
+    assert "overwrite(" not in repair
     for instruction in (contract, repair):
         assert ".content.update(" not in instruction
         assert ".field.update(" not in instruction
@@ -3336,7 +3349,7 @@ def test_python_nested_quote_guidance_example_preserves_inner_code(repair):
     assert "Escape trailing single quotes" in instruction
     assert "not the enclosing opening and closing delimiters" in instruction
     assert "decoded once" in instruction
-    assert "Never reformat existing source or copied search/drop anchors" in instruction
+    assert "Do not rewrite embedded content to enforce this convention" in instruction
     if repair:
         assert "rather than deleting or rewriting valid content" in instruction
     else:
@@ -3344,11 +3357,12 @@ def test_python_nested_quote_guidance_example_preserves_inner_code(repair):
         assert "use f'''...''' only when interpolation is needed" in instruction
         assert "not a restriction on other valid Python quote styles" in instruction
     examples = re.findall(r"```python\n(.*?)\n```", instruction, re.DOTALL)
-    example = next(code for code in examples if code.startswith("obj.content.overwrite("))
-    assert example.startswith("obj.content.overwrite('''")
+    example = next(code for code in examples if code.startswith("content_text = "))
+    assert example.startswith("content_text = '''")
     assert '\\"' not in example
     outer = ast.parse(example)
-    inner = ast.literal_eval(outer.body[0].value.args[0])
+    assert isinstance(outer.body[0], ast.Assign)
+    inner = ast.literal_eval(outer.body[0].value)
     assert inner == 'note = """first line\nsecond line"""'
     ast.parse(inner)
 
@@ -3454,11 +3468,11 @@ async def test_outer_quote_convention_preserves_old_source_in_search_and_drop(me
     patch = operations.model_dump()["preferences"][0]["content"]
     key = "search" if method == "edit" else "delete"
     assert patch["blocks"][0][key] == old_source
-    # The shared matcher removes a dropped whole line including its newline.
+    # Pi deletes only the selected text; the unselected newline stays.
     expected = (
         content.replace(old_source, replacement)
         if method == "edit"
-        else content.replace(old_source + "\n", "")
+        else content.replace(old_source, "")
     )
     assert await PatchOp(FieldType.STRING).apply_checked(content, patch) == expected
     assert memory.content == content
@@ -3472,7 +3486,10 @@ def test_trajectory_prompt_template_uses_outer_triple_single_quotes():
     registry = MemoryTypeRegistry(load_schemas=False)
     registry.load_from_yaml(str(resolve_memory_templates_dir() / "trajectories.yaml"))
     provider = AgentTrajectoryContextProvider(
-        messages=[], source_steps=[], memory_registry=registry
+        messages=[],
+        source_steps=[],
+        memory_registry=registry,
+        targets=[TrajectoryTarget(case={"name": "case"})],
     )
     instruction = provider.instruction()
     program = instruction.split("Use:\n", 1)[1].split("\nthen sdk.commit().", 1)[0]
@@ -3765,8 +3782,8 @@ def test_known_case_can_be_selected_without_any_memory_write():
     schema = registry.get("cases")
     fields = {
         "case_name": "payment_selection",
-        "task_signature": "Choose an eligible payment method",
-        "input": '{"preconditions":["a booking change is requested"]}',
+        "domain": "Choose an eligible payment method",
+        "description": '{"preconditions":["a booking change is requested"]}',
         "rubric": "[]",
     }
     uri = "viking://user/u/memories/cases/payment_selection.md"
@@ -3864,7 +3881,7 @@ def test_yaml_rubric_and_action_scores_preserve_string_fields():
     schema = registry.get("trajectories")
     context = _context([schema], template_context={"language": "en"})
     program = r"""sdk.create_trajectories(
-        context_rules='', steps='''Observed steps''',
+        case_name='case_a', context_rules='', steps='''Observed steps''',
         evaluation_criteria=r'''
 - id: confirmation
   passed: true
@@ -3958,10 +3975,7 @@ def test_raw_json_strings_preserve_case_rubric_string_schema():
     schema = registry.get("cases")
     context = _context([schema], template_context={"language": "en"})
     operations, error = create_extraction_output_protocol("python").parse(
-        r"""sdk.create_cases(case_name="case", task_signature="Task", input='''Context''', execution_count=1,
-            rubric=r'''[
-                {"id": "confirmation", "description": "Obtain an explicit \"yes\" before acting."}
-            ]''')""",
+        'sdk.create_cases(case_name="case", domain="Task", description=\'\'\'Context\'\'\', execution_count=1,\n            rubric=r\'\'\'[\n                {"id": "confirmation", "description": "Obtain an explicit \\"yes\\" before acting."}\n            ]\'\'\')',
         context,
     )
     assert error is None

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from benchmark.tau2.common.tau2_env.tau2_environment import Tau2UserSimulatorFormatError
+from benchmark.tau2.common.tau2_env.tau2_environment import Tau2UserSimulatorError
 from benchmark.tau2.train._rollout_helpers import (
     _as_tool_input,
     _case_trial,
@@ -326,7 +326,7 @@ class VikingBotTau2RolloutExecutor:
     async def _execute_one(self, case: Case, context: ExecutionContext) -> Rollout:
         try:
             return await self._execute_one_async(case, context)
-        except Tau2UserSimulatorFormatError as exc:
+        except Tau2UserSimulatorError as exc:
             return _failed_tau2_simulator_rollout(case, context, exc)
 
     async def _execute_one_async(self, case: Case, context: ExecutionContext) -> Rollout:

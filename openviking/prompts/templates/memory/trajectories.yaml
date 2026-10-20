@@ -4,7 +4,7 @@ description: |
   case_name identifies its reusable scenario; tasks in the same Case remain independent.
   This is training evidence for contrastive Experience learning, not a reusable SOP.
 directory: "viking://user/{{ user_space }}/memories/trajectories/{{ case_name }}"
-filename_template: "{{ trajectory_name }}.md"
+filename_template: "inbox/{{ extract_context.get_session_timestamp()[:8] }}_{{ {'success': 'S', 'failure': 'F', 'unknown': 'U'}[outcome] }}_{{ extract_context.get_random_id() }}.md"
 enabled: true
 operation_mode: add_only
 stage: agent
@@ -33,11 +33,15 @@ content_template: |-
 
   {{ steps }}
 fields:
+  - name: case_name
+    type: string
+    description: Copy the exact name of the supplied Case this Trajectory describes.
+    merge_op: immutable
   - name: context_rules
     type: string
     description: |
-      Extract only the relevant execution-time rules, without a section title or Trajectory Record
-      header. The content template adds the Session Context heading. Return an empty string when
+      Extract only the execution-time rules relevant to this Case, without a section title or
+      Trajectory Record header. The content template adds the Session Context heading. Return an empty string when
       no relevant rule is supplied.
       All source messages are supplied once in source_steps. Read execution-time rules from
       its system messages, including recorded text prefixed with "system:". Select only rules
@@ -80,8 +84,10 @@ fields:
       explanations, as dialogue. Preserve explicit confirmations, tool errors (including a
       rejected done call), and actual user STOP/termination events in their original order.
 
-      Select facts for this execution, not the Case's entire business scope. Preserve the minimum
-      complete evidence needed to review the user's requirements, evaluation results and key
+      Select facts for this Case's part of the execution, not the Case's entire business scope.
+      Do not attribute another Case's exclusive actions or facts to this Case. Shared facts may
+      appear in multiple trajectories when genuinely relevant; do not force disjoint accounts.
+      Preserve the minimum complete evidence needed to review the user's requirements, evaluation results and key
       decisions in both successful and failed runs, including facts the agent ignored or misused.
       Keep exact task-relevant values, including identifiers, amounts, dates, statuses, tool names
       and key parameters. For calculations and comparisons, retain the source values and relevant
@@ -103,30 +109,32 @@ fields:
     type: string
     init_value: "[]"
     description: |
-      Generate a best-effort YAML list of assessments from case.rubric and source_steps.
+      Use one YAML list for external results and context-based assessments.
+      For each external_evaluation.criterion_results entry with a reported passed or score,
+      copy criterion_name verbatim as id and copy the reported passed/score unchanged,
+      including false, zero and null. Use the external ID even when the Case uses another ID.
+      Extract these judgments; do not rejudge them because tool execution succeeded or you
+      disagree with the evaluator. Explain discrepancies in evidence without changing results.
+      For criteria without an external judgment, assess from case.rubric and source_steps.
       The Case rubric is guidance, not an exhaustive list or an ID whitelist.
-      No precomputed rubric results are required. External evaluation is optional: when
-      absent, judge from the conversation and tool evidence rather than returning [] merely
-      because there is no evaluator report.
-      Each returned item has an id (quoted), passed (true, false or null), concise evidence,
-      and an optional description of the criterion being assessed. Prefer a supplied Case
-      criterion ID when assessing the same requirement. Keep other relevant assessments
-      supported by the context, with a description so they remain understandable on their own.
-      Do not invent unsupported requirements or create another Case.
+      Prefer a supplied Case criterion ID for context-based judgments of that requirement.
+      External evaluation is optional; its absence does not require an empty list.
+      An overall pass/fail does not establish each criterion's result.
+      Each item has an id (quoted), passed (true, false or null), concise evidence and an optional
+      description. Include score only when explicitly reported for that criterion.
+      Preserve other relevant context-based assessments with their descriptions; do not duplicate
+      or contradict externally reported judgments. Do not invent unsupported requirements.
       Write evidence as a YAML block scalar (evidence: |) so quotes and multiple lines need
       no JSON escaping. The server preserves model descriptions and fills missing descriptions
       from matching Case criteria; an unmatched ID does not discard the assessment.
-      Preserve explicitly reported results for matching criteria; an overall pass/fail alone
-      does not prove each criterion passed/failed. Read external records semantically, not
-      by matching field names. Distinguish external results from conversation-based judgments
-      in evidence and retain contradictions rather than rewriting external results.
-      Use null for insufficient evidence or inapplicable criteria and explain why.
-      Partial or empty results are allowed; missing assessments imply neither success nor
-      failure. Return [] when no usable assessments are available. Malformed entries are
-      omitted without blocking the factual Trajectory; unknown or repeated IDs are retained.
-      YAML example (use a relevant criterion ID and observed evidence):
+      For context-based judgments, use null when evidence is insufficient or the criterion is
+      inapplicable. Partial or empty results are allowed only when no reported external judgments
+      are omitted. Malformed model-only entries are omitted without blocking the factual Trajectory;
+      missing or changed external judgments require repair. Keep exactly one entry per external ID.
+      YAML example (use the external criterion's exact ID, judgment and score when provided):
       - id: "criterion_id"
         passed: false
+        score: 0.0
         evidence: |
           The tool updated the record before the user confirmed the change.
     merge_op: immutable

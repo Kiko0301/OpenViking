@@ -45,6 +45,7 @@ from openviking.session.memory.memory_updater import (
     validate_operation_targets,
     write_stored_links,
 )
+from openviking.session.memory.merge_op.link_merge import is_persisted_link
 from openviking.session.memory.patch_merge_context_provider import (
     PatchMergeContextProvider,
     PatchMergePatch,
@@ -269,6 +270,9 @@ class StreamingMemoryUpdater:
         links = remap_stored_links(
             links, dict(getattr(result.operations, "delete_replacements", {}) or {})
         )
+        links = [link for link in links if is_persisted_link(link.model_dump())]
+        if not links:
+            return
         viking_fs = safe_get_viking_fs()
         lock_paths = _uri_lock_paths(_link_endpoint_uri_set(links), viking_fs, request.ctx)
         async with self._apply_lock:

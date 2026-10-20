@@ -58,11 +58,15 @@ def case(index=0):
 
 
 def call_user(generate):
-    messages = [SystemMessage(role="system", content="Simulate a customer.")]
+    messages = [
+        SystemMessage(role="system", content="Simulate a customer."),
+        reply("Please cancel my booking."),  # Prior customer turn, after Tau2's role flip.
+        UserMessage(role="user", content="The cancellation is complete."),
+    ]
     result = env_module._wrap_tau2_generate_with_rate_limit_retry(generate)(
         model="offline", messages=messages, call_name="user_simulator_response"
     )
-    assert len(messages) == 1
+    assert len(messages) == 3
     return result
 
 
@@ -106,7 +110,8 @@ def test_invalid_output_retries_current_generation_without_polluting_history(mon
     user = UserSimulator(
         llm="offline", instructions="Confirm then wait for completion.", tools=None
     )
-    state = user.get_init_state()
+    previous = UserMessage(role="user", content="Please change my reservation.")
+    state = user.get_init_state([previous])
     original_system = deepcopy(state.system_messages)
     incoming = AssistantMessage(role="assistant", content="Please confirm the changes.")
 
@@ -114,7 +119,7 @@ def test_invalid_output_retries_current_generation_without_polluting_history(mon
 
     assert actual.content == accepted.content
     assert same_state is state
-    assert state.messages == [incoming, actual]
+    assert state.messages == [previous, incoming, actual]
     assert state.system_messages == original_system
     assert len(inputs) == 3
     assert (
@@ -133,14 +138,15 @@ def test_exhaustion_is_bounded_redacted_and_does_not_commit_a_rejected_reply(mon
         user_simulator, "generate", env_module._wrap_tau2_generate_with_rate_limit_retry(generate)
     )
     user = UserSimulator(llm="offline", instructions="Wait for completion", tools=None)
-    state = UserState(system_messages=[], messages=[])
+    previous = UserMessage(role="user", content="Please change my reservation.")
+    state = UserState(system_messages=[], messages=[previous])
     incoming = AssistantMessage(role="assistant", content="Please confirm.")
 
     with pytest.raises(env_module.Tau2UserSimulatorFormatError, match="after 3 attempts") as caught:
         user.generate_next_message(incoming, state)
 
     assert generate.call_count == 3
-    assert state.messages == [incoming]
+    assert state.messages == [previous, incoming]
     assert state.system_messages == []
     assert "private-value" not in str(caught.value)
     assert len(str(caught.value)) < 2500
@@ -178,7 +184,13 @@ def test_reasoning_only_and_format_failures_share_one_budget():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["vikingbot", "native"])
-async def test_exhausted_format_only_fails_one_rollout_and_skips_learning(monkeypatch, backend):
+@pytest.mark.parametrize(
+    "error_type",
+    [env_module.Tau2UserSimulatorFormatError, env_module.Tau2UserSimulatorInitializationError],
+)
+async def test_exhausted_simulator_only_fails_one_rollout_and_skips_learning(
+    monkeypatch, backend, error_type
+):
     if backend == "vikingbot":
         from benchmark.tau2.train.rollout_executor_vikingbot import VikingBotTau2RolloutExecutor
 
@@ -192,7 +204,7 @@ async def test_exhausted_format_only_fails_one_rollout_and_skips_learning(monkey
     policy = ExperienceSet("viking://user/default/memories/experiences", [])
     context = ExecutionContext("snapshot", {"training": False, "stage": "eval_train_rollout"})
     good = Rollout(case(1), [], "snapshot", RubricEvaluation(True, 1.0, [], []))
-    error = env_module.Tau2UserSimulatorFormatError("invalid stop format after 3 attempts")
+    error = error_type("invalid user output; attempts exhausted")
 
     def outcome(case, *args):
         if case.input["task_no"] == 0:
@@ -212,7 +224,7 @@ async def test_exhausted_format_only_fails_one_rollout_and_skips_learning(monkey
     failed = results[0]
     assert results[1] is good
     assert failed.evaluation.score == 0.0 and not failed.evaluation.passed
-    assert failed.metadata["execution_error"]["type"] == "Tau2UserSimulatorFormatError"
+    assert failed.metadata["execution_error"]["type"] == error_type.__name__
     assert failed.metadata["execution_error"]["source"] == "tau2_simulator"
     assert failed.metadata["eval_trial"] == 0
     assert failed.case.name == "tau2_case_0"
@@ -229,7 +241,7 @@ async def test_exhausted_format_only_fails_one_rollout_and_skips_learning(monkey
     )
     assert report["case_count"] == 2 and report["accuracy"] == 0.5
     assert report["execution_error_count"] == 1 and report["execution_error_rate"] == 0.5
-    assert report["execution_error_types"] == {"tau2_simulator:Tau2UserSimulatorFormatError": 1}
+    assert report["execution_error_types"] == {f"tau2_simulator:{error_type.__name__}": 1}
     assert report["trials"][0]["execution_error_count"] == 1
 
 
@@ -261,7 +273,8 @@ def failing_gym(monkeypatch):
     )
     monkeypatch.setattr(UserSimulator, "is_stop", classmethod(env_module._tau2_user_is_stop))
     user = UserSimulator(llm="offline", instructions="Wait for completion.", tools=None)
-    state = user.get_init_state()
+    previous = UserMessage(role="user", content="Please change my reservation.")
+    state = user.get_init_state([previous])
     incoming = AssistantMessage(role="assistant", content="Please confirm.")
 
     class FakeGym:
@@ -301,24 +314,26 @@ def failing_gym(monkeypatch):
 
 def test_gym_rethrows_typed_format_failure_after_background_swallow(failing_gym):
     env, generate, state, incoming = failing_gym
+    history = list(state.messages)
     with pytest.raises(env_module.Tau2UserSimulatorFormatError) as caught:
         env.reset()
     assert env.env._simulation_done.is_set()
     assert generate.call_count == 3
-    assert state.messages == [incoming]
+    assert state.messages == [*history, incoming]
     assert "3 attempts" in str(caught.value)
     assert env.execution_error["type"] == "Tau2UserSimulatorFormatError"
 
 
 def test_gym_mid_dialog_failure_ends_without_delivering_rejected_text(failing_gym):
     env, generate, state, incoming = failing_gym
+    history = list(state.messages)
     env.env._orchestrator = env.env._get_orchestrator()
     assert (
         env.tool_call("communicate_with_user", {"content": "Please confirm."}) == "Task Terminated"
     )
     assert env.terminated
     assert generate.call_count == 3
-    assert state.messages == [incoming]
+    assert state.messages == [*history, incoming]
     assert env.execution_error["type"] == "Tau2UserSimulatorFormatError"
     assert env.tool_call("communicate_with_user", {"content": "Again?"}) == "Task Terminated"
     assert generate.call_count == 3
@@ -361,3 +376,97 @@ async def test_concurrent_user_generations_do_not_share_corrections_or_retry_cou
     assert all(result.content == "Yes." for result in results)
     assert calls == {"needs-retry": 2, "ordinary": 1}
     assert len(messages) == 1
+
+
+@pytest.mark.parametrize("marker", ["###STOP###", "###TRANSFER###", "###OUT-OF-SCOPE###"])
+def test_initial_terminal_reply_retries_once_without_polluting_history(monkeypatch, marker):
+    from tau2.orchestrator.orchestrator import DEFAULT_FIRST_AGENT_MESSAGE
+
+    attempts = []
+    accepted = reply("My cancelled flight caused me to miss a meeting; I want compensation.")
+
+    def generate(**kwargs):
+        attempts.append(deepcopy(kwargs["messages"]))
+        return reply(marker) if len(attempts) == 1 else accepted
+
+    monkeypatch.setattr(
+        user_simulator, "generate", env_module._wrap_tau2_generate_with_rate_limit_retry(generate)
+    )
+    user = UserSimulator(llm="offline", instructions="Ask for compensation.", tools=None)
+    state = user.get_init_state()
+    before = deepcopy(state.system_messages)
+    message, result = user.generate_next_message(DEFAULT_FIRST_AGENT_MESSAGE, state)
+
+    assert message.content == accepted.content
+    assert result is state
+    assert state.messages == [DEFAULT_FIRST_AGENT_MESSAGE, message]
+    assert state.system_messages == before
+    assert len(attempts) == 2
+    assert "No customer request has been delivered yet" in attempts[1][-1].content
+    assert marker not in [m.content for m in state.messages]
+
+
+@pytest.mark.parametrize("second", ["###OUT-OF-SCOPE###", "###STOP###", "", "Okay ###STOP###"])
+def test_initial_invalid_outputs_share_two_attempt_budget(monkeypatch, second):
+    from tau2.orchestrator.orchestrator import DEFAULT_FIRST_AGENT_MESSAGE
+
+    generate = Mock(spec=[], side_effect=[reply("###OUT-OF-SCOPE###"), reply(second)])
+    monkeypatch.setattr(
+        user_simulator, "generate", env_module._wrap_tau2_generate_with_rate_limit_retry(generate)
+    )
+    user = UserSimulator(llm="offline", instructions="Ask for compensation.", tools=None)
+    state = user.get_init_state()
+    with pytest.raises(env_module.Tau2UserSimulatorInitializationError, match="after 2 attempts"):
+        user.generate_next_message(DEFAULT_FIRST_AGENT_MESSAGE, state)
+    assert generate.call_count == 2
+    assert state.messages == [DEFAULT_FIRST_AGENT_MESSAGE]
+
+
+def test_initial_valid_customer_message_does_not_retry():
+    generate = Mock(spec=[], return_value=reply("Please cancel my flight."))
+    wrapped = env_module._wrap_tau2_generate_with_rate_limit_retry(generate)
+    assert (
+        wrapped(
+            model="offline",
+            messages=[SystemMessage(role="system", content="Customer scenario")],
+            call_name="user_simulator_response",
+        ).content
+        == "Please cancel my flight."
+    )
+    generate.assert_called_once()
+
+
+def test_initial_failure_survives_gym_thread_error_capture(failing_gym):
+    env, generate, state, _ = failing_gym
+    state.messages.clear()
+    generate.return_value = reply("###OUT-OF-SCOPE###")
+    # The fake Gym starts with its existing greeting; no user reply has been committed.
+    with pytest.raises(env_module.Tau2UserSimulatorInitializationError, match="after 2 attempts"):
+        env.reset()
+    assert generate.call_count == 2
+    assert env.execution_error["type"] == "Tau2UserSimulatorInitializationError"
+    assert not any(isinstance(m, UserMessage) for m in state.messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["vikingbot", "native"])
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_unknown_errors_and_cancellation_are_not_isolated(monkeypatch, backend, error_type):
+    if backend == "vikingbot":
+        from benchmark.tau2.train.rollout_executor_vikingbot import VikingBotTau2RolloutExecutor
+
+        executor = VikingBotTau2RolloutExecutor()
+        monkeypatch.setattr(
+            type(executor), "_execute_one_async", AsyncMock(side_effect=error_type())
+        )
+    else:
+        from benchmark.tau2.train.rollout_executor_native import NativeTau2RolloutExecutor
+
+        executor = NativeTau2RolloutExecutor()
+        monkeypatch.setattr(type(executor), "_execute_one_sync", Mock(side_effect=error_type()))
+    with pytest.raises(error_type):
+        await executor.execute(
+            [case()],
+            ExperienceSet("viking://user/default/memories/experiences", []),
+            ExecutionContext("snapshot", {"training": False, "stage": "train_rollout"}),
+        )

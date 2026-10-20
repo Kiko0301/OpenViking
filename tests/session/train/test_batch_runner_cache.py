@@ -605,3 +605,82 @@ def test_train_rollout_cache_config_and_report_default_to_enabled():
     )
     assert report.reuse_train_rollout_cache is True
     assert report.to_dict()["reuse_train_rollout_cache"] is True
+
+
+@pytest.mark.asyncio
+async def test_epoch_zero_cache_excludes_execution_errors_but_keeps_business_failures(tmp_path):
+    import json
+    from unittest.mock import AsyncMock
+
+    from openviking.session.train.components.dataset_service import rollout_to_dict
+    from openviking.session.train.context import ExecutionContext
+    from openviking.session.train.domain import Rollout, RubricEvaluation
+
+    case = _case()
+    context = ExecutionContext("snapshot", {"training": True, "epoch": 0})
+    failed = Rollout(
+        case,
+        [],
+        "snapshot",
+        RubricEvaluation(False, 0.0, [], []),
+        metadata={"execution_error": {"source": "simulator", "type": "InitializationError"}},
+    )
+    business_failure = Rollout(case, [], "snapshot", RubricEvaluation(False, 0.0, [], []))
+    delegate = Mock(execute=AsyncMock(side_effect=[[failed], [business_failure]]))
+    completed = []
+    executor = CachedEpochZeroTrainRolloutExecutor(
+        delegate, tmp_path, "test", on_rollout_complete=lambda **kwargs: completed.append(kwargs)
+    )
+
+    assert await executor.execute([case], None, context) == [failed]
+    assert not executor._path(case).exists()
+    # Persisted execution failures from earlier runs must not be reused either.
+    executor._path(case).write_text(
+        json.dumps({"cache_version": 1, "rollout": rollout_to_dict(failed)}), encoding="utf-8"
+    )
+    assert executor._load(case) is None
+    assert await executor.execute([case], None, context) == [business_failure]
+    cached = await executor.execute([case], None, context)
+    assert len(cached) == 1 and not cached[0].evaluation.passed
+    assert cached[0].metadata["train_rollout_cache_hit"] is True
+    assert delegate.execute.await_count == 2
+    assert len(completed) == 3
+
+
+def test_baseline_cache_rejects_execution_errors_on_read_and_write(tmp_path):
+    import json
+
+    config = BatchTrainEvalConfig(dataset="tau2", domain="airline")
+    path = tmp_path / "baseline.json"
+    report = {"accuracy": 0.5, "execution_error_count": 1}
+    assert not _write_baseline_cache(path, report, config=config)
+    assert not path.exists()
+    path.write_text(json.dumps({"cache_version": 1, "report": report}), encoding="utf-8")
+    assert _load_baseline_cache(path) is None
+    assert _write_baseline_cache(path, {**report, "execution_error_count": 0}, config=config)
+    assert _load_baseline_cache(path)["accuracy"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_baseline_execution_error_reports_cache_skip(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from openviking.session.train import batch_runner
+
+    path = tmp_path / "baseline.json"
+    monkeypatch.setattr(batch_runner, "_baseline_cache_path", lambda config: path)
+    result = SimpleNamespace(metadata={"report": {"execution_error_count": 1}})
+    pipeline = SimpleNamespace(eval=AsyncMock(return_value=result))
+    recorder = SimpleNamespace(record=AsyncMock())
+    returned, cache_hit = await batch_runner._load_or_run_baseline_eval(
+        config=BatchTrainEvalConfig(dataset="tau2", domain="airline"),
+        pipeline=pipeline,
+        case_loader=None,
+        policy_set=None,
+        report_builder=None,
+        event_recorder=recorder,
+    )
+    assert returned is result and cache_hit is False
+    assert not path.exists()
+    assert recorder.record.await_args_list[-1].args[0] == "baseline_cache_skip_execution_error"

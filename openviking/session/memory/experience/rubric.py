@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 import yaml
@@ -89,6 +90,14 @@ def snapshot_rubric_results(value: Any, rubric: list[dict[str, str]]) -> list[di
         if description is not None:
             result["description"] = description
         result.update(passed=item["passed"], evidence=item["evidence"])
+        if "score" in item:
+            score = item["score"]
+            if (
+                score is None
+                or type(score) is int
+                or (type(score) is float and math.isfinite(score))
+            ):
+                result["score"] = score
         results.append(result)
     if len(results) != len(value):
         logger.warning(
@@ -97,3 +106,41 @@ def snapshot_rubric_results(value: Any, rubric: list[dict[str, str]]) -> list[di
             len(value),
         )
     return results
+
+
+def validate_external_rubric_results(
+    results: list[dict[str, Any]], external_evaluation: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Check reported per-criterion judgments without injecting results or mapping Case IDs.
+
+    Overall outcomes and unstructured evaluator evidence do not imply per-criterion results.
+    The provider returns mismatches to the existing extraction repair loop before any write.
+    """
+    reports = (external_evaluation or {}).get("criterion_results")
+    if not isinstance(reports, list):
+        return []
+    errors = []
+    for report in reports:
+        if not isinstance(report, dict):
+            continue
+        name = report.get("criterion_name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        judgments = {key: report[key] for key in ("passed", "score") if key in report}
+        if not judgments:
+            continue
+        expected = {"id": name, **judgments}
+        matches = [result for result in results if result["id"] == name]
+        if len(matches) != 1 or any(
+            key not in matches[0] or matches[0][key] != value for key, value in judgments.items()
+        ):
+            errors.append(
+                {
+                    "error": "Extract exactly one evaluation_criteria entry for this external "
+                    "criterion. Copy criterion_name as id and the reported passed/score unchanged; "
+                    "do not substitute a Case ID or rejudge the result. Explain discrepancies "
+                    "only in evidence.",
+                    "expected": expected,
+                }
+            )
+    return errors

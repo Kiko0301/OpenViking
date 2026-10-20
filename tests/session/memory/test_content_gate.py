@@ -304,13 +304,14 @@ async def test_gate_dispatch_is_type_generic_and_independent_of_quality_gate(
 
 
 @pytest.mark.asyncio
-async def test_ordinary_patch_keeps_existing_lenient_semantics():
-    # Only the gated-content boundary requires every block to apply.
+async def test_ordinary_and_checked_patch_share_pi_validation():
+    # Every Pi edit batch is validated in full, even before a type-owned gate.
     merge = PatchOp(FieldType.STRING)
     content = "unchanged"
     empty = StrPatch(blocks=[SearchReplaceBlock(search="", replace="ignored")])
-    assert await merge.apply(content, empty) == content
-    with pytest.raises(ValueError, match="non-empty search"):
+    with pytest.raises(ValueError, match="search must not be empty"):
+        await merge.apply(content, empty)
+    with pytest.raises(ValueError, match="search must not be empty"):
         await merge.apply_checked(content, empty)
 
 
@@ -451,42 +452,48 @@ async def test_extraction_repair_and_writer_share_the_content_gate(
 ):
     bad = f"experience.content.{bad_edit}\nsdk.commit()"
     good = 'experience.content.edit(search="old reminder", replace="new reminder")\nsdk.commit()'
-    extraction, model, fs = extraction_case(monkeypatch, [bad, good if repaired else bad])
+    is_drop = bad_edit.startswith("drop(")
+    repair_reply = json.dumps(
+        {
+            "status": "repaired",
+            "repairs": [{"edit_index": 0, "search": "old reminder", "replace": "new reminder"}],
+        }
+        if repaired
+        else {"status": "cannot_repair", "reason": "No safe correction"}
+    )
+    responses = [bad, (good if repaired else bad) if is_drop else repair_reply]
+    if not is_drop and not repaired:
+        responses.extend([bad, repair_reply])  # The regenerated Edit also gets local repair.
+    extraction, model, fs = extraction_case(monkeypatch, responses)
     result, _ = await extraction.run()
-    assert model.get_completion_async.await_count == 2
+    assert model.get_completion_async.await_count == len(responses)
+    if not is_drop and not repaired:
+        fallback = model.get_completion_async.await_args_list[2].kwargs["messages"]
+        assert any("cannot_repair: No safe correction" in m["content"] for m in fallback)
     retry_messages = model.get_completion_async.await_args_list[1].kwargs["messages"]
-    failed_message = {"role": "assistant", "content": bad}
-    assert retry_messages.count(failed_message) == 1
-    repair_message = retry_messages[retry_messages.index(failed_message) + 1]
-    assert repair_message["role"] == "user"
-    repair = repair_message["content"]
-    assert "Memory content validation failed" in repair
-    gate_errors = json.loads(repair.split("Errors: ", 1)[1])
-    assert gate_errors[0]["uri"] == URI
-    assert gate_errors[0]["page_id"] == 1
-    if expected_search is not None:
-        diagnostic = gate_errors[0]["error"]
-        assert f"match_count={expected_count}" in diagnostic
-        assert f"search={expected_search!r}" in diagnostic
-        assert "replace='new reminder'" in diagnostic
-    if expected_search == "missing reminder":
-        # The DAG gate must not hide the richer generic patch diagnostics.
-        details = repair.split("Failed edits:\n", 1)[1].split(
-            "\n\nMemory content validation failed", 1
-        )[0]
-        assert json.loads(details) == [
-            {
-                "uri": URI,
-                "page_id": 1,
-                "field": "content",
-                "block_index": 1,
-                "search": "missing reminder",
-                "replace": "new reminder",
-                "reason": "not_found",
-                "match_count": 0,
-                "found_in_other_uris": [],
-            }
-        ]
+    if is_drop:
+        # Drop-only edits still use the original content-gate retry.
+        assert {"role": "assistant", "content": bad} in retry_messages
+    else:
+        assert len(retry_messages) == 2
+        assert all(message["role"] != "assistant" for message in retry_messages)
+        payload = json.loads(retry_messages[1]["content"])
+        target = payload["targets"][0]
+        assert target["uri"] == URI and target["field"] == "content"
+        assert target["original_text"] == SOURCE
+        if expected_search is not None:
+            assert target["edits"][0]["search"] == expected_search
+            diagnostic = target["error"]
+            assert f"{URI}#content" in diagnostic
+            assert (
+                f"Found {expected_count} occurrences"
+                if expected_count
+                else "Could not find the exact text"
+            ) in diagnostic
+        if expected_search == "missing reminder":
+            details = next(error for error in payload["errors"] if "block_index" in error)
+            assert details["block_index"] == 1
+            assert details["reason"] == "not_found" and details["match_count"] == 0
     if not repaired:
         assert not result.upsert_operations
         assert MemoryFileUtils.read(fs.files[URI], uri=URI).content == SOURCE
@@ -515,8 +522,8 @@ async def test_case_rubric_gate_validates_patched_field_without_requiring_conten
         content="",
         extra_fields={
             "case_name": "library",
-            "task_signature": "library",
-            "input": "",
+            "domain": "library",
+            "description": "",
             "rubric": before,
         },
     )
@@ -549,7 +556,7 @@ async def test_case_rubric_gate_validates_patched_field_without_requiring_conten
 
 
 @pytest.mark.asyncio
-async def test_checked_patch_error_describes_the_failing_sequential_block():
+async def test_checked_patch_rejects_overlapping_original_ranges():
     changes = StrPatch(
         blocks=[
             SearchReplaceBlock(search="old reminder", replace="updated reminder"),
@@ -559,35 +566,33 @@ async def test_checked_patch_error_describes_the_failing_sequential_block():
     with pytest.raises(ValueError) as caught:
         await PatchOp(FieldType.STRING).apply_checked(SOURCE, changes)
     error = str(caught.value)
-    assert "Patch block 2 failed shared exact/fuzzy matching" in error
-    assert "match_count=0" in error
-    assert "search='old reminder'" in error
-    assert "replace='final reminder'" in error
+    assert "edits[0] and edits[1] overlap in string field" in error
+    assert "Merge them into one edit or target disjoint regions" in error
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("output_format", ["python", "json"])
 @pytest.mark.parametrize(
-    ("old_text", "approximate_text"),
+    ("original_fragment", "approximate_text"),
     [
-        ("old reminder", "old reminders"),
+        ("old “reminder”", 'old "reminder"'),
         (
             "退款原路退回，且退款账户必须为原支付方式。",
-            "退款原路退回，以及退款账户必须为原支付方式。",
+            "退款原路退回,且退款账户必须为原支付方式。",
         ),
     ],
-    ids=["typo", "unicode"],
+    ids=["quotes", "unicode-width"],
 )
 async def test_patch_formats_share_fuzzy_preview_and_locked_write(
-    monkeypatch, output_format, old_text, approximate_text
+    monkeypatch, output_format, original_fragment, approximate_text
 ):
-    source = SOURCE.replace("old reminder", old_text)
+    source = SOURCE.replace("old reminder", original_fragment)
     search = f'reminder = tell("{approximate_text}")'
     replacement = 'reminder = tell("new reminder")'
     change = patch(search, replacement)
     assert search not in source
     expected = await PatchOp(FieldType.STRING).apply(source, change)
-    assert expected == source.replace(old_text, "new reminder")
+    assert expected == source.replace(original_fragment, "new reminder")
     if output_format == "python":
         response = (
             f"experience.content.edit(search={search!r}, replace={replacement!r})\nsdk.commit()"
@@ -624,15 +629,16 @@ async def test_failed_block_after_fuzzy_match_does_not_persist_partial_edits(as_
     change = StrPatch(
         blocks=[
             SearchReplaceBlock(
-                search='reminder = tell("old reminders")',
+                search='reminder = tell("old reminder")   ',
                 replace='reminder = tell("new reminder")',
             ),
             SearchReplaceBlock(search="UNRELATED_MISSING_ANCHOR_12345", replace="never saved"),
         ]
     )
-    # The shared lenient matcher accepts the first block; the checked boundary must
-    # reject the second, not write the first or any unrelated/dependent operation.
-    assert "new reminder" in await PatchOp(FieldType.STRING).apply(SOURCE, change)
+    # Both the raw engine and the gated writer reject the whole batch, not just
+    # the failing second edit. No partial first edit may escape either path.
+    with pytest.raises(ValueError, match=r"Could not find edits\[1\]"):
+        await PatchOp(FieldType.STRING).apply(SOURCE, change)
     deleted = file(uri=URI.replace("case_a.md", "obsolete.md"))
     fs = Store(
         {
@@ -644,7 +650,7 @@ async def test_failed_block_after_fuzzy_match_does_not_persist_partial_edits(as_
     before = dict(fs.files)
     candidate = operation(change.model_dump() if as_dict else change, file())
     errors = await loop()._validate_content_gates(batch(candidate))
-    assert len(errors) == 1 and "Patch block 2" in errors[0]["error"]
+    assert len(errors) == 1 and "edits[1]" in errors[0]["error"]
     result = await updater(fs).apply_operations(
         batch(
             operation("changed", memory_type="records", uri=OTHER),
@@ -653,14 +659,14 @@ async def test_failed_block_after_fuzzy_match_does_not_persist_partial_edits(as_
         ),
         CTX,
     )
-    assert result.errors and "Patch block 2" in str(result.errors[0][1])
+    assert result.errors and "edits[1]" in str(result.errors[0][1])
     assert fs.files == before and fs.writes == [] and fs.deletes == []
     assert not fs.lock.locked()
 
 
 @pytest.mark.asyncio
 async def test_fuzzy_edit_does_not_rebase_over_a_concurrently_changed_field():
-    change = patch('reminder = tell("old reminders")', 'reminder = tell("new reminder")')
+    change = patch('reminder = tell("old reminder")   ', 'reminder = tell("new reminder")')
     candidate = operation(change, file())
     assert await loop()._validate_content_gates(batch(candidate)) == []
     latest = SOURCE.replace("old reminder", "independently changed reminder")
@@ -675,7 +681,7 @@ async def test_fuzzy_edit_does_not_rebase_over_a_concurrently_changed_field():
 @pytest.mark.asyncio
 async def test_fuzzy_match_still_requires_a_valid_final_dag():
     change = patch(
-        'reminder = tell("old reminders")',
+        'reminder = tell("old reminder")   ',
         'reminder = tell("new reminder")\nmissing.then(reminder)',
     )
     candidate = operation(change, file())
@@ -685,4 +691,18 @@ async def test_fuzzy_match_still_requires_a_valid_final_dag():
     before = dict(fs.files)
     result = await updater(fs).apply_operations(batch(candidate), CTX)
     assert result.errors and fs.files == before and not fs.writes
+    assert not fs.lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_pi_touched_line_normalization_cannot_persist_an_invalid_dag():
+    source = SOURCE.replace("old reminder", "请确认 “yes”，备注“保留”")
+    change = patch('请确认 "yes"', "请确认 “no”")
+    candidate = operation(change, file(source))
+    assert await loop()._validate_content_gates(batch(candidate))
+    fs = Store({URI: MemoryFileUtils.write(file(source))})
+    before = dict(fs.files)
+    result = await updater(fs).apply_operations(batch(candidate), CTX)
+    assert result.errors
+    assert fs.files == before and not fs.writes
     assert not fs.lock.locked()

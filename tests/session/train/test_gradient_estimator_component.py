@@ -23,8 +23,9 @@ from openviking.session.train import (
 from openviking.session.train.components.trajectory_observation import (
     TRAJECTORY_FORMAT,
 )
-from openviking.session.train.gates.experience import (
-    EXPERIENCE_GATE_CONTEXTS_KEY,
+from openviking.session.train.gates.identifiers import ExperienceIdentifierGate
+from openviking.session.train.utils import (
+    EXPERIENCE_SOURCE_CONTEXTS_KEY,
 )
 from tests.session.train.test_fakes import render_trajectory_template
 
@@ -143,7 +144,7 @@ async def test_direct_session_proposal_has_fixed_case_and_archive_provenance(mon
     proposal = gradients[0]
     assert proposal.target_name == item.rollout.case.name
     assert proposal.links[0].to_uri == item.trajectories[0].uri
-    gate_context = proposal.metadata[EXPERIENCE_GATE_CONTEXTS_KEY][0]
+    gate_context = proposal.metadata[EXPERIENCE_SOURCE_CONTEXTS_KEY][0]
     assert gate_context["passed"] is False
     assert gate_context["feedback"] == ["duplicate remains"]
     assert gate_context["evidence"][0]["summary"] == "Cancel the duplicate booking."
@@ -159,7 +160,7 @@ async def test_unknown_outcome_is_not_promoted_to_success(monkeypatch):
         ExperienceGradientEstimator, "_run_extract_loop", mock_extract_loop(operations())
     )
     (proposal,) = await estimate(ExperienceGradientEstimator(), analysis(passed=None))
-    assert proposal.metadata[EXPERIENCE_GATE_CONTEXTS_KEY][0]["passed"] is None
+    assert proposal.metadata[EXPERIENCE_SOURCE_CONTEXTS_KEY][0]["passed"] is None
 
 
 @pytest.mark.asyncio
@@ -196,6 +197,7 @@ async def test_candidate_can_generalize_evaluator_backed_success_value(monkeypat
 
 @pytest.mark.asyncio
 async def test_candidate_copying_session_entity_ids_into_reminder_is_rejected(monkeypatch):
+    monkeypatch.setattr(ExperienceIdentifierGate, "ENABLED", True)
     item = analysis(passed=True)
     item.rollout.case.input = {"user_query": "Cancel the reservations XEHM4B and 59XX6W."}
 
@@ -225,6 +227,7 @@ async def test_candidate_copying_session_entity_ids_into_reminder_is_rejected(mo
 
 @pytest.mark.asyncio
 async def test_generalized_reminder_and_numeric_rule_value_are_accepted(monkeypatch):
+    monkeypatch.setattr(ExperienceIdentifierGate, "ENABLED", True)
     item = analysis(passed=True)
     item.rollout.case.input = {
         "user_query": "Cancel reservations XEHM4B and 59XX6W and communicate total 1628."

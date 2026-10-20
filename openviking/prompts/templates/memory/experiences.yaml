@@ -26,7 +26,7 @@ fields:
       this content field is a string containing one complete, standalone DAG program.
       DAG source belongs only inside the content string, never at the top level of the reply.
       Use triple-single-quoted strings for outer SDK text arguments and triple-double-quoted
-      strings for new text literals inside the DAG; do not reformat existing search/drop anchors.
+      strings for new text literals inside the DAG.
       Inside the string, do NOT include Markdown or DAG JSON. The stored source must rebuild
       the DAG from an empty graph: start with `dag = workflow("""...""")` and include every node
       that the final DAG needs. After applying any edits, the stored result must still be a

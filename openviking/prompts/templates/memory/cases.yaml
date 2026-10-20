@@ -5,21 +5,23 @@ description: |
   fragments. Infer the business domain from the current service/task context. Group tasks
   within the same domain into one Case, and keep distinct business domains separate.
   Do not split a domain by workflow, rule check, eligibility condition, parameter, user,
-  task ID or outcome. Those distinctions belong in the linked Experience's conditional branches.
+  task ID or outcome. Those distinctions belong in the same-name Experience's conditional branches.
 
-  Search for an existing domain-level Case and reuse its canonical name and domain context. A narrower
-  workflow Case is not the domain identity; do not rename, delete or consolidate legacy Cases here.
-  Maintain its rubric from supplied rules, task requirements and feedback. Reuse stable rubric IDs;
-  add genuinely new domain-wide criteria, edit changed criteria, and remove obsolete ones only with
-  supporting evidence. A failed run does not justify weakening a rule. Do not promote one task
-  answer, evaluator literal, entity ID or local failure into a domain-wide requirement.
+  Search for an existing domain-level Case and reuse its canonical name. A narrower workflow Case
+  is not the domain identity; do not rename, delete or consolidate legacy Cases here.
+  Refine domain and description only to clarify, correct or supplement the SAME business domain
+  using supplied evidence. Never repurpose an existing Case into a different business domain;
+  reuse or create another Case for that domain instead. Keep case_name unchanged.
+  Maintain its rubric only from explicitly supplied evaluation or acceptance criteria, following
+  the rubric field's source restrictions. A failed run is not permission to change the criteria.
   For each execution, increment execution_count once on every matched existing Case, even when
   its rubric and domain context are unchanged. In Python, use matched_case.update(execution_count=1)
   on the loaded Case; sdk.commit(cases=[...]) and sdk.commit() are not required. In JSON, include
   a Case update with its page_id, unchanged identity fields, and execution_count: 1.
   This update associates the execution with the Case so it can contribute a Trajectory;
   do not return an empty operation for a match.
-  Update a changed rubric on the loaded Case using the normal edit/drop/overwrite field operations.
+  Update changed domain, description or rubric fields on the loaded Case using the normal
+  edit/drop/overwrite field operations.
   Count only matched Cases, not all search results. Use sdk.create_cases only for a new domain
   target, never for an existing one, and set execution_count=1 for its first execution.
   When merging Case patches, sum their execution_count deltas once for each final Case rather
@@ -37,36 +39,29 @@ peer_enabled: false
 content_template: |
   # {{ case_name }}
 
-  ## Business Domain
-  {{ task_signature }}
+  ## Domain
+  {{ domain }}
 
-  ## Domain Context
-  {{ input }}
+  ## Description
+  {{ description }}
 
   ## Rubric
   ```json
   {{ rubric }}
   ```
 
-  ## Linked Experiences
-  {%- for link in links or [] %}
-  {%- set target_uri = link.to_uri or "" %}
-  {%- if "/memories/experiences/" in target_uri %}
-  - [{{ uri_basename(target_uri) }}]({{ link_target(target_uri) }})
-  {%- endif %}
-  {%- endfor %}
 embedding_template: |-
   {{ case_name }}
 
-  {{ task_signature }}
+  {{ domain }}
 
-  {{ input }}
+  {{ description }}
 
   {{ rubric }}
 overview_template: |-
   # Cases Overview
   {% for item in items %}
-  - [{{ item.file_content.case_name }}](./{{ item.file_name }}) — {{ item.file_content.task_signature }}
+  - [{{ item.file_content.case_name }}](./{{ item.file_name }}) — {{ item.file_content.domain }}
   {% endfor %}
 
 fields:
@@ -81,21 +76,22 @@ fields:
       processing result, task number or entity ID.
     merge_op: immutable
 
-  - name: task_signature
+  - name: domain
     type: string
     description: |
       One sentence describing the business domain and its service scope, not one task's intent.
       Include the domain's range of services rather than a particular action or result.
       No dataset signatures or instance-specific identifiers, names, amounts, dates or paths.
-    merge_op: immutable
+    merge_op: patch
 
-  - name: input
+  - name: description
     type: string
     description: |
-      Plain-text domain context: stable background and information needed to handle requests.
-      Use concise prose or Markdown bullets, not JSON. Do not repeat task_signature or include
-      task-specific identifiers, dates, amounts, membership tiers or other instance values.
-    merge_op: immutable
+      A short Case introduction: stable background and context needed to understand this domain.
+      Use concise prose or Markdown bullets, not JSON. Do not repeat domain or rubric,
+      copy entire policy/tool manuals, or include task-specific identifiers, dates, amounts,
+      membership tiers or other instance values. Original rules belong in each Trajectory.
+    merge_op: patch
 
   - name: execution_count
     type: int64
@@ -111,10 +107,14 @@ fields:
     init_value: "[]"
     description: |
       JSON list of domain-wide evaluation criteria, each with exactly id and description strings.
-      Use stable, unique IDs and clear criteria grounded in supplied rules, task requirements and
-      feedback. Describe when a criterion applies and what counts as satisfying it. Include no
-      task-specific expected answers, identifiers or scores. Update this list as supported rules
-      evolve; retain IDs for unchanged criteria. An empty list means no criteria are established.
+      Extract only explicit external rubrics, evaluation/acceptance criteria defined in context,
+      or success conditions explicitly stated by the user.
+      Normalize wording and deduplicate without changing meaning, conditions, thresholds or scope.
+      Do not infer criteria from ordinary business rules, tool descriptions, outcomes/errors,
+      Experience advice or assistant reasoning. Existing memories alone are not authority.
+      Only explicit definitions may authorize adding, changing or removing criteria; keep stable IDs.
+      Without explicit new definitions, leave an existing rubric unchanged; use [] for a new Case.
+      Keep task-specific answers, identifiers and scores in Trajectories, not domain-wide criteria.
       Example shape only: [{"id":"respect_scope","description":"Only perform changes the user authorized."}]
       Each Trajectory evaluates these criteria and stores its own definition/result snapshot.
     merge_op: patch

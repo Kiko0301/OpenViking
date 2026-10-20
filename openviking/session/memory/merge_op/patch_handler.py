@@ -1,1185 +1,296 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""
-Patch handler for memory updates.
+"""Pi's text-edit engine, adapted from TypeScript to memory-field strings.
 
-Supports two modes:
-1. Content patch: structured SEARCH/REPLACE and DELETE blocks
-2. Field patch: Field-level updates based on merge_op
+Source: earendil-works/pi@482c1381a00d8d00bc81697e4a980c593db6803e,
+packages/coding-agent/src/core/tools/edit-diff.ts and edit.ts.
+StrPatch blocks and the memory URI/field adapt Pi to the memory SDK. Matching,
+original-snapshot batch semantics, and normalization of touched lines follow
+that pinned source. Diagnostics use the SDK parameter names search/replace.
 
-Enhanced features from RooCode:
-- Support for multiple SEARCH/REPLACE and DELETE blocks
-- Fuzzy matching (fuzzy matching)
-- Line number handling (add, strip, detect)
-- Marker escaping support
-- Aggressive line number stripping fallback
-- Detailed validation and error messages
-- Indentation preservation
-- Levenshtein distance similarity calculation
+The upstream portions are used under the MIT License:
+
+Copyright (c) 2025 Mario Zechner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 """
+
+from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
-from enum import Enum
-from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from itertools import pairwise
 
-from rapidfuzz.distance import Levenshtein
+from openviking.session.memory.merge_op.base import StrPatch
 
-from openviking.session.memory.merge_op.base import DeleteBlock, StrPatch
-from openviking.session.memory.utils.line_numbers import (
-    add_line_numbers,
-    every_line_has_line_numbers,
-    extract_start_line_number,
-    strip_line_numbers,
-)
-from openviking_cli.utils import get_logger
 
-if TYPE_CHECKING:
-    pass
+class PatchParseError(ValueError):
+    """Pi edit failure, with metadata for ExtractLoop's structured tool feedback."""
 
-logger = get_logger(__name__)
-
-
-class PatchParseError(Exception):
-    """Error parsing patch content."""
-
-    pass
-
-
-# ============================================================================
-# Core Algorithm Functions (from RooCode)
-# ============================================================================
-
-
-def normalize_string(text: str) -> str:
-    """Normalize string by handling smart quotes and special characters."""
-    replacements = {
-        "\u2018": "'",
-        "\u2019": "'",
-        "\u201c": '"',
-        "\u201d": '"',
-        "\u00a0": " ",
-        "\u200b": "",
-        "\u200c": "",
-        "\u200d": "",
-        "\u200e": "",
-        "\u200f": "",
-        "\ufeff": "",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return text
-
-
-def get_similarity(original: str, search: str) -> float:
-    """Calculate similarity ratio between two strings (0 to 1)."""
-    if search == "":
-        return 0.0
-
-    normalized_original = normalize_string(original)
-    normalized_search = normalize_string(search)
-
-    if normalized_original == normalized_search:
-        return 1.0
-
-    dist = Levenshtein.distance(normalized_original, normalized_search)
-    max_length = max(len(normalized_original), len(normalized_search))
-
-    return 1.0 - (dist / max_length) if max_length > 0 else 1.0
-
-
-def fuzzy_search(
-    lines: List[str], search_chunk: str, start_index: int, end_index: int
-) -> Dict[str, Any]:
-    """
-    Perform a "middle-out" search to find the slice most similar to search_chunk.
-
-    For single-line search, also checks for substring matches within each line.
-
-    Returns dict with bestScore, bestMatchIndex, bestMatchContent
-    """
-    best_score = 0.0
-    best_match_index = -1
-    best_match_content = ""
-    search_lines = search_chunk.split("\n")
-    search_len = len(search_lines)
-
-    mid_point = (start_index + end_index) // 2
-    left_index = mid_point
-    right_index = mid_point + 1
-
-    # For single-line search, enable substring matching mode
-    is_single_line = search_len == 1
-    search_str = search_lines[0] if is_single_line else ""
-    # Bound retained candidate text and discard it when this search returns.
-    substring_match = lru_cache(maxsize=128)(_find_best_substring_match)
-    chunk_similarity = lru_cache(maxsize=128)(get_similarity)
-
-    while left_index >= start_index or right_index <= end_index - search_len:
-        if left_index >= start_index:
-            if is_single_line:
-                # Check substring match in this single line
-                line = lines[left_index]
-                # First check for exact substring match
-                if search_str in line:
-                    best_score = 1.0
-                    best_match_index = left_index
-                    best_match_content = line
-                    left_index -= 1
-                    continue
-                # If no exact match, try the best similarity with substrings
-                line_score, line_content = substring_match(line, search_str)
-                if line_score > best_score:
-                    best_score = line_score
-                    best_match_index = left_index
-                    best_match_content = line_content
-            else:
-                # Original multi-line logic
-                original_chunk = "\n".join(lines[left_index : left_index + search_len])
-                similarity = chunk_similarity(original_chunk, search_chunk)
-                if similarity > best_score:
-                    best_score = similarity
-                    best_match_index = left_index
-                    best_match_content = original_chunk
-            left_index -= 1
-
-        if right_index <= end_index - search_len:
-            if is_single_line:
-                # Check substring match in this single line
-                line = lines[right_index]
-                # First check for exact substring match
-                if search_str in line:
-                    best_score = 1.0
-                    best_match_index = right_index
-                    best_match_content = line
-                    right_index += 1
-                    continue
-                # If no exact match, try the best similarity with substrings
-                line_score, line_content = substring_match(line, search_str)
-                if line_score > best_score:
-                    best_score = line_score
-                    best_match_index = right_index
-                    best_match_content = line_content
-            else:
-                # Original multi-line logic
-                original_chunk = "\n".join(lines[right_index : right_index + search_len])
-                similarity = chunk_similarity(original_chunk, search_chunk)
-                if similarity > best_score:
-                    best_score = similarity
-                    best_match_index = right_index
-                    best_match_content = original_chunk
-            right_index += 1
-
-    return {
-        "bestScore": best_score,
-        "bestMatchIndex": best_match_index,
-        "bestMatchContent": best_match_content,
-    }
-
-
-def _find_best_substring_match(line: str, search_str: str) -> tuple[float, str]:
-    """Find the best matching substring in a line."""
-    best_score = 0.0
-    best_content = ""
-    search_len = len(search_str)
-    line_len = len(line)
-
-    # If search string is longer than line, just compare the whole line
-    if search_len >= line_len:
-        return get_similarity(line, search_str), line
-
-    # Try sliding window for best match (limit to reasonable checks for performance)
-    # First check at start, end, and a few positions in between
-    positions_to_check = [0, line_len - search_len]
-    if line_len > search_len * 3:
-        positions_to_check.append(line_len // 2 - search_len // 2)
-
-    for i in positions_to_check:
-        if 0 <= i <= line_len - search_len:
-            substring = line[i : i + search_len]
-            score = get_similarity(substring, search_str)
-            if score > best_score:
-                best_score = score
-                best_content = substring
-
-    # Also compare with the whole line as fallback
-    whole_line_score = get_similarity(line, search_str)
-    if whole_line_score > best_score:
-        best_score = whole_line_score
-        best_content = line
-
-    return best_score, best_content
-
-
-# ============================================================================
-# Marker Utilities (from RooCode)
-# ============================================================================
-
-
-def unescape_markers(content: str) -> str:
-    """Unescape escaped markers in content."""
-    return (
-        content.replace(r"\<<<<<<<", "<<<<<<<")
-        .replace(r"\=======", "=======")
-        .replace(r"\>>>>>>>", ">>>>>>>")
-        .replace(r"\-------", "-------")
-        .replace(r"\:end_line:", ":end_line:")
-        .replace(r"\:start_line:", ":start_line:")
-    )
-
-
-# ============================================================================
-# Validation (from RooCode)
-# ============================================================================
-
-
-class State(Enum):
-    START = 1
-    AFTER_SEARCH = 2
-    AFTER_SEPARATOR = 3
-
-
-def validate_marker_sequencing(diff_content: str) -> Dict[str, Any]:
-    """Validate the marker sequencing in diff content."""
-    state = {"current": State.START, "line": 0}
-
-    SEARCH_PATTERN = r"^<<<<<<< SEARCH>?$"
-    SEP = "======="
-    REPLACE = ">>>>>>> REPLACE"
-    SEARCH_PREFIX = "<<<<<<<"
-    REPLACE_PREFIX = ">>>>>>>"
-
-    def report_merge_conflict_error(found: str, _expected: str) -> Dict[str, Any]:
-        return {
-            "success": False,
-            "error": (
-                f"ERROR: Special marker '{found}' found in your diff content at line {state['line']}:\n"
-                "\n"
-                f"When removing merge conflict markers like '{found}' from files, you MUST escape them\n"
-                "in your SEARCH section by prepending a backslash (\\) at the beginning of the line:\n"
-                "\n"
-                "CORRECT FORMAT:\n\n"
-                "<<<<<<< SEARCH\n"
-                "content before\n"
-                f"\\{found}    <-- Note the backslash here in this example\n"
-                "content after\n"
-                "=======\n"
-                "replacement content\n"
-                ">>>>>>> REPLACE\n"
-                "\n"
-                "Without escaping, the system confuses your content with diff syntax markers.\n"
-                "You may use multiple diff blocks in a single diff request, but ANY of ONLY the following "
-                "separators that occur within SEARCH or REPLACE content must be escaped, as follows:\n"
-                f"\\{SEARCH_PREFIX}\n"
-                f"\\{SEP}\n"
-                f"\\{REPLACE}\n"
-            ),
-        }
-
-    def report_invalid_diff_error(found: str, expected: str) -> Dict[str, Any]:
-        return {
-            "success": False,
-            "error": (
-                f"ERROR: Diff block is malformed: marker '{found}' found in your diff content at line {state['line']}. "
-                f"Expected: {expected}\n"
-                "\n"
-                "CORRECT FORMAT:\n\n"
-                "<<<<<<< SEARCH\n"
-                ":start_line: (required) The line number of original content where the search block starts.\n"
-                "-------\n"
-                "[exact content to find including whitespace]\n"
-                "=======\n"
-                "[new content to replace with]\n"
-                ">>>>>>> REPLACE\n"
-            ),
-        }
-
-    def report_line_marker_in_replace_error(marker: str) -> Dict[str, Any]:
-        return {
-            "success": False,
-            "error": (
-                f"ERROR: Invalid line marker '{marker}' found in REPLACE section at line {state['line']}\n"
-                "\n"
-                "Line markers (:start_line: and :end_line:) are only allowed in SEARCH sections.\n"
-                "\n"
-                "CORRECT FORMAT:\n"
-                "<<<<<<< SEARCH\n"
-                ":start_line:5\n"
-                "content to find\n"
-                "=======\n"
-                "replacement content\n"
-                ">>>>>>> REPLACE\n"
-                "\n"
-                "INCORRECT FORMAT:\n"
-                "<<<<<<< SEARCH\n"
-                "content to find\n"
-                "=======\n"
-                ":start_line:5    <-- Invalid location\n"
-                "replacement content\n"
-                ">>>>>>> REPLACE\n"
-            ),
-        }
-
-    lines = diff_content.split("\n")
-    search_count = sum(1 for l in lines if re.match(SEARCH_PATTERN, l.strip()))
-    sep_count = sum(1 for l in lines if l.strip() == SEP)
-    replace_count = sum(1 for l in lines if l.strip() == REPLACE)
-
-    likely_bad_structure = search_count != replace_count or sep_count < search_count
-
-    for line in diff_content.split("\n"):
-        state["line"] += 1
-        marker = line.strip()
-
-        # Check for line markers in REPLACE sections (but allow escaped ones)
-        if state["current"] == State.AFTER_SEPARATOR:
-            if marker.startswith(":start_line:") and not line.strip().startswith(r"\:start_line:"):
-                return report_line_marker_in_replace_error(":start_line:")
-            if marker.startswith(":end_line:") and not line.strip().startswith(r"\:end_line:"):
-                return report_line_marker_in_replace_error(":end_line:")
-
-        if state["current"] == State.START:
-            if marker == SEP:
-                return (
-                    report_invalid_diff_error(SEP, "SEARCH")
-                    if likely_bad_structure
-                    else report_merge_conflict_error(SEP, "SEARCH")
-                )
-            if marker == REPLACE:
-                return report_invalid_diff_error(REPLACE, "SEARCH")
-            if marker.startswith(REPLACE_PREFIX):
-                return report_merge_conflict_error(marker, "SEARCH")
-            if re.match(SEARCH_PATTERN, marker):
-                state["current"] = State.AFTER_SEARCH
-            elif marker.startswith(SEARCH_PREFIX):
-                return report_merge_conflict_error(marker, "SEARCH")
-
-        elif state["current"] == State.AFTER_SEARCH:
-            if re.match(SEARCH_PATTERN, marker):
-                return report_invalid_diff_error("SEARCH", SEP)
-            if marker.startswith(SEARCH_PREFIX):
-                return report_merge_conflict_error(marker, "SEARCH")
-            if marker == REPLACE:
-                return report_invalid_diff_error(REPLACE, SEP)
-            if marker.startswith(REPLACE_PREFIX):
-                return report_merge_conflict_error(marker, "SEARCH")
-            if marker == SEP:
-                state["current"] = State.AFTER_SEPARATOR
-
-        elif state["current"] == State.AFTER_SEPARATOR:
-            if re.match(SEARCH_PATTERN, marker):
-                return report_invalid_diff_error("SEARCH", REPLACE)
-            if marker.startswith(SEARCH_PREFIX):
-                return report_merge_conflict_error(marker, REPLACE)
-            if marker == SEP:
-                return (
-                    report_invalid_diff_error(SEP, REPLACE)
-                    if likely_bad_structure
-                    else report_merge_conflict_error(SEP, REPLACE)
-                )
-            if marker == REPLACE:
-                state["current"] = State.START
-            elif marker.startswith(REPLACE_PREFIX):
-                return report_merge_conflict_error(marker, REPLACE)
-
-    if state["current"] == State.START:
-        return {"success": True}
-    else:
-        expected = "=======" if state["current"] == State.AFTER_SEARCH else ">>>>>>> REPLACE"
-        return {
-            "success": False,
-            "error": f"ERROR: Unexpected end of sequence: Expected '{expected}' was not found.",
-        }
-
-
-# ============================================================================
-# Result Classes (from RooCode)
-# ============================================================================
-
-
-@dataclass
-class DiffResult:
-    """Result of applying a diff."""
-
-    success: bool
-    content: Optional[str] = None
-    error: Optional[str] = None
-    fail_parts: Optional[List[Dict]] = None
-
-
-# ============================================================================
-# Main Strategy Class (from RooCode)
-# ============================================================================
-
-
-class MultiSearchReplaceDiffStrategy:
-    """Multi-Search-Replace diff strategy implementation."""
-
-    def __init__(self, fuzzy_threshold: float = 1.0, buffer_lines: int = 40):
-        """
-        Initialize the strategy.
-
-        Args:
-            fuzzy_threshold: Similarity threshold for fuzzy matching (0.0 to 1.0)
-            buffer_lines: Number of extra context lines to search around target
-        """
-        self.fuzzy_threshold = fuzzy_threshold
-        self.buffer_lines = buffer_lines
-
-    def apply_diff(
+    def __init__(
         self,
-        original_content: str,
-        diff_content: str,
-        _param_start_line: Optional[int] = None,
-        _param_end_line: Optional[int] = None,
-    ) -> DiffResult:
-        """
-        Apply a multi-search-replace diff to the original content.
-
-        Args:
-            original_content: The original file content
-            diff_content: The multi-search-replace diff content
-            _param_start_line: (unused) Reserved for future use
-            _param_end_line: (unused) Reserved for future use
-
-        Returns:
-            DiffResult with success status and modified content
-        """
-        # Validate marker sequencing
-        valid_seq = validate_marker_sequencing(diff_content)
-        if not valid_seq["success"]:
-            return DiffResult(success=False, error=valid_seq["error"])
-
-        # Parse diff blocks
-        matches = self._parse_diff_blocks(diff_content)
-        if not matches:
-            return DiffResult(success=True, content=original_content)
-
-        # First try simple substring replacement - this handles the common case
-        result_content = original_content
-        all_applied = True
-        processed_matches = []
-
-        for match in matches:
-            search_content = unescape_markers(match.get("searchContent", ""))
-            replace_content = unescape_markers(match.get("replaceContent", ""))
-
-            if search_content == replace_content:
-                continue
-
-            has_line_numbers = (
-                every_line_has_line_numbers(search_content)
-                and every_line_has_line_numbers(replace_content)
-            ) or (every_line_has_line_numbers(search_content) and replace_content.strip() == "")
-
-            if has_line_numbers:
-                search_content = strip_line_numbers(search_content)
-                replace_content = strip_line_numbers(replace_content)
-
-            if not search_content:
-                all_applied = False
-                break
-
-            if search_content not in result_content:
-                all_applied = False
-                break
-
-            processed_matches.append((search_content, replace_content))
-
-        if all_applied and processed_matches:
-            for search_content, replace_content in processed_matches:
-                result_content = result_content.replace(search_content, replace_content)
-            return DiffResult(success=True, content=result_content)
-
-        # Fall back to line-based approach for complex cases
-        # Detect line ending from original content
-        line_ending = "\r\n" if "\r\n" in original_content else "\n"
-        result_lines = re.split(r"\r?\n", original_content)
-        diff_results = []
-        applied_count = 0
-
-        # Sort replacements by startLine
-        replacements = [
-            {
-                "startLine": int(m.get("startLine", 0)),
-                "searchContent": m.get("searchContent", ""),
-                "replaceContent": m.get("replaceContent", ""),
-            }
-            for m in matches
-        ]
-        replacements.sort(key=lambda x: x["startLine"])
-
-        for replacement in replacements:
-            search_content = replacement["searchContent"]
-            replace_content = replacement["replaceContent"]
-            start_line = replacement["startLine"] + (
-                replacement["startLine"] if replacement["startLine"] != 0 else 0
-            )
-
-            # Unescape markers
-            search_content = unescape_markers(search_content)
-            replace_content = unescape_markers(replace_content)
-
-            # Strip line numbers if present
-            has_all_line_numbers = (
-                every_line_has_line_numbers(search_content)
-                and every_line_has_line_numbers(replace_content)
-            ) or (every_line_has_line_numbers(search_content) and replace_content.strip() == "")
-
-            if has_all_line_numbers and start_line == 0:
-                inferred_start_line = extract_start_line_number(search_content)
-                if inferred_start_line is not None:
-                    start_line = inferred_start_line
-
-            if has_all_line_numbers:
-                search_content = strip_line_numbers(search_content)
-                replace_content = strip_line_numbers(replace_content)
-
-            # If search and replace are identical, treat as success (no changes needed)
-            if search_content == replace_content:
-                diff_results.append(
-                    {
-                        "success": True,
-                        "message": "Search and replace content are identical - no changes needed",
-                    }
-                )
-                continue
-
-            # Split content into lines
-            search_lines = [] if search_content == "" else search_content.split("\n")
-            replace_lines = [] if replace_content == "" else replace_content.split("\n")
-
-            # Validate search content is not empty
-            if len(search_lines) == 0:
-                diff_results.append(
-                    {
-                        "success": False,
-                        "error": (
-                            "Empty search content is not allowed\n\n"
-                            "Debug Info:\n"
-                            "- Search content cannot be empty\n"
-                            "- For insertions, provide a specific line using :start_line: "
-                            "and include content to search for\n"
-                            "- For example, match a single line to insert before/after it"
-                        ),
-                    }
-                )
-                continue
-
-            end_line = replacement["startLine"] + len(search_lines) - 1
-
-            # Initialize search variables
-            match_index = -1
-            best_match_score = 0.0
-            best_match_content = ""
-            search_chunk = "\n".join(search_lines)
-
-            # Determine search bounds
-            search_start_index = 0
-            search_end_index = len(result_lines)
-
-            # Validate and handle line range if provided
-            if start_line:
-                exact_start_index = start_line - 1
-                search_len = len(search_lines)
-                exact_end_index = exact_start_index + search_len - 1
-
-                # Try exact match first
-                original_chunk = "\n".join(result_lines[exact_start_index : exact_end_index + 1])
-                similarity = get_similarity(original_chunk, search_chunk)
-                if similarity >= self.fuzzy_threshold:
-                    match_index = exact_start_index
-                    best_match_score = similarity
-                    best_match_content = original_chunk
-                else:
-                    # Set bounds for buffered search
-                    search_start_index = max(0, start_line - (self.buffer_lines + 1))
-                    search_end_index = min(
-                        len(result_lines), start_line + len(search_lines) + self.buffer_lines
-                    )
-
-            # If no match found yet, try middle-out search within bounds
-            if match_index == -1:
-                fuzzy_result = fuzzy_search(
-                    result_lines, search_chunk, search_start_index, search_end_index
-                )
-                match_index = fuzzy_result["bestMatchIndex"]
-                best_match_score = fuzzy_result["bestScore"]
-                best_match_content = fuzzy_result["bestMatchContent"]
-
-            # Try aggressive line number stripping as a fallback
-            if match_index == -1 or best_match_score < self.fuzzy_threshold:
-                aggressive_search_content = strip_line_numbers(search_content, aggressive=True)
-                aggressive_replace_content = strip_line_numbers(replace_content, aggressive=True)
-
-                aggressive_search_lines = (
-                    [] if aggressive_search_content == "" else aggressive_search_content.split("\n")
-                )
-                aggressive_search_chunk = "\n".join(aggressive_search_lines)
-
-                # Try middle-out search again with aggressive stripped content
-                fuzzy_result = fuzzy_search(
-                    result_lines, aggressive_search_chunk, search_start_index, search_end_index
-                )
-                if (
-                    fuzzy_result["bestMatchIndex"] != -1
-                    and fuzzy_result["bestScore"] >= self.fuzzy_threshold
-                ):
-                    match_index = fuzzy_result["bestMatchIndex"]
-                    best_match_score = fuzzy_result["bestScore"]
-                    best_match_content = fuzzy_result["bestMatchContent"]
-                    # Replace with stripped versions
-                    search_content = aggressive_search_content
-                    replace_content = aggressive_replace_content
-                    search_lines = aggressive_search_lines
-                    replace_lines = [] if replace_content == "" else replace_content.split("\n")
-                else:
-                    # No match found with either method
-                    if start_line and end_line:
-                        original_section = "\n\nOriginal Content:\n" + add_line_numbers(
-                            "\n".join(
-                                result_lines[
-                                    max(0, start_line - 1 - self.buffer_lines) : min(
-                                        len(result_lines), end_line + self.buffer_lines
-                                    )
-                                ]
-                            ),
-                            max(1, start_line - self.buffer_lines),
-                        )
-                    else:
-                        original_section = "\n\nOriginal Content:\n" + add_line_numbers(
-                            "\n".join(result_lines)
-                        )
-
-                    best_match_section = (
-                        "\n\nBest Match Found:\n"
-                        + add_line_numbers(best_match_content, match_index + 1)
-                        if best_match_content
-                        else "\n\nBest Match Found:\n(no match)"
-                    )
-
-                    line_range = f" at line: {start_line}" if start_line else ""
-
-                    diff_results.append(
-                        {
-                            "success": False,
-                            "error": (
-                                f"No sufficiently similar match found{line_range} "
-                                f"({int(best_match_score * 100)}% similar, "
-                                f"needs {int(self.fuzzy_threshold * 100)}%)\n\n"
-                                "Debug Info:\n"
-                                f"- Similarity Score: {int(best_match_score * 100)}%\n"
-                                f"- Required Threshold: {int(self.fuzzy_threshold * 100)}%\n"
-                                f"- Search Range: {f'starting at line {start_line}' if start_line else 'start to end'}\n"
-                                "- Tried both standard and aggressive line number stripping\n"
-                                "- Tip: Use read_file tool to get the latest content of the file before "
-                                "attempting to use apply_diff tool again, as file content may have changed\n\n"
-                                f"Search Content:\n{search_chunk}"
-                                f"{best_match_section}"
-                                f"{original_section}"
-                            ),
-                        }
-                    )
-                    continue
-
-            # Get matched lines from original content
-            matched_lines = result_lines[match_index : match_index + len(search_lines)]
-
-            # Get exact indentation of each line
-            original_indents = []
-            for line in matched_lines:
-                match = re.match(r"^[\t ]*", line)
-                original_indents.append(match.group(0) if match else "")
-
-            search_indents = []
-            for line in search_lines:
-                match = re.match(r"^[\t ]*", line)
-                search_indents.append(match.group(0) if match else "")
-
-            # Apply replacement while preserving exact indentation
-            # For each replace line, use the corresponding original matched line's indent
-            indented_replace_lines = []
-            for i, line in enumerate(replace_lines):
-                # Get indent from corresponding original matched line
-                if i < len(original_indents):
-                    matched_indent = original_indents[i]
-                else:
-                    matched_indent = original_indents[0] if original_indents else ""
-
-                # Get indent from corresponding search line
-                if i < len(search_indents):
-                    search_indent = search_indents[i]
-                else:
-                    search_indent = search_indents[0] if search_indents else ""
-
-                # Get indent from current replace line
-                current_replace_match = re.match(r"^[\t ]*", line)
-                current_replace_indent = (
-                    current_replace_match.group(0) if current_replace_match else ""
-                )
-
-                # Calculate relative indent level (how much deeper/shallower this line is compared to search)
-                relative_level = len(current_replace_indent) - len(search_indent)
-
-                # Apply same relative level to matched indent
-                if relative_level >= 0:
-                    final_indent = matched_indent + current_replace_indent[len(search_indent) :]
-                else:
-                    final_indent = matched_indent[: max(0, len(matched_indent) + relative_level)]
-
-                # For empty lines, keep original indent with no content
-                if line.strip() == "":
-                    indented_replace_lines.append(matched_indent)
-                else:
-                    # Add line content (without its original indent, preserving internal whitespace)
-                    line_content = line.lstrip(" \t")
-                    indented_replace_lines.append(final_indent + line_content)
-
-            # Construct final content
-            before_match = result_lines[:match_index]
-            after_match = result_lines[match_index + len(search_lines) :]
-            result_lines = before_match + indented_replace_lines + after_match
-            applied_count += 1
-
-        final_content = line_ending.join(result_lines)
-
-        # Check if all results are successful (including no-change cases)
-        all_successful = all(result.get("success", False) for result in diff_results)
-        has_failures = any(not result.get("success", False) for result in diff_results)
-
-        if applied_count == 0 and has_failures:
-            return DiffResult(success=False, fail_parts=diff_results)
-
-        # If no changes were applied but all results are successful (e.g., search==replace),
-        # return success with original content
-        if applied_count == 0 and all_successful:
-            return DiffResult(success=True, content=original_content, fail_parts=diff_results)
-
-        return DiffResult(
-            success=True, content=final_content, fail_parts=diff_results if diff_results else None
-        )
-
-    def _parse_diff_blocks(self, diff_content: str) -> List[Dict[str, Any]]:
-        """
-        Parse diff blocks from diff content.
-
-        Supports two formats:
-        1. v1 format (with :start_line: and)-------
-        2. v2 format (without :start_line: and)-------
-
-        Returns list of dicts with keys: startLine, searchContent, replaceContent
-        """
-        matches = []
-        blocks = diff_content.split("<<<<<<< SEARCH")
-
-        for block in blocks[1:]:
-            if "=======" not in block or ">>>>>>> REPLACE" not in block:
-                continue
-
-            # Split by =======
-            sep_parts = block.split("=======")
-            if len(sep_parts) < 2:
-                continue
-
-            before_sep = sep_parts[0]
-            after_sep = sep_parts[1]
-
-            # Split before_sep by -------
-            dash_parts = before_sep.split("-------")
-
-            if len(dash_parts) >= 2:
-                # v1 format: has -------
-                header = dash_parts[0]
-                search_content = (
-                    dash_parts[1].lstrip("\n").rstrip("\n") if len(dash_parts) > 1 else ""
-                )
-            else:
-                # v2 format: no -------, entire before_sep is header + search content
-                # Extract :start_line: if present
-                header = ""
-                search_content = before_sep.lstrip("\n").rstrip("\n")
-
-                # Check if first line is :start_line:
-                lines = search_content.split("\n")
-                if lines and lines[0].startswith(":start_line:"):
-                    header = lines[0]
-                    search_content = "\n".join(lines[1:])
-
-            replace_content = after_sep.split(">>>>>>> REPLACE")[0].lstrip("\n").rstrip("\n")
-
-            # Extract start_line from header
-            start_line = 0
-            for line in header.split("\n"):
-                if line.startswith(":start_line:"):
-                    try:
-                        start_line = int(line.split(":")[1].strip())
-                    except:
-                        pass
-
-            matches.append(
-                {
-                    "startLine": start_line,
-                    "searchContent": search_content,
-                    "replaceContent": replace_content,
-                }
-            )
-
-        return matches
-
-
-# ============================================================================
-# Structured patch application
-# ============================================================================
-
-
-def _delete_complete_lines(content: str, delete_content: str) -> str:
-    """Delete a unique block of complete lines, including one adjacent line ending."""
-    start = content.index(delete_content)
-    end = start + len(delete_content)
-
-    starts_at_line_boundary = start == 0 or content[start - 1] == "\n"
-    ends_at_line_boundary = (
-        end == len(content) or content.startswith("\r\n", end) or content.startswith("\n", end)
-    )
-    if not starts_at_line_boundary or not ends_at_line_boundary:
-        raise PatchParseError("DELETE content must contain one or more complete lines")
-
-    # Prefer consuming the following line ending. At EOF, consume the preceding
-    # line ending so deleting the final line does not leave a trailing blank line.
-    if content.startswith("\r\n", end):
-        end += 2
-    elif content.startswith("\n", end):
-        end += 1
-    elif start > 0 and content[start - 2 : start] == "\r\n":
-        start -= 2
-    elif start > 0 and content[start - 1] == "\n":
-        start -= 1
-
-    return content[:start] + content[end:]
-
-
-def apply_str_patch(original_content: str, patch: StrPatch) -> str:
-    """Apply a StrPatch to original content.
-
-    Args:
-        original_content: Original string content
-        patch: StrPatch model to apply
-
-    Returns:
-        Updated content after applying the patch
-    """
-    if not patch.blocks:
-        return original_content
-
-    # First try simple substring replacement - this handles the common case
-    result_content = original_content
-    all_applied = True
-
-    for block in patch.blocks:
-        search_content = unescape_markers(block.search)
-        replace_content = unescape_markers(block.replace)
-
-        if search_content == replace_content:
-            continue
-
-        if not search_content:
-            all_applied = False
-            break
-
-        if search_content not in result_content:
-            all_applied = False
-            break
-
-        match_count = result_content.count(search_content)
-        if match_count > 1:
-            raise PatchParseError(
-                f"SEARCH content matched {match_count} locations; "
-                "The re-generated SEARCH string may contain additional lines "
-                "to make sure it is unique."
-            )
-
-        if isinstance(block, DeleteBlock):
-            result_content = _delete_complete_lines(result_content, search_content)
-        else:
-            result_content = result_content.replace(search_content, replace_content, 1)
-
-    if all_applied:
-        return result_content
-
-    # Fall back to line-based approach for complex cases
-    strategy = MultiSearchReplaceDiffStrategy(fuzzy_threshold=0.8)
-
-    # Convert StrPatch blocks to internal match format
-    matches = []
-    for block in patch.blocks:
-        start_line = getattr(block, "start_line", None) or 0
-        matches.append(
-            {
-                "startLine": start_line,
-                "searchContent": block.search,
-                "replaceContent": block.replace,
-            }
-        )
-
-    if not matches:
-        return original_content
-
-    # Detect line ending from original content
-    line_ending = "\r\n" if "\r\n" in original_content else "\n"
-    result_lines = re.split(r"\r?\n", original_content)
-    diff_results = []
-    applied_count = 0
-
-    # Sort replacements by start_line
-    replacements = [
-        {
-            "startLine": int(m.get("startLine", 0)),
-            "searchContent": m.get("searchContent", ""),
-            "replaceContent": m.get("replaceContent", ""),
-        }
-        for m in matches
-    ]
-    replacements.sort(key=lambda x: x["startLine"])
-
-    for replacement in replacements:
-        search_content = replacement["searchContent"]
-        replace_content = replacement["replaceContent"]
-        start_line = replacement["startLine"]
-
-        # Unescape markers
-        search_content = unescape_markers(search_content)
-        replace_content = unescape_markers(replace_content)
-
-        # Strip line numbers if present
-        has_all_line_numbers = (
-            every_line_has_line_numbers(search_content)
-            and every_line_has_line_numbers(replace_content)
-        ) or (every_line_has_line_numbers(search_content) and replace_content.strip() == "")
-
-        if has_all_line_numbers and start_line == 0:
-            inferred_start_line = extract_start_line_number(search_content)
-            if inferred_start_line is not None:
-                start_line = inferred_start_line
-
-        if has_all_line_numbers:
-            search_content = strip_line_numbers(search_content)
-            replace_content = strip_line_numbers(replace_content)
-
-        # If search and replace are identical, treat as success (no changes needed)
-        if search_content == replace_content:
-            diff_results.append(
-                {
-                    "success": True,
-                    "message": "Search and replace content are identical - no changes needed",
-                }
-            )
-            continue
-
-        # Split content into lines
-        search_lines = [] if search_content == "" else search_content.split("\n")
-        replace_lines = [] if replace_content == "" else replace_content.split("\n")
-
-        # Validate search content is not empty
-        if len(search_lines) == 0:
-            diff_results.append(
-                {
-                    "success": False,
-                    "error": (
-                        "Empty search content is not allowed\n\n"
-                        "Debug Info:\n"
-                        "- Search content cannot be empty\n"
-                        "- For insertions, provide a specific line using :start_line: "
-                        "and include content to search for\n"
-                        "- For example, match a single line to insert before/after it"
-                    ),
-                }
-            )
-            continue
-
-        # Initialize search variables
-        match_index = -1
-        best_match_score = 0.0
-        best_match_content = ""
-        search_chunk = "\n".join(search_lines)
-
-        # Determine search bounds
-        search_start_index = 0
-        search_end_index = len(result_lines)
-
-        # Validate and handle line range if provided
-        if start_line:
-            exact_start_index = start_line - 1
-            search_len = len(search_lines)
-            exact_end_index = exact_start_index + search_len - 1
-
-            # Try exact match first
-            original_chunk = "\n".join(result_lines[exact_start_index : exact_end_index + 1])
-            similarity = get_similarity(original_chunk, search_chunk)
-            if similarity >= strategy.fuzzy_threshold:
-                match_index = exact_start_index
-                best_match_score = similarity
-                best_match_content = original_chunk
-            else:
-                # Set bounds for buffered search
-                search_start_index = max(0, start_line - (strategy.buffer_lines + 1))
-                search_end_index = min(
-                    len(result_lines), start_line + len(search_lines) + strategy.buffer_lines
-                )
-
-        # If no match found yet, try middle-out search within bounds
-        if match_index == -1:
-            fuzzy_result = fuzzy_search(
-                result_lines, search_chunk, search_start_index, search_end_index
-            )
-            match_index = fuzzy_result["bestMatchIndex"]
-            best_match_score = fuzzy_result["bestScore"]
-            best_match_content = fuzzy_result["bestMatchContent"]
-
-        # Try aggressive line number stripping as a fallback
-        if match_index == -1 or best_match_score < strategy.fuzzy_threshold:
-            aggressive_search_content = strip_line_numbers(search_content, aggressive=True)
-            aggressive_replace_content = strip_line_numbers(replace_content, aggressive=True)
-
-            aggressive_search_lines = (
-                [] if aggressive_search_content == "" else aggressive_search_content.split("\n")
-            )
-            aggressive_search_chunk = "\n".join(aggressive_search_lines)
-
-            # Try middle-out search again with aggressive stripped content
-            fuzzy_result = fuzzy_search(
-                result_lines, aggressive_search_chunk, search_start_index, search_end_index
-            )
-            if (
-                fuzzy_result["bestMatchIndex"] != -1
-                and fuzzy_result["bestScore"] >= strategy.fuzzy_threshold
-            ):
-                match_index = fuzzy_result["bestMatchIndex"]
-                best_match_score = fuzzy_result["bestScore"]
-                best_match_content = fuzzy_result["bestMatchContent"]
-                # Replace with stripped versions
-                search_content = aggressive_search_content
-                replace_content = aggressive_replace_content
-                search_lines = aggressive_search_lines
-                replace_lines = [] if replace_content == "" else replace_content.split("\n")
-            else:
-                # No match found with either method
-                if start_line:
-                    end_line = start_line + len(search_lines) - 1
-                    original_section = "\n\nOriginal Content:\n" + add_line_numbers(
-                        "\n".join(
-                            result_lines[
-                                max(0, start_line - 1 - strategy.buffer_lines) : min(
-                                    len(result_lines), end_line + strategy.buffer_lines
-                                )
-                            ]
-                        ),
-                        max(1, start_line - strategy.buffer_lines),
-                    )
-                else:
-                    original_section = "\n\nOriginal Content:\n" + add_line_numbers(
-                        "\n".join(result_lines)
-                    )
-
-                best_match_section = (
-                    "\n\nBest Match Found:\n"
-                    + add_line_numbers(best_match_content, match_index + 1)
-                    if best_match_content
-                    else "\n\nBest Match Found:\n(no match)"
-                )
-
-                line_range = f" at line: {start_line}" if start_line else ""
-
-                diff_results.append(
-                    {
-                        "success": False,
-                        "error": (
-                            f"No sufficiently similar match found{line_range} "
-                            f"({int(best_match_score * 100)}% similar, "
-                            f"needs {int(strategy.fuzzy_threshold * 100)}%)\n\n"
-                            "Debug Info:\n"
-                            f"- Similarity Score: {int(best_match_score * 100)}%\n"
-                            f"- Required Threshold: {int(strategy.fuzzy_threshold * 100)}%\n"
-                            f"- Search Range: {f'starting at line {start_line}' if start_line else 'start to end'}\n"
-                            "- Tried both standard and aggressive line number stripping\n"
-                            "- Tip: Use read_file tool to get the latest content of the file before "
-                            "attempting to use apply_diff tool again, as file content may have changed\n\n"
-                            f"Search Content:\n{search_chunk}"
-                            f"{best_match_section}"
-                            f"{original_section}"
-                        ),
-                    }
-                )
-                continue
-
-        # Get matched lines from original content
-        matched_lines = result_lines[match_index : match_index + len(search_lines)]
-
-        # Get exact indentation of each line
-        original_indents = []
-        for line in matched_lines:
-            match = re.match(r"^[\t ]*", line)
-            original_indents.append(match.group(0) if match else "")
-
-        search_indents = []
-        for line in search_lines:
-            match = re.match(r"^[\t ]*", line)
-            search_indents.append(match.group(0) if match else "")
-
-        # Apply replacement while preserving exact indentation
-        # For each replace line, use the corresponding original matched line's indent
-        indented_replace_lines = []
-        for i, line in enumerate(replace_lines):
-            # Get indent from corresponding original matched line
-            if i < len(original_indents):
-                matched_indent = original_indents[i]
-            else:
-                matched_indent = original_indents[0] if original_indents else ""
-
-            # Get indent from corresponding search line
-            if i < len(search_indents):
-                search_indent = search_indents[i]
-            else:
-                search_indent = search_indents[0] if search_indents else ""
-
-            # Get indent from current replace line
-            current_replace_match = re.match(r"^[\t ]*", line)
-            current_replace_indent = current_replace_match.group(0) if current_replace_match else ""
-
-            # Calculate relative indent level (how much deeper/shallower this line is compared to search)
-            relative_level = len(current_replace_indent) - len(search_indent)
-
-            # Apply same relative level to matched indent
-            if relative_level >= 0:
-                final_indent = matched_indent + current_replace_indent[len(search_indent) :]
-            else:
-                final_indent = matched_indent[: max(0, len(matched_indent) + relative_level)]
-
-            # For empty lines, keep original indent with no content
-            if line.strip() == "":
-                indented_replace_lines.append(matched_indent)
-            else:
-                # Add line content (without its original indent, preserving internal whitespace)
-                line_content = line.lstrip(" \t")
-                indented_replace_lines.append(final_indent + line_content)
-
-        # Construct final content
-        before_match = result_lines[:match_index]
-        after_match = result_lines[match_index + len(search_lines) :]
-        result_lines = before_match + indented_replace_lines + after_match
-        applied_count += 1
-
-    final_content = line_ending.join(result_lines)
-
-    # Check if all results are successful (including no-change cases)
-    has_failures = any(not result.get("success", False) for result in diff_results)
-
-    if applied_count == 0 and has_failures:
+        message: str,
+        *,
+        edit_index: int | None = None,
+        reason: str = "apply_error",
+        match_count: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.edit_index = edit_index
+        self.reason = reason
+        self.match_count = match_count
+
+
+def detect_line_ending(content: str) -> str:
+    crlf_index = content.find("\r\n")
+    lf_index = content.find("\n")
+    if lf_index == -1 or crlf_index == -1:
+        return "\n"
+    return "\r\n" if crlf_index < lf_index else "\n"
+
+
+def normalize_to_lf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def restore_line_endings(text: str, ending: str) -> str:
+    return text.replace("\n", "\r\n") if ending == "\r\n" else text
+
+
+# ECMAScript trimEnd, not Python rstrip (which also strips e.g. U+0085).
+_TRAILING_WHITESPACE = re.compile(
+    r"[\t\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+$"
+)
+_FUZZY_TRANSLATION = str.maketrans(
+    {
+        **dict.fromkeys("\u2018\u2019\u201a\u201b", "'"),
+        **dict.fromkeys("\u201c\u201d\u201e\u201f", '"'),
+        **dict.fromkeys("\u2010\u2011\u2012\u2013\u2014\u2015\u2212", "-"),
+        **dict.fromkeys(
+            "\u00a0\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000", " "
+        ),
+    }
+)
+
+
+def normalize_for_fuzzy_match(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = "\n".join(_TRAILING_WHITESPACE.sub("", line) for line in text.split("\n"))
+    return text.translate(_FUZZY_TRANSLATION)
+
+
+@dataclass(slots=True)
+class _Match:
+    found: bool
+    index: int
+    match_length: int
+    used_fuzzy_match: bool
+
+
+def fuzzy_find_text(content: str, search: str) -> _Match:
+    index = content.find(search)
+    if index != -1:
+        return _Match(True, index, len(search), False)
+    fuzzy_content = normalize_for_fuzzy_match(content)
+    fuzzy_old_text = normalize_for_fuzzy_match(search)
+    index = fuzzy_content.find(fuzzy_old_text)
+    if index == -1:
+        return _Match(False, -1, 0, False)
+    return _Match(True, index, len(fuzzy_old_text), True)
+
+
+def _count_occurrences(content: str, search: str) -> int:
+    content = normalize_for_fuzzy_match(content)
+    search = normalize_for_fuzzy_match(search)
+    if not search:
+        # Preserve JS String.split("").length - 1, including normalization to empty.
+        return len(content.encode("utf-16-le", errors="surrogatepass")) // 2 - 1
+    return content.count(search)
+
+
+@dataclass(slots=True)
+class _MatchedEdit:
+    edit_index: int
+    match_index: int
+    match_length: int
+    replace: str
+
+
+@dataclass(slots=True)
+class _LineSpan:
+    start: int
+    end: int
+
+
+@dataclass(slots=True)
+class _ReplacementGroup:
+    start_line: int
+    end_line: int
+    replacements: list[_MatchedEdit]
+
+
+def _split_lines_with_endings(content: str) -> list[str]:
+    return re.findall(r"[^\n]*\n|[^\n]+", content)
+
+
+def _get_line_spans(content: str) -> list[_LineSpan]:
+    offset = 0
+    spans = []
+    for line in _split_lines_with_endings(content):
+        spans.append(_LineSpan(offset, offset + len(line)))
+        offset += len(line)
+    return spans
+
+
+def _get_replacement_line_range(
+    lines: list[_LineSpan], replacement: _MatchedEdit
+) -> tuple[int, int]:
+    start = replacement.match_index
+    end = start + replacement.match_length
+    start_line = next((i for i, line in enumerate(lines) if line.start <= start < line.end), -1)
+    if start_line == -1:
+        raise PatchParseError("Replacement range is outside the base content.")
+    end_line = start_line
+    while end_line < len(lines) and lines[end_line].end < end:
+        end_line += 1
+    if end_line >= len(lines):
+        raise PatchParseError("Replacement range is outside the base content.")
+    return start_line, end_line + 1
+
+
+def _apply_replacements(content: str, replacements: list[_MatchedEdit], offset: int = 0) -> str:
+    result = content
+    for replacement in reversed(replacements):
+        index = replacement.match_index - offset
+        result = result[:index] + replacement.replace + result[index + replacement.match_length :]
+    return result
+
+
+def _apply_replacements_preserving_unchanged_lines(
+    original_content: str, base_content: str, replacements: list[_MatchedEdit]
+) -> str:
+    original_lines = _split_lines_with_endings(original_content)
+    base_lines = _get_line_spans(base_content)
+    if len(original_lines) != len(base_lines):
         raise PatchParseError(
-            f"Patch application failed: search content not found in original, original_content={original_content}, patch={patch}"
+            "Cannot preserve unchanged lines because the base content has a different line count."
         )
+    groups: list[_ReplacementGroup] = []
+    for replacement in sorted(replacements, key=lambda edit: edit.match_index):
+        start_line, end_line = _get_replacement_line_range(base_lines, replacement)
+        current = groups[-1] if groups else None
+        if current is not None and start_line < current.end_line:
+            current.end_line = max(current.end_line, end_line)
+            current.replacements.append(replacement)
+        else:
+            groups.append(_ReplacementGroup(start_line, end_line, [replacement]))
+    original_line_index = 0
+    result = []
+    for group in groups:
+        result.extend(original_lines[original_line_index : group.start_line])
+        start_offset = base_lines[group.start_line].start
+        end_offset = base_lines[group.end_line - 1].end
+        result.append(
+            _apply_replacements(
+                base_content[start_offset:end_offset], group.replacements, start_offset
+            )
+        )
+        original_line_index = group.end_line
+    result.extend(original_lines[original_line_index:])
+    return "".join(result)
 
-    return final_content
+
+def apply_edits_to_normalized_content(content: str, patch: StrPatch, path: str) -> str:
+    """Match all edits against the same LF-normalized source, as Pi does."""
+    edits = [
+        (normalize_to_lf(block.search), normalize_to_lf(block.replace)) for block in patch.blocks
+    ]
+    total = len(edits)
+    for index, (search, _) in enumerate(edits):
+        if not search:
+            label = "search" if total == 1 else f"edits[{index}].search"
+            raise PatchParseError(
+                f"{label} must not be empty in {path}.", edit_index=index, reason="empty_search"
+            )
+    initial_matches = [fuzzy_find_text(content, search) for search, _ in edits]
+    used_fuzzy_match = any(match.used_fuzzy_match for match in initial_matches)
+    replacement_base = normalize_for_fuzzy_match(content) if used_fuzzy_match else content
+    matched_edits = []
+    for index, (search, replace) in enumerate(edits):
+        match = fuzzy_find_text(replacement_base, search)
+        if not match.found:
+            message = (
+                f"Could not find the exact text in {path}. The search must match exactly "
+                "including all whitespace and newlines."
+                if total == 1
+                else f"Could not find edits[{index}] in {path}. The search must match exactly "
+                "including all whitespace and newlines."
+            )
+            raise PatchParseError(message, edit_index=index, reason="not_found", match_count=0)
+        occurrences = _count_occurrences(replacement_base, search)
+        if occurrences > 1:
+            message = (
+                f"Found {occurrences} occurrences of the text in {path}. The text must be unique. "
+                "Please provide more context to make it unique."
+                if total == 1
+                else f"Found {occurrences} occurrences of edits[{index}] in {path}. "
+                "Each search must be unique. Please provide more context to make it unique."
+            )
+            raise PatchParseError(
+                message, edit_index=index, reason="non_unique", match_count=occurrences
+            )
+        matched_edits.append(_MatchedEdit(index, match.index, match.match_length, replace))
+    matched_edits.sort(key=lambda edit: edit.match_index)
+    for previous, current in pairwise(matched_edits):
+        if previous.match_index + previous.match_length > current.match_index:
+            raise PatchParseError(
+                f"edits[{previous.edit_index}] and edits[{current.edit_index}] overlap in {path}. "
+                "Merge them into one edit or target disjoint regions.",
+                edit_index=current.edit_index,
+                reason="overlap",
+            )
+    new_content = (
+        _apply_replacements_preserving_unchanged_lines(content, replacement_base, matched_edits)
+        if used_fuzzy_match
+        else _apply_replacements(replacement_base, matched_edits)
+    )
+    if content == new_content:
+        message = (
+            f"No changes made to {path}. The replacement produced identical content. This might "
+            "indicate an issue with special characters or the text not existing as expected."
+            if total == 1
+            else f"No changes made to {path}. The replacements produced identical content."
+        )
+        raise PatchParseError(message, reason="no_change")
+    return new_content
 
 
-# Import MergeOp here to avoid circular import
+def apply_str_patch(original_content: str, patch: StrPatch, *, path: str = "string field") -> str:
+    """Adapt a memory field to Pi's edit tool, including BOM and line endings."""
+    if not patch.blocks:
+        raise PatchParseError(
+            "Edit tool input is invalid. edits must contain at least one replacement.",
+            reason="empty_edits",
+        )
+    bom = "\ufeff" if original_content.startswith("\ufeff") else ""
+    content = original_content[len(bom) :]
+    ending = detect_line_ending(content)
+    new_content = apply_edits_to_normalized_content(normalize_to_lf(content), patch, path)
+    return bom + restore_line_endings(new_content, ending)

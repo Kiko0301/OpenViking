@@ -94,7 +94,6 @@ from openviking.session.train.domain import (
     Trajectory,
     TrajectoryOutcome,
 )
-from openviking.session.train.gates import ExperienceImprovementGate
 from openviking.session.train.gradients import PatchSemanticGradient
 from openviking.session.train.interfaces import (
     CaseLoader,
@@ -132,7 +131,6 @@ __all__ = [
     "BatchPolicyTrainer",
     "ExperienceGradientEstimator",
     "ExperienceGradientContext",
-    "ExperienceImprovementGate",
     "SessionRolloutAnalyzer",
     "SessionAnalyzerContext",
     "PatchMergePolicyOptimizer",

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from test_case_experience_pipeline import observe, presented_trajectories
+from test_case_experience_pipeline import observe, presented_trajectories, trajectory_program
 from test_case_experience_pipeline import setup_observation as setup_observation
 from test_gradient_estimator_component import ROOT, analysis, operations, validated_operations
 
@@ -25,6 +25,8 @@ from openviking.session.train import (
     StreamingPolicyTrainer,
     StreamingPolicyTrainerConfig,
 )
+from openviking.session.train.components.trajectory_lifecycle import trajectory_archive_uri
+from openviking.session.train.gates.identifiers import ExperienceIdentifierGate
 
 
 @pytest.fixture
@@ -146,12 +148,13 @@ async def cases(setup_observation, monkeypatch, request):
                     content="case",
                     extra_fields={
                         "case_name": name,
-                        "task_signature": case.task_signature,
-                        "input": "{}",
+                        "domain": case.task_signature,
+                        "description": "{}",
                         "rubric": "[]",
                     },
                 )
             )
+            model.get_completion_async.return_value = trajectory_program(case_name=name)
             (signal,) = await observe(analyzer, run, policies, context)
             records.append(signal.after_file)
 
@@ -178,14 +181,15 @@ async def cases(setup_observation, monkeypatch, request):
             max_concurrent_cases=4,
         ),
     )
-    compressor._link_case_to_training_outputs = AsyncMock()
     fs.commit = AsyncMock()
     return SimpleNamespace(fs=fs, ctx=ctx, compressor=compressor, records=records)
 
 
 def states(cases):
     return [
-        MemoryFileUtils.read(cases.fs.files[r.uri], uri=r.uri).extra_fields["experience_update"]
+        MemoryFileUtils.read(
+            cases.fs.files[r.uri if r.uri in cases.fs.files else trajectory_archive_uri(r.uri)]
+        ).extra_fields["experience_update"]
         for r in cases.records
     ]
 
@@ -248,13 +252,13 @@ async def noop_result(cases, **kwargs):
             ctx=cases.ctx,
             state="no_op",
             batch_id=kwargs["batch_id"],
-            experience_uri=f"{ROOT}/{kwargs['case_name']}.md",
         )
     return {
         "case_name": kwargs["case_name"],
         "trajectory_uris": [m.uri for m in kwargs["memories"]],
         "experience_uri": f"{ROOT}/{kwargs['case_name']}.md",
         "written_experience_uris": [],
+        "plan_metadata": {"chunk_count": 1, "chunk_item_counts": [0], "chunks": [{}]},
     }
 
 
@@ -425,8 +429,7 @@ async def test_external_learning_reuses_streaming_trainer_and_serializes_finaliz
     for name in [f"case_{i}" for i in range(6)]:
         uri = f"{ROOT}/{name}.md"
         memory = MemoryFileUtils.read(cases.fs.files[uri], uri=uri)
-        assert len(memory.links) == 2
-        assert all(f"/trajectories/{name}/" in link["to_uri"] for link in memory.links)
+        assert memory.links == [] and memory.backlinks == []
     assert all(s["state"] == "applied" for s in states(cases))
 
 
@@ -462,7 +465,7 @@ async def test_overlapping_external_requests_do_not_reclaim_same_trajectories(ca
 
 
 @pytest.mark.asyncio
-async def test_buffered_trainer_native_apply_preserves_forward_provenance(tmp_path, monkeypatch):
+async def test_buffered_trainer_keeps_provenance_in_plan_not_experience(tmp_path, monkeypatch):
     from openviking.pyagfs import get_binding_client
     from openviking.server.identity import RequestContext, Role
     from openviking.session.memory.dataclass import StoredLink
@@ -530,7 +533,8 @@ async def test_buffered_trainer_native_apply_preserves_forward_provenance(tmp_pa
         assert result.apply_result.errors == []
         assert result.plan.items == proposed.items
         stored = MemoryFileUtils.read(await fs.read_file(target, ctx=ctx), uri=target)
-        assert {link["to_uri"] for link in stored.links} == {source}
+        assert stored.links == []
+        assert {link.to_uri for link in result.plan.items[0].links} == {source}
         assert await fs.read_file(source, ctx=ctx) == original
         assert (await fs._async_agfs.pathlock_observe())["active_locks"] == 0
     finally:
@@ -652,9 +656,9 @@ async def test_large_case_uses_old_count_chunks_and_retains_every_trajectory(cas
         assert all("trajectory_uri" not in record for record in records)
         for batch in current_batches[:-1]:
             assert all(
-                MemoryFileUtils.read(cases.fs.files[uri], uri=uri).extra_fields[
-                    "experience_update"
-                ]["state"]
+                MemoryFileUtils.read(
+                    cases.fs.files[trajectory_archive_uri(uri)], uri=trajectory_archive_uri(uri)
+                ).extra_fields["experience_update"]["state"]
                 in {"applied", "no_op"}
                 for uri in batch
             )
@@ -680,6 +684,8 @@ async def test_large_case_uses_old_count_chunks_and_retains_every_trajectory(cas
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cases", [1], indirect=True)
 async def test_rejected_candidate_marks_case_failed_and_can_be_retried(cases, monkeypatch):
+    monkeypatch.setattr(ExperienceIdentifierGate, "ENABLED", True)
+
     async def rejected(estimator, provider, context):
         provider.case.input["reservation"] = "XEHM4B"
         return await validated_operations(

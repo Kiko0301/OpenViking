@@ -29,10 +29,10 @@ def fields(name):
     return {
         "case_name": name,
         "execution_count": 1,
-        "task_signature": (
+        "domain": (
             "Library lending and returns" if name == "library" else "Airline booking services"
         ),
-        "input": "Current service context and supplied user information.",
+        "description": "Current service context and supplied user information.",
         "rubric": '[{"id":"scope","description":"Respect the request scope and confirm changes."}]',
     }
 
@@ -114,7 +114,7 @@ async def test_singletons_reuse_recent_canonical_case_despite_empty_index(setup_
     env.resolver.get_vlm.assert_not_awaited()
     uri = f"{ROOT}/airline.md"
     latest = MemoryFileUtils.read(env.fs.files[uri], uri=uri)
-    latest.extra_fields["input"] = "Fresh domain context written after the previous batch."
+    latest.extra_fields["description"] = "Fresh domain context written after the previous batch."
     env.fs.files[uri] = MemoryFileUtils.write(latest, env.registry.get("cases").content_template)
     original = env.fs.files[uri]
     for name, source in [("airline_service", "source-b"), ("airline_booking", "source-c")]:
@@ -133,7 +133,7 @@ async def test_singletons_reuse_recent_canonical_case_despite_empty_index(setup_
             ctx=CTX,
         )
         assert [case.name for case in cases] == ["airline"]
-        assert cases[0].input["summary"] == latest.extra_fields["input"]
+        assert cases[0].input["summary"] == latest.extra_fields["description"]
         assert env.fs.files == {f"{ROOT}/airline.md": original}
     assert env.fs.search.await_count == 3
     assert env.model.get_completion_async.await_count == 2
@@ -307,6 +307,8 @@ async def test_concurrent_count_only_updates_preserve_deltas_and_case_associatio
     stored = MemoryFileUtils.read(env.fs.files[uri], uri=uri)
     assert stored.extra_fields["execution_count"] == 15
     assert stored.content == initial_content
+    for name in ("domain", "description"):
+        assert stored.extra_fields[name] == initial.extra_fields[name]
     env.model.get_completion_async.assert_awaited_once()
     for req, result in zip(requests, results, strict=True):
         assert not result.apply_result.errors
@@ -318,3 +320,63 @@ async def test_concurrent_count_only_updates_preserve_deltas_and_case_associatio
             ctx=CTX,
         )
         assert [case.name for case in cases] == ["airline"]
+        assert cases[0].task_signature == initial.extra_fields["domain"]
+        assert cases[0].input == {"summary": initial.extra_fields["description"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edit", ["patch", "overwrite"])
+async def test_context_updates_preserve_identity_count_and_all_case_sources(setup_merge, edit):
+    env = setup_merge
+    uri = f"{ROOT}/airline.md"
+    original = {**fields("airline"), "execution_count": 7}
+    original["rubric"] = normalize_case_rubric(original["rubric"])
+    initial = MemoryFile(uri=uri, memory_type="cases", content="", extra_fields=original)
+    env.fs.files[uri] = MemoryFileUtils.write(initial, env.registry.get("cases").content_template)
+    updates = {
+        "domain": "Airline booking and cancellation services",
+        "description": "Use current airline service records and preserve user authorization.",
+    }
+    requests = []
+    for index in range(8):
+        req = request("airline", f"execution-{index}")
+        operation = req.operations.upsert_operations[0]
+        operation.create_only = False
+        operation.old_memory_file_content = initial
+        operation.memory_fields = {**fields("airline"), **updates}
+        requests.append(req)
+    calls = [
+        f"prefetched_memory_1.{name}.edit(search={original[name]!r}, replace={value!r})"
+        if edit == "patch"
+        else f"prefetched_memory_1.{name}.overwrite({value!r})"
+        for name, value in updates.items()
+    ]
+    env.model.get_completion_async.return_value = "\n".join(
+        [
+            *calls,
+            "prefetched_memory_1.update(execution_count=8)",
+            "sdk.commit(case_sources=[(prefetched_memory_1, [1,2,3,4,5,6,7,8])])",
+        ]
+    )
+
+    results = await asyncio.gather(*(submit(env, req) for req in requests))
+
+    stored = MemoryFileUtils.read(env.fs.files[uri], uri=uri)
+    assert stored.extra_fields["case_name"] == "airline"
+    assert stored.extra_fields["execution_count"] == 15
+    for name, value in updates.items():
+        assert stored.extra_fields[name] == value and value in stored.content
+    assert stored.extra_fields["rubric"] == original["rubric"]
+    env.model.get_completion_async.assert_awaited_once()
+    for req, result in zip(requests, results, strict=True):
+        assert not result.apply_result.errors
+        cases = await _canonical_cases_from_update_result(
+            operations=result.operations,
+            requested_operations=req.operations,
+            result=result.apply_result,
+            viking_fs=env.fs,
+            ctx=CTX,
+        )
+        assert [case.name for case in cases] == ["airline"]
+        assert cases[0].task_signature == updates["domain"]
+        assert cases[0].input == {"summary": updates["description"]}

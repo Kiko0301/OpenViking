@@ -19,7 +19,6 @@ from openviking.session.compressor_v3 import (
     _canonical_cases_from_update_result,
     _commit_experience_snapshot,
     _contexts_from_update_result,
-    _experience_gate_skipped_operations,
     _experience_root_uri,
     _experience_session_map,
     _experience_snapshot_provenance,
@@ -102,8 +101,8 @@ def _case_operation() -> ResolvedOperation:
         uris=["viking://user/u/memories/cases/重复预订处理.md"],
         memory_fields={
             "case_name": "重复预订处理",
-            "task_signature": "处理重复预订并只取消确认重复的订单",
-            "input": '{"summary":"用户要求处理重复预订","preconditions":["存在两个相似预订"]}',
+            "domain": "处理重复预订并只取消确认重复的订单",
+            "description": '{"summary":"用户要求处理重复预订","preconditions":["存在两个相似预订"]}',
             "rubric": '[{"id":"verify_duplicate","description":"取消前必须确认哪一单是重复订单"},{"id":"scope","description":"不得影响有效订单"}]',
             "evidence": "助手根据读取结果确认重复项并完成取消。",
         },
@@ -289,43 +288,6 @@ async def test_memory_diff_includes_intentionally_skipped_operations(monkeypatch
         "total_deletes": 0,
         "total_skipped": 1,
     }
-
-
-def test_experience_gate_rejection_is_serialized_as_skipped_operation():
-    skipped = _experience_gate_skipped_operations(
-        {
-            "chunks": [
-                {
-                    "experience_improvement_gate": {
-                        "passed": False,
-                        "candidates": [
-                            {
-                                "target_uri": ("viking://user/u/memories/experiences/cancel.md"),
-                                "passed": False,
-                                "replays": [
-                                    {
-                                        "reason": (
-                                            "candidate still accepts the failed trajectory "
-                                            "as complete"
-                                        )
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                }
-            ]
-        }
-    )
-
-    assert skipped == [
-        {
-            "memory_type": "experiences",
-            "uri": "viking://user/u/memories/experiences/cancel.md",
-            "reason_code": "experience_gate_rejected",
-            "reason": "candidate still accepts the failed trajectory as complete",
-        }
-    ]
 
 
 @pytest.mark.asyncio
@@ -626,6 +588,9 @@ async def test_train_from_extracted_cases_persists_only_trajectory_phase(monkeyp
     )
 
     class FakeAnalyzer:
+        async def analyze_many(self, rollouts, context):
+            return [await self.analyze(rollout, context) for rollout in rollouts]
+
         async def analyze(self, rollout, context):
             assert context.memory_registry is not None
             analyzed_rollouts.append(rollout)
@@ -656,28 +621,9 @@ async def test_train_from_extracted_cases_persists_only_trajectory_phase(monkeyp
         trainer_factory,
     )
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectory",
+        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectories",
         extra_extraction,
     )
-    proposal_gate = AsyncMock(
-        side_effect=lambda gradients, policy_set, context: (
-            gradients,
-            {
-                "experience_improvement_gate": {
-                    "stage": "proposal",
-                    "passed": True,
-                    "accepted_count": len(gradients),
-                    "rejected_count": 0,
-                    "candidates": [],
-                }
-            },
-        )
-    )
-    monkeypatch.setattr(
-        "openviking.session.compressor_v3.ExperienceImprovementGate.validate",
-        proposal_gate,
-    )
-
     compressor = SessionCompressorV3(
         vikingdb=None,
         rollout_analyzer=FakeAnalyzer(),
@@ -733,7 +679,6 @@ async def test_train_from_extracted_cases_persists_only_trajectory_phase(monkeyp
     assert result["experience_learning_deferred"] is True
     assert result["persisted_experience_count"] == 0
     trainer_factory.assert_not_awaited()
-    proposal_gate.assert_not_awaited()
     assert submitted_gradients == []
     assert submitted_analyses == []
     # Verify analysis was used
@@ -765,6 +710,9 @@ async def test_train_from_extracted_cases_skips_trajectory_extraction_when_not_a
         )
 
     class FakeAnalyzer:
+        async def analyze_many(self, rollouts, context):
+            return [await self.analyze(rollout, context) for rollout in rollouts]
+
         async def analyze(self, rollout, context):
             del context
             analyzed.append(rollout)
@@ -790,7 +738,7 @@ async def test_train_from_extracted_cases_skips_trajectory_extraction_when_not_a
         AsyncMock(return_value=FakeTrainer()),
     )
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectory",
+        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectories",
         estimate,
     )
 
@@ -820,6 +768,9 @@ async def test_train_from_extracted_multiple_case_memories_analyzes_bound_rollou
         )
 
     class FakeAnalyzer:
+        async def analyze_many(self, rollouts, context):
+            return [await self.analyze(rollout, context) for rollout in rollouts]
+
         async def analyze(self, rollout, context):
             del context
             seen_rollouts.append(rollout)
@@ -846,7 +797,7 @@ async def test_train_from_extracted_multiple_case_memories_analyzes_bound_rollou
         AsyncMock(return_value=FakeTrainer()),
     )
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectory",
+        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectories",
         fake_estimate_exp_gradients,
     )
 
@@ -970,8 +921,8 @@ async def test_v3_extract_trains_only_canonical_case_after_patch_merge(monkeypat
     loser_uri = "viking://user/u/memories/cases/duplicate_booking_duplicate.md"
     canonical_fields = {
         "case_name": "duplicate_booking",
-        "task_signature": "Handle duplicate bookings safely.",
-        "input": '{"summary":"cancel only the confirmed duplicate booking"}',
+        "domain": "Handle duplicate bookings safely.",
+        "description": '{"summary":"cancel only the confirmed duplicate booking"}',
         "rubric": (
             '[{"id":"verify_duplicate","description":"The assistant verifies '
             'which booking is duplicate before cancellation."}]'
@@ -1634,7 +1585,8 @@ async def test_v3_training_memory_diff_filters_batch_items_by_source_session(
     assert [op["uri"] for op in diff["operations"]["adds"]] == [exp_a]
 
 
-def test_v3_maps_each_written_experience_to_its_source_sessions():
+@pytest.mark.parametrize("trajectory_links", [False, True])
+def test_v3_maps_each_written_experience_to_its_source_sessions(trajectory_links):
     traj_a = "viking://user/u/sessions/traj_a/history/archive_001"
     traj_b = "viking://user/u/sessions/traj_b/history/archive_001"
     exp_a = "viking://user/u/memories/experiences/exp_a.md"
@@ -1675,6 +1627,12 @@ def test_v3_maps_each_written_experience_to_its_source_sessions():
             ),
         ]
     )
+    if trajectory_links:
+        for item, source_uri in zip(plan.items, (traj_a, traj_b), strict=True):
+            item.metadata["source_sessions"] = [{"source_session_uri": source_uri}]
+            item.links[0] = item.links[0].model_copy(
+                update={"to_uri": f"viking://user/u/memories/trajectories/{item.target_name}/t.md"}
+            )
     apply_result = PolicyApplyResult(
         updated_policy_set=ExperienceSet(
             root_uri="viking://user/u/memories/experiences",
@@ -1829,7 +1787,8 @@ async def test_case_learning_records_trajectory_diff_before_synthesis(monkeypatc
         content='{"uncertainties": ["unknown cause"]}',
     )
 
-    async def observe(self, analysis, context):
+    async def observe(self, analyses, context):
+        (analysis,) = analyses
         assert context.memory_registry is not None
         analysis.metadata["trajectory_memory"] = memory
         analysis.trajectories = [
@@ -1846,7 +1805,7 @@ async def test_case_learning_records_trajectory_diff_before_synthesis(monkeypatc
         )
 
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectory", observe
+        "openviking.session.compressor_v3.SessionRolloutAnalyzer._extract_trajectories", observe
     )
     monkeypatch.setattr(
         "openviking.session.compressor_v3.get_viking_fs",
@@ -1874,42 +1833,6 @@ async def test_case_learning_records_trajectory_diff_before_synthesis(monkeypatc
     assert result["memory_diff"]["operations"]["adds"] == [
         {"uri": memory.uri, "memory_type": "trajectories", "after": memory.content}
     ]
-
-
-def test_same_session_multiple_cases_do_not_cross_link():
-    from openviking.session.compressor_v3 import _case_training_links
-
-    archive = "viking://user/u/sessions/s1/history/archive_001"
-    case = _training_case()
-    rollout = Rollout(case, _messages(), "p0")
-    analysis = RolloutAnalysis(
-        evaluation=None, rollout=rollout, metadata={"source_session_uri": archive}
-    )
-    root = "viking://user/u/memories/experiences"
-    items = [
-        PolicyPlanItem(
-            kind="upsert",
-            memory_type="experiences",
-            target_name=name,
-            target_uri=f"{root}/{name}.md",
-            before_content=None,
-            after_content="content",
-            links=[
-                StoredLink(from_uri=f"{root}/{name}.md", to_uri=archive, link_type="derived_from")
-            ],
-        )
-        for name in [case.name, "other"]
-    ]
-    links = _case_training_links(
-        analysis=analysis,
-        case_uri="case-uri",
-        plan=PolicyUpdatePlan(items=items),
-        apply_result=PolicyApplyResult(
-            updated_policy_set=ExperienceSet(root, []),
-            written_uris=[item.target_uri for item in items],
-        ),
-    )
-    assert [link.to_uri for link in links] == [items[0].target_uri]
 
 
 @pytest.mark.asyncio
@@ -1954,69 +1877,6 @@ async def test_extraction_failures_follow_strict_mode(monkeypatch, strict, path)
 
 
 @pytest.mark.asyncio
-async def test_case_link_updates_hold_policy_and_case_locks(monkeypatch):
-    from openviking.session import compressor_v3 as module
-
-    case = _training_case()
-    root = "viking://user/u/memories/experiences"
-    exp_uri = f"{root}/{case.name}.md"
-    case_uri = f"viking://user/u/memories/cases/{case.name}.md"
-    archive = "viking://user/u/sessions/s1/history/archive_001"
-    lease = "combined-lease"
-    locks = SimpleNamespace(
-        pathlock_acquire_exact_tree_batch=AsyncMock(return_value=lease),
-        pathlock_release=AsyncMock(),
-    )
-    fs = SimpleNamespace(
-        _async_agfs=locks,
-        _uri_to_path=lambda uri, ctx: uri,
-        read_file=AsyncMock(
-            return_value=MemoryFileUtils.write(
-                MemoryFile(
-                    uri=case_uri,
-                    content="case",
-                    memory_type="cases",
-                    extra_fields={"case_name": case.name},
-                )
-            )
-        ),
-        write_file=AsyncMock(),
-    )
-    links_writer = AsyncMock()
-    monkeypatch.setattr(module, "write_stored_links", links_writer)
-    item = PolicyPlanItem(
-        kind="upsert",
-        memory_type="experiences",
-        target_name=case.name,
-        target_uri=exp_uri,
-        before_content=None,
-        after_content="dag",
-        links=[StoredLink(from_uri=exp_uri, to_uri=archive, link_type="derived_from")],
-    )
-    compressor = SessionCompressorV3(vikingdb=None)
-    await compressor._link_case_to_training_outputs(
-        analysis=RolloutAnalysis(
-            evaluation=None,
-            rollout=Rollout(case, [], "p"),
-            metadata={"source_session_uri": archive},
-        ),
-        case_uri=case_uri,
-        plan=PolicyUpdatePlan(items=[item]),
-        apply_result=PolicyApplyResult(
-            updated_policy_set=ExperienceSet(root, []), written_uris=[exp_uri]
-        ),
-        ctx=_ctx(),
-        viking_fs=fs,
-    )
-    locks.pathlock_acquire_exact_tree_batch.assert_awaited_once_with(
-        [case_uri], [root], timeout_secs=300.0
-    )
-    assert fs.write_file.await_args.kwargs["lease_ref"] == lease
-    assert links_writer.await_args.kwargs["lease_ref"] == lease
-    locks.pathlock_release.assert_awaited_once_with(lease)
-
-
-@pytest.mark.asyncio
 async def test_enabled_skills_run_once_independently_of_case_count(monkeypatch):
     from openviking.session.train.components.session_analyzer import SessionRolloutAnalyzer
 
@@ -2027,14 +1887,18 @@ async def test_enabled_skills_run_once_independently_of_case_count(monkeypatch):
         "openviking.session.compressor_v3.get_streaming_policy_trainer",
         AsyncMock(return_value=trainer),
     )
-    monkeypatch.setattr(SessionRolloutAnalyzer, "_extract_trajectory", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        SessionRolloutAnalyzer, "_extract_trajectories", AsyncMock(return_value=None)
+    )
     compressor = SessionCompressorV3(vikingdb=None)
     compressor._session_skill_extraction_enabled = lambda: True
     compressor.extract_session_skills = AsyncMock(
         return_value={"skill_submitted": 1, "skill_uris": ["skill-uri"]}
     )
+    other_case = _training_case()
+    other_case.name = "other_case"
     result = await compressor.train_from_extracted_cases(
-        cases=[_training_case(), _training_case()],
+        cases=[_training_case(), other_case],
         messages=_messages(),
         ctx=_ctx(),
         archive_uri="viking://user/u/sessions/s/history/archive_001",

@@ -9,6 +9,7 @@ from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOpera
 from openviking.session.memory.experience.trajectory_context import (
     SYSTEM_STEP_MAX_CHARS,
     AgentTrajectoryContextProvider,
+    TrajectoryTarget,
     trajectory_source_steps,
 )
 
@@ -29,7 +30,7 @@ def operations(
                     "steps": content,
                     "context_rules": context_rules,
                     "trajectory_name": "model_name",
-                    "case_name": "model_case",
+                    "case_name": "case",
                     "outcome": "success",
                 },
             )
@@ -43,7 +44,9 @@ def operations(
 @pytest.mark.parametrize("language", ["en", "zh-CN"])
 @pytest.mark.parametrize("source_steps", [None, []])
 def test_trajectory_instruction_keeps_the_target_language(language, source_steps):
-    provider = AgentTrajectoryContextProvider(messages=[], source_steps=source_steps)
+    provider = AgentTrajectoryContextProvider(
+        messages=[], source_steps=source_steps, targets=[TrajectoryTarget(case={"name": "case"})]
+    )
     provider._output_language = language
 
     instruction = provider.instruction()
@@ -61,7 +64,11 @@ def test_trajectory_instruction_keeps_the_target_language(language, source_steps
 
 def test_trajectory_prompt_keeps_effect_evidence_without_domain_specific_examples():
     instruction = " ".join(
-        AgentTrajectoryContextProvider(messages=[], source_steps=[]).instruction().split()
+        AgentTrajectoryContextProvider(
+            messages=[], source_steps=[], targets=[TrajectoryTarget(case={"name": "case"})]
+        )
+        .instruction()
+        .split()
     )
 
     assert "state changes, side effects, and important facts that did not change" in instruction
@@ -90,9 +97,9 @@ async def test_trajectory_style_does_not_rewrite_source_evidence_or_content(lang
     provider = AgentTrajectoryContextProvider(
         messages=[message(source)],
         source_steps=steps,
-        trajectory_name="trial",
-        case_name="case",
-        outcome="failure",
+        targets=[
+            TrajectoryTarget(case={"name": "case"}, trajectory_name="trial", outcome="failure")
+        ],
     )
     provider._output_language = language
     payload = json.loads((await provider.prefetch())[0]["content"])
@@ -101,7 +108,7 @@ async def test_trajectory_style_does_not_rewrite_source_evidence_or_content(lang
     label = "The user supplied" if language == "en" else "用户提供"
     content = f"# Trajectory\n1. `user` {label}: {source}"
     result = operations(content)
-    assert provider.validate_resolved_operations(result) == []
+    assert await provider.validate_resolved_operations(result) == []
     assert result.upsert_operations[0].memory_fields["steps"] == content
 
 
@@ -122,18 +129,22 @@ async def test_trajectory_style_does_not_rewrite_source_evidence_or_content(lang
         "\n".join(f"{index}. step" for index in range(1, 301)),
     ],
 )
-def test_content_is_kept_without_heading_numbering_count_or_type_binding(content):
+async def test_content_is_kept_without_heading_numbering_count_or_type_binding(content):
     provider = AgentTrajectoryContextProvider(
         messages=[message("Cancel the booking")],
         source_steps=[{"type": "user", "content": "Cancel the booking"}],
-        trajectory_name="server_fixed",
-        case_name="case",
-        outcome="failure",
-        target_uri="viking://user/u/memories/trajectories/case/server_fixed.md",
+        targets=[
+            TrajectoryTarget(
+                case={"name": "case"},
+                trajectory_name="server_fixed",
+                outcome="failure",
+                target_uri="viking://user/u/memories/trajectories/case/server_fixed.md",
+            )
+        ],
     )
     result = operations(content)
 
-    assert provider.validate_resolved_operations(result) == []
+    assert await provider.validate_resolved_operations(result) == []
 
     operation = result.upsert_operations[0]
     assert operation.memory_fields == {
@@ -146,22 +157,26 @@ def test_content_is_kept_without_heading_numbering_count_or_type_binding(content
         "action_score_sources": {},
         "evaluation_criteria": [],
     }
-    assert operation.uris == [provider.target_uri]
+    assert operation.uris == [provider.targets["case"].target_uri]
 
 
 @pytest.mark.parametrize("count", [0, 2])
-def test_single_trajectory_constraint_is_retained(count):
-    provider = AgentTrajectoryContextProvider(messages=[], source_steps=[])
-    errors = provider.validate_resolved_operations(operations("plain text", count=count))
-    assert errors[0]["error"] == "Trajectory extraction must create exactly one memory"
+async def test_single_trajectory_constraint_is_retained(count):
+    provider = AgentTrajectoryContextProvider(
+        messages=[], source_steps=[], targets=[TrajectoryTarget(case={"name": "case"})]
+    )
+    errors = await provider.validate_resolved_operations(operations("plain text", count=count))
+    assert errors[0]["error"] == "Create exactly one Trajectory per supplied Case"
 
 
-def test_trajectory_memory_type_constraint_is_retained():
-    provider = AgentTrajectoryContextProvider(messages=[], source_steps=[])
-    errors = provider.validate_resolved_operations(
+async def test_trajectory_memory_type_constraint_is_retained():
+    provider = AgentTrajectoryContextProvider(
+        messages=[], source_steps=[], targets=[TrajectoryTarget(case={"name": "case"})]
+    )
+    errors = await provider.validate_resolved_operations(
         operations("plain text", memory_type="experiences")
     )
-    assert errors[0]["error"] == "The only operation must create a Trajectory"
+    assert errors[0]["error"] == "Every operation must create a Trajectory"
 
 
 def test_source_steps_preserve_system_control_dialogue_and_duplicate_messages():
@@ -233,13 +248,15 @@ async def test_system_rules_reach_model_once_through_source_steps():
         message("Cancel the booking"),
     ]
     steps = trajectory_source_steps(messages)
-    provider = AgentTrajectoryContextProvider(messages=messages, source_steps=steps)
+    provider = AgentTrajectoryContextProvider(
+        messages=messages, source_steps=steps, targets=[TrajectoryTarget(case={"name": "case"})]
+    )
     payload = json.loads((await provider.prefetch())[0]["content"])
 
-    assert set(payload) == {
+    assert set(payload) == {"cases", "source_steps"}
+    assert set(payload["cases"][0]) == {
         "case",
         "task_spec",
-        "source_steps",
         "injected_actions",
         "external_evaluation",
     }
@@ -257,7 +274,7 @@ async def test_system_rules_reach_model_once_through_source_steps():
     assert "training metadata, not execution-time rules or actions" in prompt
     content = "Confirmation precedes cancellation.\nThe user asked to cancel."
     result = operations(content)
-    assert provider.validate_resolved_operations(result) == []
+    assert await provider.validate_resolved_operations(result) == []
     assert result.upsert_operations[0].memory_fields["steps"] == content
 
 
@@ -346,9 +363,7 @@ async def test_system_rules_are_context_in_single_source_input_not_output_steps(
     provider = AgentTrajectoryContextProvider(
         messages=[],
         source_steps=trajectory_source_steps([message(rules), message(dialogue)]),
-        trajectory_name="t",
-        case_name="case",
-        outcome="unknown",
+        targets=[TrajectoryTarget(case={"name": "case"}, trajectory_name="t", outcome="unknown")],
     )
     payload = json.loads((await provider.prefetch())[0]["content"])
     assert payload["source_steps"] == [
@@ -409,11 +424,11 @@ async def test_tool_summary_selection_is_task_guidance_not_input_field_filtering
     provider = AgentTrajectoryContextProvider(
         messages=messages,
         source_steps=trajectory_source_steps(messages),
-        outcome=outcome,
+        targets=[TrajectoryTarget(case={"name": "case"}, outcome=outcome)],
     )
     prompt = " ".join(provider.instruction().split())
     for requirement in (
-        "Select facts for this execution",
+        "Select facts for this Case's part of the execution",
         "not the Case's entire business scope",
         "Keep exact task-relevant values",
         "source values and relevant candidate alternatives",
@@ -441,7 +456,7 @@ async def test_tool_summary_selection_is_task_guidance_not_input_field_filtering
     # The new wording does not add a semantic validator or rewrite model-produced text.
     result = operations("1. `tool:get_user_details` observed profile facts.")
     content = result.upsert_operations[0].memory_fields["steps"]
-    assert provider.validate_resolved_operations(result) == []
+    assert await provider.validate_resolved_operations(result) == []
     assert result.upsert_operations[0].memory_fields["steps"] == content
 
 
@@ -449,7 +464,9 @@ async def test_tool_summary_selection_is_task_guidance_not_input_field_filtering
 async def test_named_reminders_reach_extraction_with_copy_header_guidance():
     note = "[Experience Reminder] require_chinese, ask_reason\n\n**建议**\nKeep the full guidance."
     steps = trajectory_source_steps([message(note)])
-    provider = AgentTrajectoryContextProvider(messages=[], source_steps=steps)
+    provider = AgentTrajectoryContextProvider(
+        messages=[], source_steps=steps, targets=[TrajectoryTarget(case={"name": "case"})]
+    )
     instruction = provider.instruction()
     assert "copy its first line exactly" in instruction
     assert "[Experience Reminder] advice_a, advice_b" in instruction

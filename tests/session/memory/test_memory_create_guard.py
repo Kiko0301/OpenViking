@@ -695,11 +695,11 @@ async def test_reported_create_conflicts_reset_between_runs():
             "cases",
             {
                 "case_name": "payment_selection",
-                "task_signature": "Choose an eligible payment method",
-                "input": '{"summary":"Choose payment"}',
+                "domain": "Choose an eligible payment method",
+                "description": '{"summary":"Choose payment"}',
                 "rubric": "[]",
             },
-            "task_signature",
+            "domain",
         ),
     ],
 )
@@ -819,7 +819,7 @@ async def test_independent_same_target_creates_merge_before_final_validation(
     assert set(fs.files) == {uri}
     memory = MemoryFileUtils.read(fs.files[uri], uri=uri)
     if memory_type == "cases" and outcome == "existing_at_merge":
-        assert memory.extra_fields["task_signature"] == "Existing fact."
+        assert memory.extra_fields["domain"] == "Existing fact."
         for result in results:
             assert result.apply_result.written_uris == [] and result.apply_result.edited_uris == []
             assert result.operations.upsert_operations == []

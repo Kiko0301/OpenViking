@@ -135,7 +135,7 @@ class AgentEvolutionService:
         lease_seconds: int = 900,
         wait: bool = True,
     ) -> dict[str, Any]:
-        """Run deferred Experience synthesis from pending Trajectories."""
+        """Consume Case inboxes selected by canonical names or trigger Trajectory URIs."""
         self._ensure_initialized()
         if self._session_compressor is None:
             raise NotInitializedError("SessionCompressorV3")

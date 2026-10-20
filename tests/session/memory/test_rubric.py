@@ -12,7 +12,10 @@ from openviking.session.memory.experience.rubric import (
     parse_case_rubric,
     snapshot_rubric_results,
 )
-from openviking.session.memory.experience.trajectory_context import AgentTrajectoryContextProvider
+from openviking.session.memory.experience.trajectory_context import (
+    AgentTrajectoryContextProvider,
+    TrajectoryTarget,
+)
 from openviking.session.train import Case, Rubric, RubricCriterion
 
 RUBRIC = [
@@ -148,16 +151,18 @@ def test_excessively_nested_result_yaml_is_omitted():
     assert snapshot_rubric_results("[" * depth + "0" + "]" * depth, RUBRIC) == []
 
 
-def test_bad_rubric_and_action_scores_do_not_block_factual_trajectory():
+async def test_bad_rubric_and_action_scores_do_not_block_factual_trajectory():
     from test_trajectory_context import operations
 
-    provider = AgentTrajectoryContextProvider(messages=[], source_steps=[])
+    provider = AgentTrajectoryContextProvider(
+        messages=[], source_steps=[], targets=[TrajectoryTarget(case={"name": "case"})]
+    )
     result = operations("Factual dialogue.")
     result.upsert_operations[0].memory_fields.update(
         evaluation_criteria="not a YAML list",
         action_scores=[{"id": "not_injected", "score": 1, "evidence": "unsupported"}],
     )
-    errors = provider.validate_resolved_operations(result)
+    errors = await provider.validate_resolved_operations(result)
     assert errors == []
     assert result.upsert_operations[0].memory_fields["action_scores"] == []
     assert result.upsert_operations[0].memory_fields["evaluation_criteria"] == []
@@ -182,13 +187,13 @@ async def test_extraction_receives_case_rubric_and_arbitrary_external_evidence()
     provider = AgentTrajectoryContextProvider(
         messages=[],
         source_steps=[],
-        case=asdict(case),
-        external_evaluation=external,
+        targets=[TrajectoryTarget(case=asdict(case), external_evaluation=external)],
     )
     payload = json.loads((await provider.prefetch())[0]["content"])
-    assert payload["case"]["rubric"] == RUBRIC
-    assert payload["external_evaluation"] == external
+    assert payload["cases"][0]["case"]["rubric"] == RUBRIC
+    assert payload["cases"][0]["external_evaluation"] == external
     result = operations("Recorded dialogue.")
+    result.upsert_operations[0].memory_fields["case_name"] = "library"
     result.upsert_operations[0].memory_fields["evaluation_criteria"] = yaml.safe_dump(
         [
             {
@@ -199,7 +204,7 @@ async def test_extraction_receives_case_rubric_and_arbitrary_external_evidence()
             {"id": "scope", "passed": None, "evidence": "Requested scope not recorded."},
         ]
     )
-    assert provider.validate_resolved_operations(result) == []
+    assert await provider.validate_resolved_operations(result) == []
     snapshots = result.upsert_operations[0].memory_fields["evaluation_criteria"]
     assert snapshots[0] == {
         **RUBRIC[0],
@@ -251,8 +256,13 @@ async def test_case_evidence_is_separate_from_conversation_and_respects_schema_f
     ]
     assert len(evidence_messages) == int(allow_cases)
     if allow_cases:
-        assert "external evaluation reports" in evidence_messages[0]["content"]
-        assert evidence_messages[0]["content"].endswith(reports[0])
+        prompt = evidence_messages[0]["content"]
+        assert "Only explicitly supplied rubric or acceptance criteria" in prompt
+        assert "Task context and external evaluation reports are not additional criteria" in prompt
+        assert "do not infer standards from behavior, scores or errors" in prompt
+        assert "Keep the original meaning and scope" in prompt
+        assert "Extract reusable evaluation standards" not in prompt
+        assert prompt.endswith(reports[0])
     assert provider.messages == source
 
 
@@ -353,5 +363,162 @@ def test_rubric_prompt_uses_case_as_guidance_not_an_id_whitelist():
     assert "Prefer a supplied Case criterion ID" in description
     assert "preserves model descriptions" in description
     assert "an unmatched ID does not discard the assessment" in description
+    assert "copy criterion_name verbatim as id" in description
+    assert "copy the reported passed/score unchanged" in description
+    assert "Explain discrepancies in evidence without changing results" in description
+    assert "An overall pass/fail does not establish each criterion's result" in description
     assert "only an exact case.rubric id" not in description
     assert "Do not substitute" not in description
+
+
+@pytest.mark.parametrize("score", [0, 0.0, 0.75, -1.0, None])
+def test_rubric_snapshot_preserves_explicit_score(score):
+    assessment = {"id": "external", "passed": False, "score": score, "evidence": "Reported."}
+    assert snapshot_rubric_results([assessment], []) == [assessment]
+
+
+@pytest.mark.parametrize("score", [True, "0", float("nan"), float("inf")])
+def test_invalid_optional_score_does_not_discard_the_judgment(score):
+    assessment = {"id": "external", "passed": False, "score": score, "evidence": "Reported."}
+    assert snapshot_rubric_results([assessment], []) == [
+        {"id": "external", "passed": False, "evidence": "Reported."}
+    ]
+
+
+def external_result_provider(evaluation):
+    return AgentTrajectoryContextProvider(
+        messages=[],
+        source_steps=[],
+        targets=[
+            TrajectoryTarget(
+                case={
+                    "name": "case",
+                    "rubric": {
+                        "criteria": [{"name": "domain_reward", "description": "Reported reward."}]
+                    },
+                },
+                external_evaluation=evaluation,
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "assessments",
+    [
+        [],
+        [{"id": "external_reward", "passed": None, "score": 0.0, "evidence": "Disagree."}],
+        [{"id": "external_reward", "passed": True, "score": 0.0, "evidence": "Tool succeeded."}],
+        [{"id": "external_reward", "passed": False, "evidence": "Missing score."}],
+        [{"id": "external_reward", "passed": False, "score": 1.0, "evidence": "Changed score."}],
+        [{"id": "external_reward", "passed": False, "score": False, "evidence": "Bad score."}],
+        [{"id": "external_reward", "passed": 0, "score": 0.0, "evidence": "Bad judgment."}],
+        [{"id": "domain_reward", "passed": False, "score": 0.0, "evidence": "Renamed ID."}],
+        [
+            {"id": "external_reward", "passed": False, "score": 0.0, "evidence": "Reported."},
+            {"id": "external_reward", "passed": None, "score": 0.0, "evidence": "Disagree."},
+        ],
+    ],
+    ids=[
+        "omitted",
+        "null",
+        "true",
+        "score-omitted",
+        "score-changed",
+        "bool-score",
+        "int-passed",
+        "renamed",
+        "duplicate",
+    ],
+)
+async def test_external_result_mismatch_requests_repair_without_overwriting(assessments):
+    from test_trajectory_context import operations
+
+    external = {
+        "passed": False,
+        "score": 0.0,
+        "criterion_results": [{"criterion_name": "external_reward", "passed": False, "score": 0.0}],
+    }
+    original = copy.deepcopy(external)
+    provider = external_result_provider(external)
+    result = operations("Tool completed, but external acceptance failed.")
+    result.upsert_operations[0].memory_fields["evaluation_criteria"] = copy.deepcopy(assessments)
+    errors = await provider.validate_resolved_operations(result)
+    assert errors
+    assert errors[0]["case_name"] == "case"
+    assert errors[0]["expected"] == {"id": "external_reward", "passed": False, "score": 0.0}
+    assert result.upsert_operations[0].memory_fields[
+        "evaluation_criteria"
+    ] == snapshot_rubric_results(assessments, provider.targets["case"].rubric)
+    assert external == original
+    assert "external_reward" in provider.render_operation_repair(errors)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("as_text", [False, True])
+@pytest.mark.parametrize(("passed", "score"), [(False, 0.0), (True, 0.75), (None, None)])
+async def test_external_results_and_context_assessments_share_one_output(as_text, passed, score):
+    from test_trajectory_context import operations
+
+    provider = external_result_provider(
+        {
+            "passed": False,  # Overall failure must not determine every criterion.
+            "score": 0.0,
+            "criterion_results": [
+                {"criterion_name": "external_reward", "passed": passed, "score": score}
+            ],
+        }
+    )
+    assessments = [
+        {"id": "external_reward", "passed": passed, "score": score, "evidence": "External report."},
+        {"id": "user_confirmation", "passed": True, "evidence": "User explicitly confirmed."},
+    ]
+    result = operations("Recorded facts.")
+    result.upsert_operations[0].memory_fields["evaluation_criteria"] = (
+        yaml.safe_dump(assessments) if as_text else assessments
+    )
+    assert await provider.validate_resolved_operations(result) == []
+    assert result.upsert_operations[0].memory_fields["evaluation_criteria"] == assessments
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "external",
+    [
+        None,
+        {},
+        {"inspection": {"authorization": "absent"}},
+        {"passed": False, "score": 0.0, "criterion_results": []},
+        {"criterion_results": [{"criterion_name": "context", "feedback": ["Inspect evidence."]}]},
+    ],
+)
+async def test_no_external_criterion_judgment_keeps_context_only_extraction(external):
+    from test_trajectory_context import operations
+
+    provider = external_result_provider(external)
+    assessments = [{"id": "context", "passed": True, "evidence": "The user confirmed."}]
+    result = operations("Observed user confirmation.")
+    result.upsert_operations[0].memory_fields["evaluation_criteria"] = assessments
+    assert await provider.validate_resolved_operations(result) == []
+    assert result.upsert_operations[0].memory_fields["evaluation_criteria"] == assessments
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("judgments", [{"passed": False}, {"score": 0.25}])
+async def test_partial_external_result_requires_only_fields_actually_reported(judgments):
+    from test_trajectory_context import operations
+
+    provider = external_result_provider(
+        {"criterion_results": [{"criterion_name": "external_reward", **judgments}]}
+    )
+    assessment = {
+        "id": "external_reward",
+        "passed": None,
+        **judgments,
+        "evidence": "External fields preserved; unreported judgment may remain unknown.",
+    }
+    result = operations("Recorded facts.")
+    result.upsert_operations[0].memory_fields["evaluation_criteria"] = [assessment]
+    assert await provider.validate_resolved_operations(result) == []
+    assert result.upsert_operations[0].memory_fields["evaluation_criteria"] == [assessment]

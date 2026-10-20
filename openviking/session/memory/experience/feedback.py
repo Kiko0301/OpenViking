@@ -82,24 +82,16 @@ def normalize_action_scores(value: Any, sources: dict[str, dict[str, str]]) -> l
 
 def _feedback_state(value: Any) -> dict[str, Any]:
     if value is None:
-        return {"schema_version": 2, "actions": {}, "observed_trajectories": []}
+        return {"schema_version": 2, "actions": {}}
     if (
         not isinstance(value, dict)
         or type(value.get("schema_version")) is not int
         or value["schema_version"] != 2
         or not isinstance(value.get("actions"), dict)
-        or not isinstance(value.get("observed_trajectories"), list)
     ):
         raise ValueError(
             "Invalid system-owned action_feedback; expected schema_version=2 (slot_name keys)"
         )
-    observed = value["observed_trajectories"]
-    if bool(observed) != bool(value["actions"]):
-        raise ValueError("Invalid action_feedback trajectory ledger")
-    if any(not isinstance(uri, str) or not uri for uri in observed) or len(set(observed)) != len(
-        observed
-    ):
-        raise ValueError("Invalid action_feedback trajectory ledger")
     for key, item in value["actions"].items():
         if (
             not isinstance(key, str)
@@ -118,7 +110,7 @@ def _feedback_state(value: Any) -> dict[str, Any]:
                 or not isinstance(example.get("evidence"), str)
             ):
                 raise ValueError("Invalid system-owned action_feedback evidence")
-    return deepcopy(value)
+    return {"schema_version": 2, "actions": deepcopy(value["actions"])}
 
 
 def action_feedback_for_content(
@@ -185,10 +177,11 @@ async def record_experience_feedback_stats(
     viking_fs: Any,
     ctx: Any,
 ) -> dict[str, list[str]]:
-    """Atomically count all injected actions once per Trajectory and Experience.
+    """Accumulate feedback and mark the Trajectory processed under a shared write lock.
 
-    Cached extraction retries reuse immutable scores. Each slot accumulates scores
-    across instruction changes; a removed Experience is never recreated by a feedback write.
+    Cached/concurrent calls skip completed Trajectories without an unbounded Experience
+    ledger. Counters and the completion marker are separate writes: a retry after a
+    partial write can count feedback again. A deleted Experience is never recreated.
     """
     from openviking.session.memory.memory_updater import MemoryUpdater
     from openviking.session.memory.streaming_memory_updater import _acquire_stable_operation_lease
@@ -223,15 +216,31 @@ async def record_experience_feedback_stats(
         if key in actions:
             raise ValueError("Duplicate action feedback sources")
         actions[key] = {**source, **scores[alias]}
-    for uri, actions in sorted(grouped.items()):
-        operation = ResolvedOperation(memory_type="experiences", uris=[uri], memory_fields={})
-        operations = ResolvedOperations(
-            upsert_operations=[operation], delete_file_contents=[], errors=[]
+    operations = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(memory_type="experiences", uris=[uri], memory_fields={})
+            for uri in sorted(grouped)
+        ]
+        + [ResolvedOperation(memory_type="trajectories", uris=[trajectory.uri], memory_fields={})],
+        delete_file_contents=[],
+        errors=[],
+    )
+    lease = await _acquire_stable_operation_lease(operations, viking_fs, ctx)
+    if lease is None:
+        raise RuntimeError("Experience feedback requires a write-set pathlock")
+    try:
+        latest = MemoryFileUtils.read(
+            await viking_fs.read_file(trajectory.uri, ctx=ctx), uri=trajectory.uri
         )
-        lease = await _acquire_stable_operation_lease(operations, viking_fs, ctx)
-        if lease is None:
-            raise RuntimeError("Experience feedback requires a write-set pathlock")
-        try:
+        update_state = latest.extra_fields.get("experience_update") or {}
+        if not isinstance(update_state, dict):
+            raise ValueError("Invalid Trajectory experience_update metadata")
+        if update_state.get("feedback_recorded") is True:
+            result["skipped_uris"] = sorted(grouped)
+            return result
+        for operation in operations.upsert_operations[:-1]:
+            uri = operation.uris[0]
+            actions = grouped[uri]
             try:
                 raw = await viking_fs.read_file(uri, ctx=ctx)
             except Exception as exc:
@@ -241,9 +250,6 @@ async def record_experience_feedback_stats(
                 continue
             previous = MemoryFileUtils.read(raw, uri=uri)
             state = _feedback_state(previous.extra_fields.get("action_feedback"))
-            if trajectory.uri in state["observed_trajectories"]:
-                result["skipped_uris"].append(uri)
-                continue
             for action in actions.values():
                 item = state["actions"].setdefault(
                     action["slot_name"], {**dict.fromkeys(_COUNTS, 0), "examples": {}}
@@ -257,15 +263,23 @@ async def record_experience_feedback_stats(
                             "action_feedback", action["evidence"], 1000
                         ),
                     }
-            state["observed_trajectories"].append(trajectory.uri)
             operation.memory_fields = {"action_feedback": state}
             operation.old_memory_file_content = previous
             updater = MemoryUpdater(registry=registry, transaction_handle=lease)
             updater._viking_fs = viking_fs
-            updated = await updater.apply_operations(operations, ctx)
+            updated = await updater.apply_operations(
+                ResolvedOperations(
+                    upsert_operations=[operation], delete_file_contents=[], errors=[]
+                ),
+                ctx,
+            )
             if updated.errors:
                 raise RuntimeError(f"Experience feedback update failed: {updated.errors}")
             result["updated_uris"].append(uri)
-        finally:
-            await viking_fs._async_agfs.pathlock_release(lease)
+        latest.extra_fields["experience_update"] = {**update_state, "feedback_recorded": True}
+        await viking_fs.write_file(
+            latest.uri, MemoryFileUtils.write(latest), ctx=ctx, lease_ref=lease
+        )
+    finally:
+        await viking_fs._async_agfs.pathlock_release(lease)
     return result

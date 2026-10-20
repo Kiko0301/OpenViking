@@ -34,8 +34,8 @@ def case_memory(name, *, user="u", memory_type="cases"):
         content=f"Business domain {name}",
         extra_fields={
             "case_name": name,
-            "task_signature": f"Domain {name}",
-            "input": '{"summary":"service domain"}',
+            "domain": f"Domain {name}",
+            "description": '{"summary":"service domain"}',
             "rubric": "[]",
             # Old on-disk data must not become Case learning context after field removal.
             "evidence": "OBSOLETE_CASE_EVIDENCE",
@@ -142,7 +142,7 @@ async def test_count_only_case_update_associates_execution_without_explicit_sele
                         "page_id": page_id,
                         **{
                             name: target.extra_fields[name]
-                            for name in ("case_name", "task_signature", "input")
+                            for name in ("case_name", "domain", "description")
                         },
                         "execution_count": 1,
                     }
@@ -290,8 +290,7 @@ async def test_reading_candidates_without_selection_does_not_associate_them(
         "sdk.commit(cases=[1])",
         "sdk.commit(cases=['viking://user/u/memories/cases/second.md'])",
         "second.delete()\nsdk.commit(cases=[second])",
-        "created = sdk.create_cases(case_name='new', task_signature='New domain', "
-        "input='{}', rubric='[]', execution_count=1)\nsdk.commit(cases=[created])",
+        "created = sdk.create_cases(case_name='new', domain='New domain', description='{}', rubric='[]', execution_count=1)\nsdk.commit(cases=[created])",
     ],
 )
 async def test_python_case_selection_rejects_invalid_objects(monkeypatch, program):
@@ -435,10 +434,7 @@ async def test_new_case_binding_still_uses_creation_not_a_reference(monkeypatch)
         monkeypatch, output_format="python"
     )
     fs._uri_to_path = lambda uri, **kwargs: uri
-    model.get_completion_async.return_value = (
-        "created = sdk.create_cases(case_name='new', task_signature='New domain', "
-        "input='{}', rubric='[]', execution_count=1)"
-    )
+    model.get_completion_async.return_value = "created = sdk.create_cases(case_name='new', domain='New domain', description='{}', rubric='[]', execution_count=1)"
     result, _ = await loop.run()
     assert not result.case_references
     assert len(result.upsert_operations) == 1

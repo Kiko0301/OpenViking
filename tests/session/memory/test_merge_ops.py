@@ -12,6 +12,7 @@ import pytest
 from openviking.session.memory.dataclass import (
     MemoryField,
 )
+from openviking.session.memory.extraction_output_protocol.edit_format import EDIT_TOOL_DESCRIPTION
 from openviking.session.memory.merge_op import (
     DeleteBlock,
     ImmutableOp,
@@ -61,11 +62,11 @@ class TestPatchOp:
         assert "PATCH" in desc
         assert "test content" in desc
 
-    def test_get_output_schema_description_string_mentions_shared_search_replace_rules(self):
-        """String patch description should defer to the shared SEARCH/REPLACE rules."""
+    def test_get_output_schema_description_string_mentions_shared_edit_instructions(self):
+        """String patch description should defer to the shared Edit instructions."""
         op = PatchOp(FieldType.STRING)
         desc = op.get_output_schema_description("test content")
-        assert "Follow the shared SEARCH/REPLACE rules above." in desc
+        assert "Follow the shared Edit instructions." in desc
 
     def test_get_output_schema_description_string_drops_line_number_prefix_reminder(self):
         """String patch description should rely on the shared line-prefix guidance."""
@@ -99,10 +100,10 @@ class TestPatchOp:
         loop_progressed = threading.Event()
         merge_observed_progress = None
 
-        def apply_and_observe(current_value, patch_value):
+        def apply_and_observe(current_value, patch_value, **kwargs):
             nonlocal merge_observed_progress
             merge_observed_progress = loop_progressed.wait(timeout=0.5)
-            return original_apply(current_value, patch_value)
+            return original_apply(current_value, patch_value, **kwargs)
 
         monkeypatch.setattr(patch_handler, "apply_str_patch", apply_and_observe)
         patch = {"blocks": [{"search": "hello world", "replace": "hello there"}]}
@@ -115,12 +116,13 @@ class TestPatchOp:
         assert merge_observed_progress is True
 
     @pytest.mark.asyncio
-    async def test_apply_invalid_dict_patch_falls_back_to_string_replacement(self):
-        """Invalid dict-form patches should preserve the compatibility fallback."""
+    async def test_apply_invalid_dict_patch_is_rejected(self):
+        """Malformed edits must not become literal dictionary text in a field."""
         op = PatchOp(FieldType.STRING)
         patch = {"blocks": [{"search": "hello world"}]}
 
-        assert await op.apply("hello world", patch) == str(patch)
+        with pytest.raises(ValueError):
+            await op.apply("hello world", patch)
 
     @pytest.mark.asyncio
     async def test_apply_dict_patch_propagates_patch_parse_error(self):
@@ -128,14 +130,14 @@ class TestPatchOp:
         op = PatchOp(FieldType.STRING)
         patch = {"blocks": [{"search": "status: pending", "replace": "status: done"}]}
 
-        with pytest.raises(PatchParseError, match="matched 2 locations"):
+        with pytest.raises(PatchParseError, match="Found 2 occurrences"):
             await op.apply("status: pending\nstatus: pending", patch)
 
     @pytest.mark.asyncio
     async def test_apply_dict_delete_patch(self):
         """Dict-form DELETE blocks should remove complete lines."""
         op = PatchOp(FieldType.STRING)
-        patch = {"blocks": [{"delete": "line 2\nline 3"}]}
+        patch = {"blocks": [{"delete": "line 2\nline 3\n"}]}
 
         assert await op.apply("line 1\nline 2\nline 3\nline 4", patch) == "line 1\nline 4"
 
@@ -262,38 +264,31 @@ class TestSearchReplaceBlock:
         assert block.search == "old content"
         assert block.replace == "new content"
 
-    def test_search_description_mentions_page_bound_target_file(self):
-        """SEARCH description should require exact text from the target file."""
+    def test_search_description_describes_value_not_another_edit_tutorial(self):
         description = SearchReplaceBlock.model_fields["search"].description
-        assert description is not None
-        assert "page_id" in description
-        assert "read result" in description
-        assert "another memory or page" in description
-        assert "exact" in description
-        assert "Choose page_id first" in description
-        assert "Never use SEARCH text" in description
+        assert (
+            description
+            == "Exact, unique text in the original field; must not overlap another block."
+        )
+        assert "original field, not after earlier edits are applied" in EDIT_TOOL_DESCRIPTION
 
-    def test_search_description_mentions_contiguous_multiline_search(self):
-        """SEARCH description should require contiguous multi-line matches."""
+    def test_exact_matching_instruction_has_one_shared_owner(self):
         description = SearchReplaceBlock.model_fields["search"].description
-        assert description is not None
-        assert "Multi-line SEARCH must be contiguous" in description
-        assert "split non-adjacent edits into separate blocks" in description
+        assert "Edit a single memory field using exact text replacement" in EDIT_TOOL_DESCRIPTION
+        assert "usually 2-4" not in description
+        assert "Multi-line SEARCH must be contiguous" not in description
 
-    def test_search_description_mentions_line_number_prefix_exclusion(self):
-        """SEARCH description should require stripping Claude Code line prefixes."""
+    def test_original_snapshot_semantics_live_in_shared_description(self):
         description = SearchReplaceBlock.model_fields["search"].description
-        assert description is not None
-        assert "line_number<TAB>" in description
-        assert "exclude those prefixes from SEARCH" in description
+        assert "line_number<TAB>" not in description
+        assert "Do not emit overlapping or nested edits" in EDIT_TOOL_DESCRIPTION
+        assert "Keep search as small as possible" in EDIT_TOOL_DESCRIPTION
 
-    def test_replace_description_mentions_line_number_prefix_exclusion(self):
-        """REPLACE description should forbid tab-prefixed line numbers."""
+    def test_replace_description_only_describes_replacement_value(self):
         description = SearchReplaceBlock.model_fields["replace"].description
-        assert description is not None
-        assert "line_number<TAB>" in description
-        assert "Never include" in description
-        assert "Use a DELETE block for complete-line deletion" in description
+        assert description == "Replacement text for this targeted edit."
+        assert "line_number<TAB>" not in description
+        assert "Keep search as small as possible" in EDIT_TOOL_DESCRIPTION
 
 
 class TestDeleteBlock:
@@ -306,16 +301,15 @@ class TestDeleteBlock:
         assert block.search == "line 2\nline 3"
         assert block.replace == ""
 
-    def test_delete_description_requires_complete_contiguous_lines(self):
+    def test_delete_description_explains_literal_removal(self):
         description = DeleteBlock.model_fields["delete"].description
 
         assert description is not None
-        assert "complete, contiguous lines" in description
+        assert "Include the newline to remove a complete line" in description
         assert "unique" in description
-        assert "line_number<TAB>" in description
-        assert "other content must remain" in description
-        assert "delete_ids deletes the whole item" in description
-        assert "non-contiguous" in description
+        assert "line_number<TAB>" not in description
+        assert "submit all replacements together" in EDIT_TOOL_DESCRIPTION
+        assert DeleteBlock.model_json_schema()["properties"]["delete"]["minLength"] == 1
 
 
 class TestStrPatch:
@@ -353,9 +347,7 @@ class TestStrPatch:
         schema = StrPatch.model_json_schema()
 
         assert schema["$defs"]["DeleteBlock"]["required"] == ["delete"]
-        block_refs = {
-            option["$ref"] for option in schema["properties"]["blocks"]["items"]["anyOf"]
-        }
+        block_refs = {option["$ref"] for option in schema["properties"]["blocks"]["items"]["anyOf"]}
         assert block_refs == {
             "#/$defs/SearchReplaceBlock",
             "#/$defs/DeleteBlock",
@@ -371,20 +363,15 @@ class TestApplyStrPatch:
     """Tests for apply_str_patch."""
 
     def test_empty_patch(self):
-        """Empty patch returns original."""
-        original = "line1\nline2\nline3"
-        patch = StrPatch()
-        result = apply_str_patch(original, patch)
-        assert result == original
+        """Pi requires at least one edit."""
+        with pytest.raises(PatchParseError, match="at least one replacement"):
+            apply_str_patch("line1\nline2\nline3", StrPatch())
 
     @pytest.mark.parametrize(
         ("original", "search", "expected"),
         [
             ("hello world", "hello world", "updated"),
-            ("hello world", "hello worle", "updated"),
-            ("hello world\nhello world", "hello worle", "hello world\nupdated"),
             ("标题：‘天气’晴朗🌞", "标题：'天气'晴朗🌞", "updated"),
-            ("alpha\nbeta\nalpha\nbeta", "alpha\nbetx", "alpha\nbeta\nupdated"),
         ],
     )
     def test_simple_replace(self, original, search, expected):
@@ -395,12 +382,12 @@ class TestApplyStrPatch:
     @pytest.mark.parametrize(
         ("original", "delete", "expected"),
         [
-            ("line 1\nline 2\nline 3", "line 2", "line 1\nline 3"),
-            ("line 1\nline 2\nline 3\nline 4", "line 2\nline 3", "line 1\nline 4"),
-            ("line 1\nline 2\nline 3", "line 2\nline 3", "line 1"),
-            ("line 1\nline 2", "line 1", "line 2"),
+            ("line 1\nline 2\nline 3", "line 2\n", "line 1\nline 3"),
+            ("line 1\nline 2\nline 3\nline 4", "line 2\nline 3\n", "line 1\nline 4"),
+            ("line 1\nline 2\nline 3", "\nline 2\nline 3", "line 1"),
+            ("line 1\nline 2", "line 1\n", "line 2"),
             ("line 1", "line 1", ""),
-            ("line 1\r\nline 2\r\nline 3", "line 2", "line 1\r\nline 3"),
+            ("line 1\r\nline 2\r\nline 3", "line 2\n", "line 1\r\nline 3"),
         ],
     )
     def test_delete_complete_lines(self, original, delete, expected):
@@ -408,16 +395,15 @@ class TestApplyStrPatch:
 
         assert apply_str_patch(original, patch) == expected
 
-    def test_delete_rejects_partial_line(self):
+    def test_delete_is_literal_replacement_with_empty_text(self):
         patch = StrPatch(blocks=[DeleteBlock(delete="world")])
 
-        with pytest.raises(PatchParseError, match="complete lines"):
-            apply_str_patch("hello world", patch)
+        assert apply_str_patch("hello world", patch) == "hello "
 
     def test_duplicate_delete_is_rejected(self):
         patch = StrPatch(blocks=[DeleteBlock(delete="duplicate")])
 
-        with pytest.raises(PatchParseError, match="matched 2 locations"):
+        with pytest.raises(PatchParseError, match="Found 2 occurrences"):
             apply_str_patch("duplicate\nduplicate", patch)
 
     def test_duplicate_search_is_rejected(self):
@@ -429,7 +415,7 @@ class TestApplyStrPatch:
 
         with pytest.raises(
             PatchParseError,
-            match="additional lines to make sure it is unique",
+            match="Please provide more context to make it unique",
         ):
             apply_str_patch(original, patch)
 
@@ -443,11 +429,11 @@ class TestApplyStrPatch:
             ]
         )
 
-        with pytest.raises(PatchParseError, match="matched 2 locations"):
+        with pytest.raises(PatchParseError, match="Found 2 occurrences"):
             apply_str_patch(original, patch)
 
-    def test_numbered_multiline_patch_uses_inferred_start_line(self):
-        """Tab-prefixed read output should target the numbered range."""
+    def test_numbered_multiline_patch_does_not_guess_a_line_range(self):
+        """Display line numbers are not a Pi edit addressing mechanism."""
         original = "keep\nsame\nkeep\nsame"
         patch = StrPatch(
             blocks=[
@@ -458,12 +444,11 @@ class TestApplyStrPatch:
             ]
         )
 
-        result = apply_str_patch(original, patch)
+        with pytest.raises(PatchParseError, match="Could not find"):
+            apply_str_patch(original, patch)
 
-        assert result == "keep\nsame\nKEEP\nSAME"
-
-    def test_numbered_patch_uses_aggressive_strip_with_leading_spaces(self):
-        """Aggressive stripping should still handle tab-prefixed line numbers."""
+    def test_numbered_patch_does_not_strip_the_search(self):
+        """Pi only applies its listed normalizations, not line-number stripping."""
         original = "alpha\nbeta\ngamma"
         patch = StrPatch(
             blocks=[
@@ -474,9 +459,8 @@ class TestApplyStrPatch:
             ]
         )
 
-        result = apply_str_patch(original, patch)
-
-        assert result == "alpha\nBETA\ngamma"
+        with pytest.raises(PatchParseError, match="Could not find"):
+            apply_str_patch(original, patch)
 
 
 # ============================================================================

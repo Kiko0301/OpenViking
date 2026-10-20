@@ -13,6 +13,7 @@ from openviking.session.memory.extraction_output_protocol.base import (
     ExtractionOutputContext,
     ExtractionOutputProtocol,
 )
+from openviking.session.memory.extraction_output_protocol.edit_format import EDIT_TOOL_DESCRIPTION
 from openviking.session.memory.tools import add_tool_call_pair_to_messages
 from openviking.session.memory.utils import (
     parse_json_with_stability,
@@ -87,7 +88,7 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
         return (
             "## Output Format\n"
             "The final output of the model must strictly follow the JSON Schema format shown below:\n"
-            f"```json\n{schema}\n```"
+            f"```json\n{schema}\n```\n\n## String field edits\n{EDIT_TOOL_DESCRIPTION}"
         )
 
     def render_reference_rules(self, context: ExtractionOutputContext) -> str:
@@ -178,16 +179,11 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
     def render_patch_repair(self, patch_errors: list[dict[str, Any]]) -> str:
         details = json.dumps(patch_errors, ensure_ascii=False, indent=2)
         return (
-            "The SEARCH/REPLACE or DELETE patch could not be applied to the target memory file. "
-            "The SEARCH or DELETE text must be copied exactly from the read result of the file bound to that operation's page_id. "
-            "The matched text must occur exactly once in the target file. "
-            "If it occurs more than once, include enough contiguous surrounding context to make it unique. "
-            "Do not use match text from the conversation or from another page. "
-            "If you copy from numbered read output, exclude the `line_number<TAB>` prefix from SEARCH, REPLACE, and DELETE text. "
-            "If found_in_other_uris is non-empty, diagnose this as a possible page_id mismatch and choose the correct target page_id or rewrite the patch for the current page_id; do not silently move the patch. "
-            "Regenerate the complete operations JSON, including previous successful operations and fixed failed operations. "
-            "Output ONLY the complete JSON object matching the required schema.\n\n"
-            f"Failed patch operations:\n{details}"
+            "A SEARCH/REPLACE or DELETE edit could not be applied to its target field. "
+            "Follow the Edit instructions in the initial output contract. "
+            "Regenerate the complete operations JSON, preserving other intended operations "
+            "and source associations. Do not move the edit to another page merely because "
+            "its text matches.\n\nFailed patch operations:\n" + details
         )
 
     def render_resolution_repair(self, issues: list[dict[str, Any]]) -> str:

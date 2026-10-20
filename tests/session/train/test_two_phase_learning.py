@@ -287,6 +287,9 @@ async def test_wait_cancellation_does_not_fake_a_complete_bar(monkeypatch):
     assert done.args == ("experience_learn_done",)
     assert done.kwargs["task_id"] == "learn-1"
     assert done.kwargs["incomplete"] is True
+    assert done.kwargs["trajectory_count"] is None
+    assert done.kwargs["trigger_trajectory_count"] == 1
+    assert done.kwargs["selection_mode"] == "case_inbox"
     assert done.kwargs["error"].startswith("CancelledError:")
 
 

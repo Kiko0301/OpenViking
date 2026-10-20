@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import json
 import re
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from openviking.core.namespace import is_session_uri
 from openviking.session.memory.dataclass import MemoryFile
+from openviking.session.memory.merge_op.link_merge import is_persisted_link
 from openviking.session.memory.utils.content_template import render_content_template
 from openviking.session.memory.utils.link_renderer import LinkRenderer
 from openviking.session.memory.utils.messages import parse_memory_file_with_fields
@@ -155,7 +159,38 @@ class MemoryFileUtils:
     ) -> str:
         """Serialize a MemoryFile as plain-text body plus MEMORY_FIELDS metadata."""
         metadata = memory_file.to_metadata()
+        if memory_file.memory_type == "cases":
+            metadata.pop("links", None)
+            metadata.pop("backlinks", None)
+        elif memory_file.memory_type == "trajectories":
+            metadata["links"] = [
+                link
+                for link in memory_file.links
+                if link.get("link_type") == "derived_from"
+                and is_session_uri(str(link.get("to_uri") or ""))
+            ]
+            metadata.pop("backlinks", None)
+            state = metadata.get("experience_update")
+            if isinstance(state, dict):
+                metadata["experience_update"] = {
+                    key: value for key, value in state.items() if key != "experience_uri"
+                }
+        else:
+            for field, endpoint in (("links", "from_uri"), ("backlinks", "to_uri")):
+                if field in metadata:
+                    metadata[field] = [
+                        link
+                        for link in metadata[field]
+                        if is_persisted_link({**link, endpoint: memory_file.uri})
+                    ]
         if memory_file.memory_type == "experiences":
+            for key in ("source_sessions", "success_trajectory_refs"):
+                metadata.pop(key, None)
+            feedback = metadata.get("action_feedback")
+            if isinstance(feedback, dict):
+                metadata["action_feedback"] = {
+                    key: value for key, value in feedback.items() if key != "observed_trajectories"
+                }
             # Graph JSON is authoritative. Relations remain in MEMORY_FIELDS;
             # Markdown templates/linkification must not mutate executable data.
             content_template = None

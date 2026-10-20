@@ -159,14 +159,24 @@ or too broad may themselves need repair.
 Keep the exact Case name even if its language differs. Write DAG descriptions in
 {self._output_language}.
 
-## Final response: choose exactly one memory SDK template
+## DAG structure example (content only, not the SDK reply)
+This staged example assumes a hypothetical Session with duplicate-update failures and a
+get_record_details tool. It shows how to resolve the target, inspect state and choose the
+relevant reminder, not a complete update workflow. Use only tool names and needs supported
+by the real Session; the example does not make get_record_details available to your agent.
+Existing answers and matching successful tool results can satisfy ask/call nodes immediately.
+```text
+{_EXPERIENCE_STAGED_DAG_EXAMPLE}
+```
+
+## Final response: create, update, or leave unchanged
 There are two Python layers: the outer reply is a write-only memory SDK program; the inner
 DAG source is stored in content. workflow/check/ask/call/choose/tell/any_of and node relation calls belong
 ONLY inside content strings or edit snippets, never at the top level of the reply.
 The Existing Experience message contains a system-provided read result. Its SDK binding is
 experience; it is already registered, not code to repeat. Never put sdk.read(), sdk.existing()
 or sdk.error() in the final reply.
-The templates below demonstrate syntax, not evidence. Use the DAG or edits justified by this
+The examples demonstrate syntax, not evidence. Use the DAG or edits justified by this
 Case's Trajectories; do not copy the example reminder into unrelated Cases.
 Either graph shape can be used for creation or updates. Choose the smallest graph supported by
 the actual correction. Do not add node types just to match an example.
@@ -186,33 +196,8 @@ sdk.commit()
 
 ### Update: when the prefetch supplies experience as an existing memory object
 Use experience directly. Do not redeclare it, create a replacement object, or invent another
-variable name. Follow the generic SDK string-editing rules: prefer edit()/drop() for local
-changes; use overwrite() only when most of the DAG needs rewriting. Copy each search/drop
-anchor verbatim from the existing source and ensure it occurs exactly once. The final content
-after applying all edits must still be one complete valid DAG.
-Example input: the existing content below is read-only context, not the SDK reply.
-```text
-{_EXPERIENCE_DAG_EXAMPLE}
-```
-A local edit of that source:
-```python
-experience.content.edit(
-    search='''whether the available records cover that scope.''',
-    replace='''whether the available records cover that scope, and which records are missing.''',
-)
-sdk.commit()
-```
-
-For a broad rewrite, supply the complete replacement DAG to overwrite().
-This staged example assumes a hypothetical Session with duplicate-update failures and a
-get_record_details tool. It shows how to resolve the target, inspect state and choose the
-relevant reminder, not a complete update workflow. Use only tool names and needs supported
-by the real Session; the example does not make get_record_details available to your agent.
-Existing answers and matching successful tool results can satisfy ask/call nodes immediately.
-```python
-experience.content.overwrite('''{_EXPERIENCE_STAGED_DAG_EXAMPLE}''')
-sdk.commit()
-```
+variable name. Follow the shared Edit instructions in the output contract, including method selection.
+The final content after applying edits must still be one complete valid DAG.
 
 For no change, return only `sdk.commit()`."""
 
@@ -289,14 +274,10 @@ For no change, return only `sdk.commit()`."""
         messages.append(
             {
                 "role": "user",
-                "content": "Use exactly one SDK template from the instructions: update the existing "
-                "experience following the generic SDK string-editing rules (prefer "
-                "experience.content.edit(...)/drop() for local changes; use "
-                "experience.content.overwrite(...) for broad rewrites), use a bare "
-                "sdk.create_experiences(...) only if the fixed target was not found, "
-                "or return sdk.commit() for no change. The final content after applying edits "
-                "must be one complete valid DAG. Do not return a bare DAG, "
-                "repeat the prefetch read call, or recreate the system-provided binding.",
+                "content": "Use the Create/Update rules above and the shared Edit instructions "
+                "for the prefetched target; return sdk.commit() for no change. "
+                "Output the complete SDK program. Do not return a bare DAG. "
+                "Do not repeat the prefetch read call or recreate the system-provided binding.",
             }
         )
         self._model_prefetch_messages = [*model_messages, messages[-1]]
@@ -348,17 +329,21 @@ def _trajectory_model_content(content: str) -> str:
 
 
 def _trajectory_comparison_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    # The shared Case DTO retains execution-oriented names for benchmark tasks.
+    # Expose domain-memory names here, not task-control input or internal metadata.
+    case_view = {}
+    for key, value in payload["case"].items():
+        if key == "metadata":
+            continue
+        if key == "task_signature":
+            key = "domain"
+        elif key == "input":
+            key, value = "description", value.get("summary", "")
+        case_view[key] = value
     messages = [
         {
             "role": "user",
-            "content": "# Case and Trajectory Batch\n\n"
-            + _metadata_block(
-                {
-                    "case": {
-                        key: value for key, value in payload["case"].items() if key != "metadata"
-                    }
-                }
-            ),
+            "content": "# Case and Trajectory Batch\n\n" + _metadata_block({"case": case_view}),
         }
     ]
     for group in ("successful_trajectories", "failed_trajectories", "other_trajectories"):

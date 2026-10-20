@@ -178,12 +178,12 @@ def _registry() -> MemoryTypeRegistry:
                     merge_op=MergeOp.IMMUTABLE,
                 ),
                 MemoryField(
-                    name="task_signature",
+                    name="domain",
                     field_type=FieldType.STRING,
                     merge_op=MergeOp.IMMUTABLE,
                 ),
                 MemoryField(
-                    name="input",
+                    name="description",
                     field_type=FieldType.STRING,
                     merge_op=MergeOp.IMMUTABLE,
                 ),
@@ -226,8 +226,8 @@ def _case_op(name: str) -> ResolvedOperation:
         uris=[f"viking://user/u/memories/cases/{name}.md"],
         memory_fields={
             "case_name": name,
-            "task_signature": f"{name} signature",
-            "input": '{"summary":"case input"}',
+            "domain": f"{name} signature",
+            "description": '{"summary":"case input"}',
             "rubric": '[{"id":"done","description":"done"}]',
         },
     )
@@ -573,7 +573,7 @@ async def test_cached_updater_restores_vectorization_for_tool_and_skill_memories
 
 
 @pytest.mark.asyncio
-async def test_streaming_memory_updater_fast_path_filters_links(monkeypatch):
+async def test_streaming_memory_updater_fast_path_discards_case_links(monkeypatch):
     fs = PathlockedInMemoryVikingFS(
         {
             "viking://user/u/memories/events/existing.md": (
@@ -634,8 +634,9 @@ async def test_streaming_memory_updater_fast_path_filters_links(monkeypatch):
     assert result.request_count == 1
     assert result.metadata["flush_reason"] == "append_only_fast_path"
     assert len(result.operations.upsert_operations) == 1
-    assert len(result.operations.resolved_links) == 1
-    assert result.operations.resolved_links[0].to_uri.endswith("/events/existing.md")
+    assert result.operations.resolved_links == []
+    assert MemoryFileUtils.read(fs.files[op1.uris[0]]).links == []
+    assert MemoryFileUtils.read(fs.files[link.to_uri]).backlinks == []
     assert result.apply_result.written_uris == [op1.uris[0]]
 
 
@@ -1009,8 +1010,8 @@ def test_enforce_merge_group_peer_enabled_false_keeps_self_scope():
         old_memory_file_content=None,
         memory_fields={
             "case_name": "case_note",
-            "task_signature": "case signature",
-            "input": "{}",
+            "domain": "case signature",
+            "description": "{}",
             "rubric": "[]",
             "peer_id": "conv-42",
         },

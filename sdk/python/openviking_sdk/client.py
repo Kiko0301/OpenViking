@@ -2055,7 +2055,13 @@ class AsyncHTTPClient:
         lease_seconds: int = 900,
         wait: bool = True,
     ) -> Dict[str, Any]:
-        """Learn Experiences, or return a task_id with wait=False for progress polling."""
+        """Consume selected Case inboxes; wait=False returns a task_id for polling.
+
+        trajectory_uris identify the Cases to wake, not a whitelist of files. The
+        server includes older pending work from those inboxes and unions the Case
+        scopes with case_names. With neither filter, consume current-user inboxes.
+        Failed records require retry_failed=True; completed records are not relearned.
+        """
         payload: Dict[str, Any] = {
             "max_cases": max_cases,
             "retry_failed": retry_failed,
@@ -3042,6 +3048,10 @@ class SyncHTTPClient:
         lease_seconds: int = 900,
         wait: bool = True,
     ) -> Dict[str, Any]:
+        """Consume Case inboxes selected by trigger URIs or canonical Case names.
+
+        Trigger URIs also include older pending work in the same Cases.
+        """
         return run_async(
             self._async_client.learn_experiences(
                 trajectory_uris=trajectory_uris,

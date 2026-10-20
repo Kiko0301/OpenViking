@@ -245,7 +245,7 @@ async def test_prefetch_reads_only_fixed_case_experience():
     assert all(set(message) == {"role", "content"} for message in result)
     batch = metadata(result[0])
     assert set(batch) == {"case"}
-    assert set(batch["case"]) == {"name", "task_signature", "input", "rubric"}
+    assert set(batch["case"]) == {"name", "domain", "description", "rubric"}
     assert batch["case"]["name"] == "case_a"
     assert "INTERNAL_CASE_SOURCE" not in text
     assert "DUPLICATE_CASE_INPUT" not in text
@@ -265,10 +265,11 @@ async def test_prefetch_reads_only_fixed_case_experience():
     assert "delivered_advice" in provider.instruction()
     assert provider.get_tools() == []
     final_instruction = result[-1]["content"]
-    assert "experience.content.edit(...)/drop() for local changes" in final_instruction
-    assert "experience.content.overwrite(...) for broad rewrites" in final_instruction
-    assert "final content after applying edits" in final_instruction
-    assert "sdk.create_experiences(...)" in final_instruction
+    assert "shared Edit instructions" in final_instruction
+    assert "prefetched target" in final_instruction
+    assert "experience.content.edit(" not in final_instruction
+    assert "experience.content.overwrite(" not in final_instruction
+    assert "one complete valid DAG" in provider.instruction()
     assert "sdk.commit() for no change" in final_instruction
     assert "Do not return a bare DAG" in final_instruction
 
@@ -346,7 +347,14 @@ def test_comparison_budget_excludes_internal_metadata_without_mutating_control_d
     messages = _trajectory_comparison_messages(payload)
 
     assert messages == baseline_messages
-    assert metadata(messages[0]) == {"case": visible_case}
+    assert metadata(messages[0]) == {
+        "case": {
+            "name": "case_a",
+            "domain": "Service domain",
+            "description": "Domain context",
+            "rubric": visible_case["rubric"],
+        }
+    }
     assert case == original_case
     assert payload["case"]["metadata"] == original_case["metadata"]
     assert payload["target_experience_uri"] == arguments["target_uri"]
@@ -470,7 +478,7 @@ async def test_prefetch_keeps_each_sessions_rules_with_its_own_dialogue():
     assert messages[0]["content"].startswith("# Case and Trajectory Batch\n")
     assert messages[1]["content"].startswith("# Existing Experience\n")
     assert "File not found" in messages[1]["content"]
-    assert messages[-1]["content"].startswith("Use exactly one SDK template")
+    assert messages[-1]["content"].startswith("Use the Create/Update rules")
     for message, trajectory in zip(messages[2:4], trajectories, strict=True):
         assert message["content"] == _trajectory_model_content(trajectory.content)
         assert "source_session_uri" not in metadata(message)

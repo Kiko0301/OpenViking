@@ -9,7 +9,35 @@ Merge rules:
 - link_type and description: latest write wins
 """
 
+from __future__ import annotations
+
 from typing import Any, Dict, List
+
+from openviking.core.namespace import classify_uri, is_session_uri
+
+
+def is_persisted_link(link: Dict[str, Any]) -> bool:
+    """Case membership comes from names/directories; only Trajectory→Session is stored."""
+    source, target = (str(link.get(key) or "") for key in ("from_uri", "to_uri"))
+    types = []
+    for uri in (source, target):
+        namespace = classify_uri(uri)
+        index = namespace.content_index
+        types.append(
+            namespace.parts[index + 1]
+            if namespace.is_memory and index is not None and len(namespace.parts) > index + 1
+            else None
+        )
+    source_type, target_type = types
+    if "cases" in types or target_type == "trajectories":
+        return False
+    if source_type == "trajectories":
+        return link.get("link_type") == "derived_from" and is_session_uri(target)
+    return not (
+        source_type == "experiences"
+        and link.get("link_type") == "derived_from"
+        and is_session_uri(target)
+    )
 
 
 def _dedup_key(link: Dict[str, Any]) -> str:

@@ -10,6 +10,8 @@ to the storage system.
 from __future__ import annotations
 
 import re
+import secrets
+import string
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
     from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 
 from openviking.core.context import ContextLevel
+from openviking.core.namespace import is_session_uri
 from openviking.message import Message
 from openviking.message.part import TextPart
 from openviking.server.identity import RequestContext
@@ -32,6 +35,7 @@ from openviking.session.memory.dataclass import (
 )
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_op import MergeOpFactory, PatchOp
+from openviking.session.memory.merge_op.link_merge import is_persisted_link
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.utils.memory_file_utils import (
     MemoryFileUtils,
@@ -116,7 +120,8 @@ async def write_stored_links(
     """Write StoredLinks to their endpoint files' links/backlinks fields.
 
     For each link: from_uri's ``links`` receives the forward link;
-    to_uri's ``backlinks`` receives the reverse reference.
+    to_uri's ``backlinks`` receives the reverse reference, except immutable Session archives.
+    Name/directory-derived training relations are discarded before either endpoint is touched.
     Files listed in skip_uris are skipped (caller handles them in the same write).
     Returns the endpoint URIs that were successfully rewritten.  Callers can
     use this to avoid reporting link-only edits for files that failed the
@@ -127,10 +132,12 @@ async def write_stored_links(
     skip = skip_uris or set()
     file_links: Dict[str, Dict[str, List[StoredLink]]] = {}
     for link in links:
+        if not is_persisted_link(link.model_dump()):
+            continue
         if link.from_uri not in skip:
             file_links.setdefault(link.from_uri, {"links": [], "backlinks": []})
             file_links[link.from_uri]["links"].append(link)
-        if link.to_uri not in skip:
+        if link.to_uri not in skip and not is_session_uri(link.to_uri):
             file_links.setdefault(link.to_uri, {"links": [], "backlinks": []})
             file_links[link.to_uri]["backlinks"].append(link)
 
@@ -231,6 +238,8 @@ class ExtractContext:
             self.messages = messages
             self.chunk_meta = chunk_meta
         self.page_id_map = PageIdMap()
+        self._random_id: str | None = None
+        self._session_timestamp: str | None = None
 
     @classmethod
     def _build_extraction_messages(
@@ -400,21 +409,31 @@ class ExtractContext:
                         continue
         return datetime.now().strftime("%Y%m%d%H%M%S")
 
-    def get_session_timestamp(self) -> str:
-        """取对话第一条消息的时间戳（YYYYMMDDHHMMSS），用于文件名唯一化。
+    def get_random_id(self, *, refresh: bool = False) -> str:
+        """Return one short filename ID per context; refresh only after a name collision."""
+        if self._random_id is None or refresh:
+            alphabet = string.ascii_lowercase + string.digits
+            self._random_id = "".join(secrets.choice(alphabet) for _ in range(6))
+        return self._random_id
 
-        Fallback 到 datetime.now() 以保证总是返回非空字符串。
-        """
+    def get_session_timestamp(self) -> str:
+        """Return the first valid message timestamp, fixed across repeated renders."""
         from datetime import datetime
 
+        if self._session_timestamp is not None:
+            return self._session_timestamp
         for msg in self.messages:
             created_at = getattr(msg, "created_at", None)
             if created_at:
                 try:
-                    return datetime.fromisoformat(created_at).strftime("%Y%m%d%H%M%S")
+                    self._session_timestamp = datetime.fromisoformat(created_at).strftime(
+                        "%Y%m%d%H%M%S"
+                    )
+                    return self._session_timestamp
                 except (ValueError, TypeError):
                     continue
-        return datetime.now().strftime("%Y%m%d%H%M%S")
+        self._session_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        return self._session_timestamp
 
     def get_event_content(
         self, ranges_str: str, summary: str | None, ratio_threshold: float = 0.2
@@ -828,6 +847,11 @@ async def prepare_memory_fields(
                     current,
                     updates[field.name],
                     require_exact=observed is not None and observed_value != current,
+                    path=f"{uri}#{field.name}",
+                )
+            elif isinstance(merge_op, PatchOp):
+                metadata[field.name] = await merge_op.apply(
+                    current, updates[field.name], path=f"{uri}#{field.name}"
                 )
             else:
                 metadata[field.name] = await merge_op.apply(current, updates[field.name])
@@ -928,6 +952,7 @@ class MemoryUpdater:
                 ctx,
                 uri_memory_type_map={uri: memory_type} if memory_type else {},
                 ingest_options=ingest_options,
+                strict=strict,
             )
             return attempted > 0
         except Exception:
@@ -957,6 +982,9 @@ class MemoryUpdater:
         search_tags_by_uri: Dict[str, List[str]] = None,
     ) -> MemoryUpdateResult:
         validate_operation_targets(operations)
+        operations.resolved_links = [
+            link for link in operations.resolved_links if is_persisted_link(link.model_dump())
+        ]
         viking_fs = self._get_viking_fs()
         lease = self._transaction_handle
         owns_lease = False
@@ -1551,6 +1579,7 @@ class MemoryUpdater:
         uri_memory_type_map: Dict[str, str] = None,
         search_tags_by_uri: Dict[str, List[str]] = None,
         ingest_options: Any = None,
+        strict: bool = False,
     ) -> int:
         """Vectorize written and edited memory files.
 
@@ -1684,10 +1713,16 @@ class MemoryUpdater:
                             embedding_msg.id,
                             "embedding enqueue returned false",
                         )
+                    if not enqueued and strict:
+                        raise RuntimeError(f"Embedding enqueue returned false for {uri}")
                     logger.debug(f"Enqueued memory for vectorization: {uri}")
+                elif strict:
+                    raise ValueError(f"No embedding input for {uri}")
 
             except Exception as e:
                 tracer.error(f"Failed to vectorize memory {uri}: {e}")
+                if strict:
+                    raise
         return attempted_count
 
     @staticmethod

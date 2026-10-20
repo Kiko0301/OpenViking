@@ -76,18 +76,17 @@ class FakeVikingFS:
         return f"/local/{account_id}/{uri.removeprefix('viking://')}"
 
     async def ls(self, uri: str, output: str = "original", ctx=None, **kwargs):
-        del kwargs
         assert output == "original"
         prefix = uri.rstrip("/") + "/"
-        return [
-            {
-                "name": path.removeprefix(prefix),
-                "uri": path,
-                "isDir": False,
-            }
-            for path in sorted(self.files)
-            if path.startswith(prefix) and "/" not in path.removeprefix(prefix)
-        ]
+        entries = {}
+        for path in sorted(self.files):
+            if not path.startswith(prefix):
+                continue
+            rest = path.removeprefix(prefix)
+            name, separator, _ = rest.partition("/")
+            entries[name] = {"name": name, "uri": prefix + name, "isDir": bool(separator)}
+        offset = kwargs.get("offset", 0)
+        return list(entries.values())[offset : offset + kwargs.get("node_limit", 1000)]
 
     async def read_file(self, uri: str, ctx=None):
         return self.files[uri]
@@ -713,7 +712,7 @@ async def test_fixed_case_merge_materializes_sdk_edits_against_latest_source(met
         "edit": (
             f"prefetched_memory_1.content.edit(search={obsolete_block!r}, replace='')\nsdk.commit()"
         ),
-        "drop": f"prefetched_memory_1.content.drop(text={obsolete_line!r})\nsdk.commit()",
+        "drop": f"prefetched_memory_1.content.drop(text={obsolete_block!r})\nsdk.commit()",
         "overwrite": f"prefetched_memory_1.content.overwrite({expected!r})\nsdk.commit()",
         "noop": "sdk.commit()",
     }
@@ -817,13 +816,9 @@ async def test_fixed_case_merge_groups_sessions_and_rebases_on_latest_policy(mon
     assert {link.to_uri for link in result.items[0].links} == set(source_uris[:2])
     assert {link.to_uri for link in result.items[1].links} == {source_uris[2]}
     assert {
-        source["source_session_uri"]
-        for source in result.items[0].metadata["patch_metadata"]["source_sessions"]
-    } == {"viking://session/old/archives/1", *source_uris[:2]}
-    assert all(
-        "feedback" not in source
-        for source in result.items[0].metadata["patch_metadata"]["source_sessions"]
-    )
+        source["source_session_uri"] for source in result.items[0].metadata["source_sessions"]
+    } == set(source_uris[:2])
+    assert all("feedback" not in source for source in result.items[0].metadata["source_sessions"])
 
 
 @pytest.mark.asyncio
@@ -881,7 +876,7 @@ async def test_fixed_case_merge_rejects_target_changes(monkeypatch, violation):
 
 
 @pytest.mark.asyncio
-async def test_policy_updater_preserves_source_archive_and_persists_replay_metadata():
+async def test_policy_updater_preserves_source_archive_and_keeps_session_metadata_transient():
     from openviking.session.train import PolicyPlanItem
 
     source_uri = "viking://session/s/archives/1"
@@ -894,7 +889,10 @@ async def test_policy_updater_preserves_source_archive_and_persists_replay_metad
             uri=current.uri,
             content=current.content,
             memory_type="experiences",
-            extra_fields={"experience_name": current.name},
+            extra_fields={
+                "experience_name": current.name,
+                "source_sessions": [{"source_session_uri": "old-session", "passed": True}],
+            },
         )
     )
     item = PolicyPlanItem(
@@ -905,11 +903,7 @@ async def test_policy_updater_preserves_source_archive_and_persists_replay_metad
         before_content=current.content,
         after_content='dag = workflow("updated")\nstep = tell("updated content")',
         links=[StoredLink(from_uri=current.uri, to_uri=source_uri, link_type="derived_from")],
-        metadata={
-            "patch_metadata": {
-                "source_sessions": [{"source_session_uri": source_uri, "passed": True}]
-            }
-        },
+        metadata={"source_sessions": [{"source_session_uri": source_uri, "passed": True}]},
     )
     result = await MemoryFilePolicyUpdater(viking_fs=fs).apply(
         PolicyUpdatePlan(items=[item]),
@@ -919,8 +913,10 @@ async def test_policy_updater_preserves_source_archive_and_persists_replay_metad
     )
     assert result.errors == []
     stored = MemoryFileUtils.read(fs.files[current.uri], uri=current.uri)
-    assert stored.extra_fields["source_sessions"][0]["passed"] is True
-    assert stored.links[0]["to_uri"] == source_uri
+    assert "source_sessions" not in stored.extra_fields
+    assert item.metadata["source_sessions"][0]["passed"] is True
+    assert stored.links == []
+    assert item.links[0].to_uri == source_uri
     assert fs.files[archive_uri] == source
     assert source_uri not in fs.files
     assert fs._async_agfs.acquire_calls == []

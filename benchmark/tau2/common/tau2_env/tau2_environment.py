@@ -20,6 +20,7 @@ logger = get_logger(__name__)
 
 DEFAULT_TAU2_USER_LLM = "openai/doubao-seed-2-0-code-preview-260215"
 _TAU2_OUTPUT_MAX_ATTEMPTS = 3
+_TAU2_INITIAL_OUTPUT_MAX_ATTEMPTS = 2
 _TAU2_USER_OUTPUT_RULE = (
     "Output either ordinary customer text without control markers, or exactly one of "
     "###STOP###, ###TRANSFER###, ###OUT-OF-SCOPE###. Never combine a marker with text "
@@ -32,8 +33,16 @@ _TAU2_USER_OUTPUT_CORRECTION = (
 )
 
 
-class Tau2UserSimulatorFormatError(ValueError):
+class Tau2UserSimulatorError(ValueError):
+    """A known simulator output failure, isolated from other rollouts."""
+
+
+class Tau2UserSimulatorFormatError(Tau2UserSimulatorError):
     """The user simulator exhausted its current-turn output-format budget."""
+
+
+class Tau2UserSimulatorInitializationError(Tau2UserSimulatorError):
+    """The simulator failed to produce an opening message after one retry."""
 
 
 _GYM_INITIAL_OBSERVATION_TIMEOUT_SECONDS = 120.0
@@ -97,6 +106,15 @@ def _wrap_tau2_generate_with_rate_limit_retry(generate: Callable[..., Any]) -> C
     @wraps(generate)
     def generate_with_rate_limit_retry(*args: Any, **kwargs: Any) -> Any:
         user_call = kwargs.get("call_name") == "user_simulator_response"
+        # Tau2 flips customer replies to assistant messages in the simulator's input.
+        # The default agent greeting is a user message; system prompts alone are not
+        # sufficient to identify startup. Existing conversation history must be respected.
+        initial_user_turn = user_call and not any(
+            message.role == "assistant" for message in kwargs["messages"]
+        )
+        max_outputs = (
+            _TAU2_INITIAL_OUTPUT_MAX_ATTEMPTS if initial_user_turn else _TAU2_OUTPUT_MAX_ATTEMPTS
+        )
         if user_call:
             from tau2.data_model.message import SystemMessage
 
@@ -139,13 +157,48 @@ def _wrap_tau2_generate_with_rate_limit_retry(generate: Callable[..., Any]) -> C
                         SystemMessage(role="system", content=_TAU2_USER_OUTPUT_CORRECTION),
                     ],
                 }
+            if initial_user_turn:
+                from tau2.user.user_simulator import OUT_OF_SCOPE, STOP, TRANSFER
+
+                text = (response.content or "").strip()
+                if not response.tool_calls and (
+                    text in (STOP, TRANSFER, OUT_OF_SCOPE)
+                    or (not text and not getattr(response, "audio_content", None))
+                ):
+                    diagnostics = {
+                        "reason": "initial_user_terminated"
+                        if text
+                        else "empty_initial_user_message",
+                        "stop_marker": text or None,
+                    }
+                if diagnostics is not None:
+                    kwargs = {
+                        **kwargs,
+                        "messages": [
+                            *user_messages,
+                            SystemMessage(
+                                role="system",
+                                content=(
+                                    "No customer request has been delivered yet. Begin the "
+                                    "conversation using the supplied scenario, without inventing "
+                                    "missing facts. A request the agent may reject is still a "
+                                    "request to make; do not end the simulation before asking it."
+                                ),
+                            ),
+                        ],
+                    }
             if diagnostics is None:
                 return response
             invalid_outputs += 1
             detail = json.dumps(diagnostics, ensure_ascii=False)
             tracer.info(f"tau2 invalid model output attempt={invalid_outputs} diagnostics={detail}")
-            if invalid_outputs >= _TAU2_OUTPUT_MAX_ATTEMPTS:
-                if last_format_error is not None:
+            if invalid_outputs >= max_outputs:
+                if initial_user_turn:
+                    error = Tau2UserSimulatorInitializationError(
+                        "tau2 user simulator produced no valid opening message "
+                        f"after {invalid_outputs} attempts; diagnostics={detail}"
+                    )
+                elif last_format_error is not None:
                     error = Tau2UserSimulatorFormatError(
                         "tau2 user simulator returned invalid stop format "
                         f"after {invalid_outputs} attempts; "
@@ -158,7 +211,7 @@ def _wrap_tau2_generate_with_rate_limit_retry(generate: Callable[..., Any]) -> C
                     )
                 tracer.error(str(error), e=error, console=False)
                 raise error
-            if format_error is None:
+            if format_error is None and not initial_user_turn:
                 time.sleep(_tau2_rate_limit_retry_delay(invalid_outputs))
 
     generate_with_rate_limit_retry._openviking_tau2_rate_limit_retry = True
@@ -415,8 +468,9 @@ class _GymTau2BenchEnv:
             user_query = _wait_for_gym_initial_observation(self.env, user_query)
         except RuntimeError as exc:
             details = json.dumps(_gym_initial_observation_diagnostics(self.env), ensure_ascii=False)
-            if (self.execution_error or {}).get("type") == Tau2UserSimulatorFormatError.__name__:
-                raise Tau2UserSimulatorFormatError(f"{exc}; diagnostics={details}") from exc
+            for error_type in (Tau2UserSimulatorFormatError, Tau2UserSimulatorInitializationError):
+                if (self.execution_error or {}).get("type") == error_type.__name__:
+                    raise error_type(f"{exc}; diagnostics={details}") from exc
             raise RuntimeError(f"{exc}; diagnostics={details}") from exc
         self.user_query = user_query.lstrip("user: ")
         self.task = info_dict["task"]

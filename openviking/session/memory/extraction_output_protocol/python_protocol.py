@@ -19,6 +19,7 @@ from openviking.session.memory.extraction_output_protocol.base import (
     ExtractionOutputProtocol,
     ExtractionOutputProtocolError,
 )
+from openviking.session.memory.extraction_output_protocol.edit_format import EDIT_TOOL_DESCRIPTION
 from openviking.session.memory.merge_op import (
     DeleteBlock,
     FieldType,
@@ -88,12 +89,11 @@ _NESTED_STRING_GUIDANCE = (
     "different valid outer delimiter, escape that delimiter instead.\n"
     "Escape only the string contents, not the enclosing opening and closing delimiters. "
     "Escapes are decoded once by the outer Python string, preserving quotes, backslashes and "
-    "newlines. Never reformat existing source or copied search/drop anchors to enforce this "
-    "convention; their decoded contents must remain verbatim.\n"
-    "Syntax-only example (use an actual existing-object binding instead of obj, and your own content):\n"
+    "newlines. Do not rewrite embedded content to enforce this convention.\n"
+    "Syntax-only example (string value, not a write operation):\n"
     "```python\n"
-    "obj.content.overwrite('''note = \"\"\"first line\n"
-    "second line\"\"\"''')\n"
+    "content_text = '''note = \"\"\"first line\n"
+    "second line\"\"\"'''\n"
     "```"
 )
 
@@ -126,18 +126,6 @@ _CONTRACT_PREAMBLE = (
     "Existing objects shown by the system may use obj.update(field=value, ...) for "
     "scalar/immutable fields according to their schema merge rules, obj.delete(replacement=None),",
     "and, when links are enabled, obj.link(target, link_type='related_to', weight=0.5, match_text=None, description='').",
-    "To change an existing string field, edit it through the object's field attribute. Use the "
-    "real field name (e.g. content), NOT the literal word 'field':",
-    "  - obj.content.overwrite(new_value): replace the whole field with a complete new string. "
-    "This is not an append or merge. All old content omitted from the new string is removed "
-    "from this field. Keep all still-valid existing constraints.",
-    "  - obj.content.edit(search=..., replace=...): replace one exact snippet in place.",
-    "  - obj.content.drop(text=...): delete one exact snippet in place.",
-    "edit()/drop() may be chained, e.g. obj.content.edit(search='''a''', replace='''b''').drop(text='''c'''); do not mix them with .overwrite() in one chain.",
-    "A field attribute is a write handle only; you cannot read it as a string or call str methods on it.",
-    "Each search= (and drop text=) MUST be copied verbatim from the current field value shown in the object's sdk.existing(...) binding, and must occur exactly once. If the snippet appears more than once, include an adjacent unique line just before or after it so the match is unique. Never use text from the conversation or the new facts you intend to add as a search anchor; that text is not in the current content and the edit will fail.",
-    "edit()/drop() only work on an existing memory's string field; new memories from create/set must be given complete field values.",
-    "For existing memories, prefer the smallest unique edit()/drop(). Do not rewrite the entire field just to add or change a few facts; large full-content rewrites are more likely to be truncated or malformed. Use obj.content.overwrite() only when most of the content changes.",
     "Use a triple-single-quoted string ('''...''') for every outer SDK natural-language argument "
     "(content, summary, goal, and every search=/replace=/text= snippet), even one-liners. "
     "Use plain strings by default; use f'''...''' only when interpolation is needed, escaping "
@@ -158,6 +146,32 @@ _CONTRACT_PREAMBLE = (
     "",
     "Available write methods for this extraction:",
 )
+
+_FIELD_WRITE_METHODS = (
+    "",
+    "## Existing string field methods",
+    "Use the real field name (e.g. content), NOT the literal word 'field'. "
+    "A field attribute is a write handle only; it cannot be read as a string.",
+    "### obj.field.edit(search=..., replace=...)",
+    EDIT_TOOL_DESCRIPTION,
+    "Local replacement example (use an actual existing-object binding instead of obj):\n"
+    "```python\n"
+    '# Existing content: "Editor: Vim\\nTheme: dark"\n'
+    "# Change only the editor; keep the theme.\n"
+    "obj.content.edit(search='''Editor: Vim''', replace='''Editor: Emacs''')\n"
+    "```",
+    "### obj.field.drop(text=...)",
+    "Replace the selected text with an empty string. Include its newline to remove a whole line.",
+    "### obj.field.overwrite(new_value)",
+    "Use overwrite only for complete field rewrites. "
+    "Replace the whole field with a complete new string. This is not an append or merge. "
+    "All old content omitted from the new string is removed from this field. "
+    "Keep all still-valid existing constraints.",
+    "edit()/drop() only work on existing string fields that support partial editing; "
+    "new memories from create/set must be given complete field values. "
+    "edit()/drop() may be chained; do not mix them with overwrite() in one chain.",
+)
+
 
 _LINK_RULES = (
     "",
@@ -276,6 +290,7 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         lines = list(_CONTRACT_PREAMBLE)
         for schema in context.schemas:
             lines.extend(self._render_schema_contract(context, schema))
+        lines.extend(_FIELD_WRITE_METHODS)
         if (
             "selected_case_ids" in context.operations_model.model_fields
             and "case_sources" not in context.operations_model.model_fields
@@ -501,17 +516,11 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
     def render_patch_repair(self, patch_errors: list[dict[str, Any]]) -> str:
         details = json.dumps(patch_errors, ensure_ascii=False, indent=2)
         return (
-            "An obj.field.edit()/drop() change could not be applied to the target memory object. "
-            "The search= (and drop text=) must be copied verbatim from the current field value shown "
-            "in that object's sdk.existing(...) binding, and must occur exactly once. If it occurs "
-            "more than once, include enough contiguous surrounding context to make it unique. Do not "
-            "use text from the conversation or the new facts you intend to add as a search anchor. "
-            "If you copy from numbered read output, exclude the `line_number<TAB>` prefix. If the "
-            "change is too broad for a clean snippet, use obj.field.overwrite(complete_new_value) instead, "
-            "preserving all still-valid existing content. "
-            "Regenerate the complete restricted Python SDK program, including previous successful "
-            "operations and fixed failed operations. Output only Python code."
-            "\n\nFailed edits:\n" + details
+            "An obj.field.edit()/drop() change could not be applied to its target field. "
+            "Follow the Edit instructions in the initial output contract. "
+            "Regenerate the complete SDK program, preserving other intended operations and "
+            "source associations. Do not move the edit to another object merely because "
+            "its text matches.\n\nFailed edits:\n" + details
         )
 
     def render_resolution_repair(self, issues: list[dict[str, Any]]) -> str:

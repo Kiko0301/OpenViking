@@ -251,9 +251,8 @@ class PatchMergeContextProvider(SessionExtractContextProvider):
 The only target is {target.target_uri}; keep the exact name {target.target_name!r}.
 The prefetched file is the latest stored version. Proposals can be based on older
 versions: apply their intended changes to the latest file while preserving unrelated
-changes and successful paths. Follow the generic SDK string-editing rules: prefer edit()/drop()
-for local changes; use overwrite() only when most of the DAG needs rewriting. Copy edit/drop
-anchors verbatim from the latest source, not a stale proposal. The final content after applying
+changes and successful paths. Follow the shared Edit instructions in the output contract,
+using the latest source, not a stale proposal. The final content after applying
 edits must be one complete valid DAG. Return no operations if the proposals add no useful change.
 Never rename, delete, supersede, create another Experience, or merge another Case. Output restricted Python memory SDK code only.
 Keep the fixed name; write natural-language DAG descriptions in {output_language}."""

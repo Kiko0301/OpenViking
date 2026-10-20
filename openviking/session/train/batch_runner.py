@@ -694,9 +694,9 @@ async def _load_or_run_baseline_eval(
             additional_lifecycle_hooks=additional_lifecycle_hooks,
         ),
     )
-    _write_baseline_cache(cache_path, baseline_result.metadata["report"], config=config)
+    written = _write_baseline_cache(cache_path, baseline_result.metadata["report"], config=config)
     await event_recorder.record(
-        "baseline_cache_write",
+        "baseline_cache_write" if written else "baseline_cache_skip_execution_error",
         stage="baseline_cache",
         baseline_cache_path=str(cache_path),
         eval_split=config.eval_split,
@@ -709,7 +709,9 @@ def _write_baseline_cache(
     report: dict[str, Any],
     *,
     config: BatchTrainEvalConfig,
-) -> None:
+) -> bool:
+    if report.get("execution_error_count"):
+        return False
     payload = {
         "cache_version": 1,
         "cache_key": _baseline_cache_key(config),
@@ -725,6 +727,7 @@ def _write_baseline_cache(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
 
 
 def _load_baseline_cache(path: Path) -> dict[str, Any] | None:
@@ -736,6 +739,8 @@ def _load_baseline_cache(path: Path) -> dict[str, Any] | None:
     report = payload.get("report")
     if not isinstance(report, dict):
         raise ValueError(f"baseline cache file has no report: {path}")
+    if report.get("execution_error_count"):
+        return None
     return {
         **report,
         "baseline_cache_hit": True,
@@ -961,9 +966,12 @@ class CachedEpochZeroTrainRolloutExecutor:
         rollout_data = payload.get("rollout")
         if not isinstance(rollout_data, dict):
             raise ValueError(f"train rollout cache file has no rollout: {path}")
-        return rollout_from_dict(rollout_data)
+        rollout = rollout_from_dict(rollout_data)
+        return None if rollout.metadata.get("execution_error") else rollout
 
     def _write(self, case: Case, rollout: Rollout) -> None:
+        if rollout.metadata.get("execution_error"):
+            return
         path = self._path(case)
         payload = {
             "cache_version": 1,

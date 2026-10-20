@@ -56,8 +56,26 @@ Task B -> its Session, task_spec and evaluation -> Trajectory B --+
 
 Each Trajectory stores the supplied concrete `task_spec` (input and rubric included) as server-owned
 metadata, alongside its own outcome/evaluation and source archive. It is null for Sessions without
-a task envelope; their concrete facts remain in the Session/Trajectory. Case `input` remains
-plain-text domain context. Case `rubric` is a mutable JSON list of `{id, description}` criteria
+a task envelope; their concrete facts remain in the Session/Trajectory. Persisted Case
+`domain` is a one-sentence business-domain/service scope; `description` is a short
+introduction with stable background, not a copy of policy/tool manuals. Both are PATCH
+string fields supporting partial `edit()`/`drop()` edits or complete `overwrite` replacements;
+`case_name` remains immutable. The Case instructions allow evidence-backed refinements
+within the same business domain, never repurposing a Case into another domain. This
+semantic boundary is expressed in the instructions, not a static domain classifier.
+Display, embeddings and the Experience model's Case header use these names.
+Benchmark CaseSpec `task_signature` and `input` remain unchanged execution/control data.
+The shared internal Case DTO maps domain scope to `task_signature` and the description
+to `input["summary"]`; those internal names are not exposed in the domain-memory header.
+
+This is a schema rename without old-name aliases. Existing Case records and persisted
+account templates must be explicitly migrated (`task_signature` → `domain`,
+`input` → `description`) before reuse; the interim name `domain_scope` also becomes
+`domain`. Remove the old top-level fields. The loader rejects
+old-named Case records rather than silently losing their scope/description. No existing
+online data is migrated automatically by this code change.
+
+Case `rubric` is a mutable JSON list of `{id, description}` criteria
 (stored in the schema's string field with `patch` merge semantics). The Case extractor maintains
 stable IDs from supplied rules, requirements and feedback without storing task-specific answers.
 The normal field gate validates the complete list after patch application; unchanged Cases can
@@ -111,38 +129,37 @@ interpreted as business success. Relevant exact amounts and IDs stay in the step
 Experience generalizes facts into conditional reminders.
 
 ```text
-Session + Case + OutcomeEvaluation
-  -> Phase 1: AgentTrajectoryContextProvider + ExtractLoop
-  -> model emits sdk.create_trajectories(context_rules=..., steps=..., ...) + sdk.commit()
-  -> server validates and normalizes the fixed add-only operation
+Session archive + all associated Cases + OutcomeEvaluation
+  -> Phase 1: one joint AgentTrajectoryContextProvider + ExtractLoop
+  -> model emits one sdk.create_trajectories(case_name=..., context_rules=..., steps=..., ...) per Case
+  -> sdk.commit() ends the single reply
+  -> server validates exactly one operation per supplied Case before any write
   -> MemoryUpdater applies content, metadata and provenance links
-  -> immutable Trajectory under trajectories/{case_name}/{archive_identity_hash}.md
+  -> immutable Trajectory under trajectories/{case_name}/{YYYY}/{MM}/{DD}/{S|F|U}_{short_id}.md
   -> mark Trajectory experience_update.state=pending
   -> Session commit completes and returns trajectory_uris
   -> Phase 2: POST /api/v1/agent-evolution/experiences/learn
   -> claim pending Trajectories under per-record locks and group them by canonical Case
-  -> if this Case's current batch has no success, add at most its latest historical success
+  -> for each non-success Trajectory, ANN-retrieve at most one similar processed success in the same Case
   -> ExperienceGradientEstimator: compare evidence and emit one complete DAG per Case/batch
-  -> optional proposal Gate
   -> deterministic plan construction + existing locked policy apply
   -> mark each claimed Trajectory applied, no_op, or failed
 ```
 
-The stable identity is a hash of Case name and archive URI, so concurrent retries cannot create
-multiple records or overwrite the first persisted observation. Lookup is by exact Case directory,
-not semantic search. Trajectories do not participate in online Experience autorecall. Each
-Trajectory links to its immutable source Session and canonical Case; each Experience links to the
-Trajectories used to synthesize it. A compact source-session index supports Gate lookup, but the
-link chain is the provenance source of truth. Commit diffs expose newly persisted Trajectories,
-including when DAG synthesis returns no-op. Old procedure-style Trajectories are not migrated.
+Each extraction creates a new observation per associated Case, including repeated archives.
+File-level creation guards prevent collisions from overwriting existing records. Trajectories
+are not online Experience autorecall candidates. Each Trajectory retains its immutable source
+Session link; compact source-session metadata is kept for attribution, not as a stored success
+index. Commit diffs expose newly persisted Trajectories, including when later DAG synthesis
+returns no-op. Old procedure-style Trajectories are not migrated.
 
 Step preprocessing uses up to 16 KiB per item within a 64,000-character conversation budget with
 explicit omission notices. System messages are supplied separately for rule selection, not counted
 as steps. Step summaries are requested to stay within 800 characters each; this is prompt guidance,
-not a runtime content check. The existing ExtractLoop still enforces one Trajectory operation and
-the fixed memory type and storage target. Persistence, pending scans, historical lookup and
-Experience inputs no longer decode a mandatory heading/step format. Optional Gate evidence uses
-bounded text chunks without interpreting them as steps or changing the stored content. Runtime execution and external
+not a runtime content check. ExtractLoop enforces exactly one Trajectory per supplied Case and
+the fixed memory type and server-owned storage targets. Persistence, pending scans, historical lookup and
+Experience inputs no longer decode a mandatory heading/step format. Source evidence uses bounded
+text chunks without interpreting them as steps or changing the stored content. Runtime execution and external
 evaluation remain server-owned metadata rather than model-generated claims. Synthesis sends the
 complete combined `content` plus compact evaluation and execution metadata, so each run keeps its
 own rules rather than inheriting another run's policy. Each selected Trajectory occupies its own
@@ -159,13 +176,14 @@ prefetch pair is sent to the model on this Experience path; ordinary memory extr
 native tool messages. Instruction normalization does not rewrite quoted Trajectory evidence.
 The 240,000-character comparison budget counts the rendered Case/Trajectory message text,
 including metadata and headings (not the separately supplied existing Experience or system
-instructions). It always retains current Trajectories. If any current Trajectory succeeded,
-historical lookup is skipped entirely. Otherwise, at most the latest eligible same-Case historical
-success is selected and admitted while space remains; historical failures, partial, unfinished
-and unknown outcomes are never used as witnesses. If no historical success exists, the batch
-proceeds without one. This check applies to each trainer chunk. A chunk that still exceeds the
-budget fails rather than silently truncating or dropping Trajectories; count-based batching is not
-a guarantee that arbitrarily long records fit the character budget.
+instructions). It always retains current Trajectories. Each non-success current Trajectory
+may add one ANN-ranked same-Case historical success; an all-success chunk makes no historical
+query. The selected records are deduplicated by URI and admitted while space remains. Historical
+failures, partial, unfinished and unknown outcomes are never used as witnesses. No eligible
+ANN hit means the batch proceeds without an extra witness, not a directory-scan fallback.
+This check applies to each trainer chunk. A chunk that still exceeds the budget fails rather
+than silently truncating or dropping current Trajectories; count-based batching does not
+imply that arbitrarily long records fit the character budget.
 
 The comparison prompt distinguishes successful runs, failed runs and unknown/partial runs. Without
 a successful run it preserves passed subcriteria and can return no-op. A grading literal alone is
@@ -173,14 +191,14 @@ not a universal rule; conflicts with user intent are retained as uncertainties. 
 not proof of a whole SOP. The update focuses on evidenced differences in scope, timing or decisions.
 Concrete entity IDs from a Session remain Trajectory evidence and must not appear in generated
 reminders. The proposal boundary deterministically turns a candidate that copies such an ID into a
-no-op; amounts and policy thresholds are not treated as IDs by this check.
+repairable extraction rejection; amounts and policy thresholds are not treated as IDs by this check.
 Compact evaluator criteria are stored with each Trajectory as evidence for synthesis. Concrete
 runtime results such as calculated totals remain evidence rather than literal requirements in the
 Experience; the synthesized reminder should preserve the grounded scope, timing, and decision rule.
 
 Concurrent Sessions still extract and persist Trajectories independently, but Session commit no
-longer generates an Experience. The Phase 2 caller provides an explicit batch of Trajectory URIs,
-or asks the server to scan pending records. Each Case keeps one fixed Experience target, which
+longer generates an Experience. The Phase 2 caller provides trigger Trajectory URIs or canonical Case names. The server
+resolves the affected Cases and consumes their inboxes, including older pending records. Each Case keeps one fixed Experience target, which
 may be updated by multiple consecutive chunks in the same invocation.
 `pending -> processing -> applied|no_op|failed` is server-owned metadata; processing leases permit
 recovery after interruption. The benchmark invokes Phase 2 once after all commit tasks in its
@@ -195,8 +213,7 @@ Only that chunk's source Sessions and Trajectories are finalized; later failures
 `applied`/`no_op` states and report already completed Experience writes. Queued Cases
 remain pending until admitted, and overlapping learning invocations remain serialized. On
 cancellation, active workers are joined; unfinished processing records retain their expiring
-leases for recovery. Optional proposal Gate configuration is retained and defaults to
-disabled. Case links use the same policy lock boundary when their backlinks are updated. The
+leases for recovery. Relation writes retain the same policy lock boundary. The
 coordinator is process-local in this version: per-record file locks protect writes, but distributed
 claim arbitration across multiple OpenViking server instances is not supported.
 
@@ -265,14 +282,14 @@ evaluation. The recorded task ID permits subsequent status queries. Service shut
 joins in-process learning workers before closing storage. This is not an automatic restart/resume
 scheduler.
 
-The explicit Phase 2 endpoint accepts exact Trajectory URIs, Case names, or both:
+The Phase 2 endpoint accepts trigger Trajectory URIs, canonical Case names, or both:
 
 ```http
 POST /api/v1/agent-evolution/experiences/learn
 Content-Type: application/json
 
 {
-  "trajectory_uris": ["viking://user/default/memories/trajectories/case/hash.md"],
+  "trajectory_uris": ["viking://user/default/memories/trajectories/case/inbox/20261020_F_abcdef.md"],
   "case_names": ["case"],
   "retry_failed": false,
   "max_cases": 100,
@@ -280,10 +297,16 @@ Content-Type: application/json
 }
 ```
 
-When both filters are supplied, the server takes their union so a caller can pass the exact
-Trajectories it observed while also recovering pending records from an interrupted commit. Calls
-are idempotent: `applied` and `no_op` records are skipped; expired `processing` leases may be
-reclaimed; `failed` records require `retry_failed=true`. Historical records without the
+Trajectory URIs select Case scopes, not a whitelist of files. The server reads each notification's
+actual `case_name` (rather than guessing from a portable directory or benchmark task name), validates
+that it belongs to that Case, and unions those Cases with `case_names`. All eligible inbox records
+in those Cases participate, ordered within each Case by persisted `created_at` and URI, so new notifications do not
+jump ahead of old pending work. No unrelated Case or archival directory is scanned. An archived
+notification can still wake its Case's inbox through a point read of its deterministic final URI.
+An explicitly unfiltered service request discovers all Case inboxes for the current user; the
+benchmark does not submit such a request when an epoch has no successful Trajectory notifications.
+Already learned observations are not relearned: `applied` and `no_op` records only finish any pending
+archival; expired `processing` leases may be reclaimed; `failed` requires `retry_failed=true`. Historical records without the
 server-owned `experience_update` state are never re-consumed as pending work. Only records marked
 with the current `ordered_markdown_v3` format participate in comparison; older formats are ignored
 and are not automatically migrated.
@@ -302,7 +325,7 @@ are not displayed. Overall `evaluation.passed` and `evaluation.score` also stay 
 the body retains only that part under `evaluation`; otherwise it omits the whole block.
 The external outcome/evaluation and fixed identity are server-owned;
 criterion judgments and effects are model-produced, validated and frozen with their definitions. Metadata remains available for outcome selection,
-optional Gate inputs, attribution and lifecycle management; mutable `experience_update` state
+source validation, attribution and lifecycle management; mutable `experience_update` state
 is excluded from the body. Lifecycle writes and retries preserve the body without re-rendering.
 Experience synthesis sends each Trajectory as one user message, retaining the Session Context
 and dialogue verbatim while compacting its generated header: identity/task metadata and
@@ -395,15 +418,19 @@ Experience `content` uses `merge_op: patch`: local `edit`/`drop` operations and 
 `overwrite` replacements are supported. Synthesis and fixed-target merge prompts follow the generic
 SDK policy: prefer the smallest unique local edit; use overwrite only for broad rewrites. Create
 still requires complete source. The persisted result, not each edit snippet, must be a complete DAG.
-Both JSON and Python edits reuse the shared exact-first, fuzzy-fallback patch matcher. Validated
-fields apply blocks sequentially and reject the whole candidate if any block fails, rather than
-saving a partial update. Preview and locked persistence use the same merge-and-validation path.
-If the field changed after it was read, anchors must still match exactly; fuzzy matching must not
-silently overwrite concurrent changes. Unrelated changes with intact exact anchors remain mergeable.
-Prompt examples show a simple check/tell graph as read-only input for a local edit and a complete
-ask/call/choose/tell graph for overwrite. Create uses a compact call form; no-op is a one-line
-instruction. Generated SDK text arguments use outer `'''...'''` strings; embedded DAG text literals
-use `"""..."""`, which need no outer-layer quote escaping. Plain strings are the default; use
+Both JSON and Python edits use the Pi engine pinned in `memory-edit-prompt.md`:
+exact lookup followed by finite Unicode/whitespace normalization, not similarity scoring.
+All blocks in a field batch match the same original content; overlapping ranges or any failed
+block reject the batch before writing. On normalized matches, Pi's touched-line overlay can
+also normalize unselected characters on those lines; unchanged lines are retained. The final
+DAG still passes the type-owned content gate. Preview and locked persistence share this engine.
+If the field changed after it was read, anchors must still match exactly to protect concurrent
+changes. Separate resolved operations retain the store's existing staged-view semantics.
+The generic SDK contract owns the local-edit example and method selection rule. Experience
+examples show a simple check/tell graph in a compact create call and a complete
+ask/call/choose/tell graph as read-only field content, not an overwrite template. No-op is a
+one-line instruction. Generated SDK text arguments use outer `'''...'''` strings; embedded DAG text
+literals use `"""..."""`, which need no outer-layer quote escaping. Plain strings are the default; use
 `f'''...'''` only for interpolation and escape literal braces. Escape literal outer delimiters,
 trailing quotes that would join the closing delimiter, and backslashes that must survive decoding.
 This is a generation convention, not a parser restriction: other valid quote styles remain accepted.
@@ -420,16 +447,16 @@ The common path is **schema field merge → type-owned content gate → persiste
 `session/memory/validation/content.py` registers type-owned validators; the Experience
 implementation in `session/memory/experience/compiler.py` validates and canonicalizes full source.
 ExtractLoop and MemoryUpdater dispatch the gate without knowing DAG syntax or special-casing Experiences.
-This deterministic validity gate is mandatory and independent of the optional model-based
-`ExperienceImprovementGate`; it does not call a model.
+This deterministic validity gate is mandatory and does not call a model.
 
 Create-only collision checks live in `session/memory/validation/create.py`. These mandatory
 checks are shared by extraction and persistence and are repeated under the write-set lease.
 Experience candidate gates live in `session/train/gates/` and share the `PolicyUpdateGate`
-contract. Each gate controls activation through an `ENABLED: ClassVar[bool]` on its class:
-`ExperienceIdentifierGate` is on; `ExperienceImprovementGate` is off by default. There is no
-configuration enable flag or separate post-generation proposal filter. Disabled quality gates do
-not initialize or call Jev. Mandatory create/content checks at persistence time remain in place.
+contract. The built-in `ExperienceIdentifierGate` is temporarily disabled by default because its
+identifier heuristic also rejects policy terms such as `24-hour`. Entity-ID generalization remains
+required by the Experience schema prompt. Custom validation gates can use the same rejection/repair
+contract. There is no built-in model-based quality replay;
+mandatory create/content checks at persistence time remain in place.
 
 Extraction previews reuse the existing operation materializer and the same gate, allowing the
 normal repair opportunity on invalid content. A valid patch remains a patch in the resolved
@@ -448,7 +475,7 @@ concurrent changes survive; stale/ambiguous patch anchors and invalid resulting 
 without falling back to prefetched content. Exact patch application is enabled for gated types;
 ordinary ungated memory types retain their existing merge/error behavior. Training proposals
 also use this materializer to obtain full before/after candidates, retaining the existing base-version
-and commit-time stale-plan checks. Gate failures cannot be disabled with a quality-gate setting.
+and commit-time stale-plan checks. These persistence checks remain mandatory.
 
 ## Server-side execution
 
@@ -558,7 +585,7 @@ Top-N rank cutoff; it only admits lower-scoring candidates into that ranked set.
 Node questions retain their original Noul/Choice types, and only the selected Experiences'
 node answers are applied. The deterministic DAG executor, not the model, then selects the next
 actions. Conditions for unselected candidates are evaluated but discarded, avoiding a second
-serial model call. Named-target evaluation and training replay still ask only node questions.
+serial model call. Named-target evaluation still asks only node questions.
 Client-side delivered-advice deduplication is unchanged.
 
 With `jev`, questions are kept in one request while the conservative estimated input is within
@@ -689,26 +716,116 @@ names. These observations are passed directly to the reflection stage. They are 
 verified business outcomes; `evaluation` remains the authoritative external result. Missing
 evaluation is represented as unknown, never converted into a passing result.
 
-`ExperienceImprovementGate.ENABLED` remains `False` by default. If enabled, it joins the same
-candidate validation/repair chain during extraction, before apply and outside the write lock; it
-never receives observation JSON as a DAG. Its legacy replay requires completion, so reminder-only DAGs cannot establish that
-through model slot filling alone. This refactor does not treat replayed reminder
-emission as business success or introduce a new Gate policy.
-
 Compilation, fixed-target checks, deletion restrictions, source provenance and locked reload/apply
 remain mandatory. Structural validation is not evidence that a candidate will improve future runs.
 
-Accepted Experiences store forward `derived_from` links to Trajectories. Those Trajectories link to
-their Session archives; `source_sessions` retains only a compact lookup index of source identity and
-outcome. Raw evidence and evaluator feedback are not duplicated into Experience metadata. Archive
-contents are never rewritten to add memory backlinks. Snapshot messages use
-`OpenViking-Experience-Session-Map`; submitter memory diffs, Case relations and Gate
-diagnostics are scoped to the originating Session and Case.
+Experiences do not persist `success_trajectory_refs` or automatic `derived_from` links to
+Trajectories/Sessions. `source_sessions` and source links remain transient update-plan metadata
+for attribution and validation. Successful comparison retrieval uses `VikingFS.find` in QUICK
+vector-search mode, scoped to the requester and `trajectories/<case_name>/archive`, with L2-only results
+and the existing `search_tags` filter `trajectory_outcome=success`. Trajectory archival attaches
+`trajectory_outcome=success|failure|unknown` through the common MemoryUpdater vectorization path;
+the value comes from the server-owned outcome, never an LLM-supplied tag. Existing untagged
+vectors require explicit tagging/reindexing with tags; queries do not backfill or scan them.
+
+Each non-success current Trajectory supplies a separate query, preferring its stored `steps`
+over its rendered management header. The shared head/tail truncation helper caps the query at
+2,048 locally estimated tokens; the embedding backend retains its own input guard. This is not
+an exact model-tokenizer count. Queries run sequentially inside the existing learning batch
+(default 16 signals), not concatenated into one query or fanned out without a limit. Each query
+requests at most eight candidate hits and selects the first eligible one; results from different
+queries are deduplicated by URI. Only those candidate files are read, with normalized URI scope,
+Case, success outcome, content format, provenance, and `applied`/`no_op` state checked again.
+Missing hits are skipped; permission/backend errors propagate. No `_comparison_key` equality
+check remains: semantic similarity is a candidate-selection signal, not proof that tasks have
+identical constraints, and the synthesis model must still compare the actual evidence.
+
+A no-op never rewrites an Experience merely to save a history index. Learning snapshots eligible
+work from the selected Case inboxes; it never descends into archives. Notifications determine
+which Cases to wake, not which individual observations are allowed to learn. This is consumption
+at existing external trigger points, not a new continuous background worker; files arriving after
+the work snapshot are picked up by a later trigger. There is no additional successful-anchor regression scan
+or model-based replay gate.
+
+Trajectory storage has two lifecycle directories under `trajectories/<case_name>`:
+
+```text
+inbox/20261019_S_abcdef.md  ->  archive/2026/10/19/S_abcdef.md
+```
+
+The inbox filename starts with the UTC creation date, not the Session date or learning date.
+`extract_context.get_random_id()` supplies six lowercase letters/digits, reused within one
+context; `trajectory_name` retains this short ID. The server pins the naming timestamp for a
+joint extraction. Each invocation creates new Trajectories, including repeated source archives.
+Creation performs only point checks in inbox and at the final archive address, with create-only
+validation under the exact destination-file lock (plus an overview sidecar only if configured).
+Neither same-source deduplication nor a Case-directory tree lock is added.
+
+Files retain their `experience_update` state. Pending, processing and failed observations stay
+in inbox; there is no failed directory.
+Learning uses the configured `max_gradients_per_update` (default 16) as the claim, synthesis,
+and failure boundary, not only as an LLM input limit. Within a Case, claim one batch with its
+own batch ID and lease, process and finalize it, then claim the next. A short final batch is
+submitted immediately rather than waiting for the streaming timer. If a batch fails, stop that
+Case for this invocation and mark only its claimed, non-terminal records failed; later records
+remain pending with unchanged attempts and leases. Other Cases may continue concurrently.
+A later trigger for the same Case, even if it contains only new Trajectory URIs, includes the old
+pending tail without `retry_failed`; failed records still require explicit retry. Returned
+`trajectory_uris`/`trajectory_count` cover claimed records, not the unclaimed tail. Benchmark events
+separately record `trigger_trajectory_count` and `selection_mode=case_inbox`; the trigger count is
+not the amount of work in inbox. If waiting is interrupted, the unknown learned count is null. Successful earlier batches and their snapshot provenance are retained.
+All observations in a completed learning chunk are marked
+`applied` or `no_op` before archival begins. Archival uses existing `VikingFS.cp` and `rm` operations
+under exact source/target file locks: copy to the dated archive, enqueue embedding there, then
+remove inbox. This split preserves the inbox recovery record until indexing has been submitted.
+An occupied archive filename must represent the same immutable observation and terminal state;
+unrelated evidence is never overwritten. Discovery of a terminal inbox record retries archival,
+not learning. An explicit submission retaining an old inbox URI resolves its final archive URI
+by filename, without scanning history or leaving redirect files.
+
+Inbox writes do not enqueue embedding. The first embedding job uses the final archive URI, so
+an asynchronous job cannot later recreate an index record at a removed inbox URI. Outcome tags
+and account-specific embedding templates are retained. Once enqueue is recorded in archive
+metadata, retrying source deletion does not enqueue again. A process crash between enqueue and
+recording that marker may duplicate the same-URI index upsert; this is not an exactly-once queue
+protocol. The existing window between committing an Experience and persisting terminal states
+is also unchanged. No second embedding is required just to change the path or filename.
+
+Existing files/account templates are not automatically migrated. Old layouts need an explicit
+migration before being used with this inbox/archive learning lifecycle; no legacy directory scan
+or persistent filename/source index is introduced.
+
+`SessionRolloutAnalyzer.analyze_many()` sees all associated Cases and the shared source steps in
+one extraction conversation. Each target carries its own rubric, evaluation, and injected actions.
+The model must assign Case-relevant facts without mixing another Case's exclusive actions; shared
+facts may appear in multiple trajectories when relevant. The complete output Case set and its
+per-Case cardinality are checked before any write. Missing, duplicate, or unexpected Cases receive
+normal bounded ExtractLoop repair feedback; there is no successful-subset write from an invalid
+model reply. Zero Cases make no trajectory model call. A normal valid multi-Case reply uses one
+LLM request, while tools/format/provider retries may add requests. Per-file writes retain existing
+failure semantics rather than introducing an all-files transaction. The generic single-rollout
+`analyze()` interface delegates to the same joint implementation with one Case. Custom analyzers
+injected into `SessionCompressorV3` implement `analyze_many()`; there is no per-Case fallback.
+
+Case and Experience names correspond one-to-one; a Trajectory's Case directory supplies its
+membership. Cases persist no `links`/`backlinks` and their template has no linked-Experience
+section. Trajectories retain only the `derived_from` Session link and no backlinks. Their
+`experience_update` keeps execution state but not a redundant `experience_uri`; recovery and
+reporting derive that URI from the canonical Case name. Experiences retain `case_name` alongside
+`experience_name`, without maintaining a separate relation list.
+
+The common serializer removes obsolete relationship fields and both ends of Case/Trajectory
+relations on normal rewrites. Relation writers reject these edges before endpoint I/O; synthesis
+no longer performs Case-link backfill or relation-only rewrites. Other ordinary-memory relations
+remain supported. There is no bulk rewrite of historical files. Raw evidence and evaluator feedback
+are not duplicated into Experience metadata, and source Session archives are never modified to
+add backlinks. Snapshot messages use `OpenViking-Experience-Session-Map`; submitter memory diffs
+and source diagnostics remain scoped to the originating Session and Case.
 
 Optional skill extraction runs separately and does not generate Trajectory memories. An explicit
 account-level Agent Evolution `false` disables Case/Experience learning. Tau2's no-memory mode
-also disables automatic Experience recall. Training errors propagate to the owning commit task;
-Gate rejections remain explicit diagnostics in the memory diff.
+also disables automatic Experience recall. Candidate-validation errors follow the existing
+strict/lenient commit error policy; no rejected quality-replay candidates are added to memory diffs.
 
 ## Semantics and state
 
@@ -749,7 +866,7 @@ Gate rejections remain explicit diagnostics in the memory diff.
   client and server together. Existing server delivery snapshots are left untouched but unused;
   no old-server-to-client delivery-state migration is performed.
 - Graph/slot validation remains enabled. Runtime decisions no longer emit synthetic evidence
-  references. Training replay retains its existing evidence format and budget. Delivery is not business
+  references. Trajectory evidence retains its existing format and budget. Delivery is not business
   compliance or success; training must distinguish client `delivered_advice` from server evaluation.
 - Automatic conversion of legacy text and tool execution remain outside this release.
 
@@ -789,9 +906,13 @@ Experience 的系统字段 `action_feedback` 以 `slot_name` 为键累计 `usefu
 此次仅收紧新评分口径，不重评旧 Trajectory、不改写累计计数。`not_useful_count` 保留原名，
 历史负分可能仅表示冗余或不适用，不能直接当作副作用次数或副作用率。旧正分也不能证明新增
 条款有效；更新模型必须核对证据。比较新口径的效果时应使用独立的新实验数据，不混用旧评分。
-计数及 `observed_trajectories` 去重记录通过既有 `MemoryUpdater` 在同一锁内持久化，
-不重新嵌入未改变的 DAG。缓存重试、并发提交、写入 ACK 丢失不会重复计数；
-普通 DAG 更新保留最新反馈，已删除的 Experience 不会被统计重建。
+计数通过既有 `MemoryUpdater` 持久化，不重新嵌入未改变的 DAG；Experience 不保存
+`observed_trajectories` 列表。反馈处理锁住当前 Trajectory 及受影响的 Experience，完成后在
+Trajectory 的 `experience_update.feedback_recorded` 写入一个布尔标记，缓存复用和正常并发
+调用据此跳过重复统计。计数和完成标记不是跨文件原子提交：部分写入失败或计数写入 ACK
+丢失后重试，可能重复计数；不为此维护无限增长的去重账本。普通 DAG 更新保留最新反馈，
+已删除的 Experience 不会被统计重建。旧列表在 Experience 下次正常写入时移除，不扫描改写
+历史文件，也不自动给历史 Trajectory 补写完成标记；重放旧数据可能再次计数。
 
 exp 更新输入中的 `# Existing Experience` 展示完整 DAG，并将只读 `action_feedback` 压缩为两组。
 沿用当前按 `slot_name` 累计的全部反馈，不区分评分版本，action 文本变更后不清零。

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -345,6 +345,130 @@ async def test_generic_jev_client_respects_retry_after(monkeypatch):
     await client.evaluate(state="state", questions={"ok": {"type": "noul"}})
 
     sleeps.assert_awaited_once_with(1.75)
+
+
+@pytest.mark.asyncio
+async def test_jev_logs_each_failed_attempt_without_leaking_payload(monkeypatch):
+    warning = Mock()
+    sleeps = AsyncMock()
+    clock = iter([10.0, 12.0, 20.0, 50.0, 60.0])
+    monkeypatch.setattr("openviking.models.jev.logger.warning", warning)
+    monkeypatch.setattr("openviking.models.jev.asyncio.sleep", sleeps)
+    monkeypatch.setattr("openviking.models.jev.monotonic", lambda: next(clock))
+    attempts = 0
+
+    def handle(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                json={"error": {"code": "RateLimitExceeded", "message": "private-body"}},
+                headers={"x-request-id": "request-429", "Retry-After": "2"},
+            )
+        if attempts == 2:
+            raise httpx.ReadTimeout("private-exception", request=request)
+        return httpx.Response(200, json={"answers": {"ok": {"type": "noul", "noul": 0.9}}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as transport:
+        client = JevClient(
+            JevConfig(
+                api_url="https://example.com/v1/systemone?token=private-url",
+                api_key="private-key",
+                max_retries=2,
+            ),
+            client=transport,
+        )
+        answers = await client.evaluate(state="private-state", questions={"ok": {"type": "noul"}})
+
+    assert answers["ok"]["noul"] == 0.9
+    assert attempts == 3
+    records = [json.loads(call.args[1]) for call in warning.call_args_list]
+    assert len(records) == 2
+    assert all(call.args[0] == "[JEV_REQUEST_FAILED] %s" for call in warning.call_args_list)
+    assert [r["attempt"] for r in records] == [1, 2]
+    assert [r["elapsed_s"] for r in records] == [2.0, 30.0]
+    assert all(r["max_attempts"] == 3 and r["timeout_s"] == 30 for r in records)
+    assert all(r["retrying"] for r in records)
+    assert records[0]["http_status"] == 429
+    assert records[0]["provider_error_code"] == "RateLimitExceeded"
+    assert records[0]["server_request_id"] == "request-429"
+    assert records[1]["error_type"] == "ReadTimeout"
+    # A timeout after a 429 must not inherit the previous response's code or request ID.
+    assert records[1]["http_status"] is None
+    assert records[1]["provider_error_code"] is None
+    assert records[1]["server_request_id"] is None
+    assert [r["retry_delay_s"] for r in records] == [2.0, 1.0]
+    assert [call.args[0] for call in sleeps.await_args_list] == [2.0, 1.0]
+    assert "private-" not in str(warning.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_jev_logs_final_timeout_without_http_status(monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr("openviking.models.jev.logger.warning", warning)
+
+    def handle(request):
+        raise httpx.ReadTimeout("", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as transport:
+        client = JevClient(
+            JevConfig(
+                api_url="https://example.com/v1/systemone",
+                api_key="secret",
+                max_retries=1,
+                retry_backoff_seconds=0,
+            ),
+            client=transport,
+        )
+        with pytest.raises(JevError) as caught:
+            await client.evaluate(state="state", questions={"q": {"type": "noul"}})
+
+    assert isinstance(caught.value.__cause__, httpx.ReadTimeout)
+    records = [json.loads(call.args[1]) for call in warning.call_args_list]
+    assert [r["retrying"] for r in records] == [True, False]
+    assert [r["attempt"] for r in records] == [1, 2]
+    assert all(r["error_type"] == "ReadTimeout" and r["http_status"] is None for r in records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "code", "error_type"),
+    [
+        (
+            401,
+            '{"code":"Unauthorized","message":"private-body"}',
+            "Unauthorized",
+            "HTTPStatusError",
+        ),
+        (503, "private-body: not JSON", None, "HTTPStatusError"),
+        (200, "private-body: not JSON", None, "JSONDecodeError"),
+    ],
+)
+async def test_jev_logs_response_status_even_without_json_error(
+    monkeypatch, status, body, code, error_type
+):
+    warning = Mock()
+    monkeypatch.setattr("openviking.models.jev.logger.warning", warning)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(status, text=body, headers={"x-tt-logid": "server-id"})
+    )
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = JevClient(
+            JevConfig(api_url="https://example.com/v1/systemone", api_key="secret", max_retries=0),
+            client=http,
+        )
+        with pytest.raises(JevError):
+            await client.evaluate(state="state", questions={"q": {"type": "noul"}})
+
+    warning.assert_called_once()
+    record = json.loads(warning.call_args.args[1])
+    assert record["http_status"] == status
+    assert record["provider_error_code"] == code
+    assert record["server_request_id"] == "server-id"
+    assert record["error_type"] == error_type
+    assert record["retrying"] is False and record["retry_delay_s"] == 0
+    assert "private-body" not in str(warning.call_args_list)
 
 
 @pytest.mark.asyncio

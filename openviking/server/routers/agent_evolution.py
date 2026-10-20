@@ -19,8 +19,15 @@ router = APIRouter(prefix="/api/v1/agent-evolution", tags=["agent-evolution"])
 
 
 class LearnExperiencesRequest(BaseModel):
-    trajectory_uris: list[str] | None = Field(default=None, max_length=10_000)
-    case_names: list[str] | None = Field(default=None, max_length=1_000)
+    trajectory_uris: list[str] | None = Field(
+        default=None,
+        max_length=10_000,
+        description="Trigger Trajectories identifying Cases whose inboxes should be consumed; "
+        "not a whitelist of files to learn. Existing pending work in those Cases is included.",
+    )
+    case_names: list[str] | None = Field(
+        default=None, max_length=1_000, description="Canonical Cases whose inboxes to consume."
+    )
     max_cases: int = Field(default=100, ge=1, le=1_000)
     wait: bool = True
     retry_failed: bool = False

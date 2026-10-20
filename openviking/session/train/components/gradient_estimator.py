@@ -30,14 +30,14 @@ from openviking.session.train.domain import (
     RolloutAnalysis,
 )
 from openviking.session.train.gates.errors import ExperienceGateRejected
-from openviking.session.train.gates.experience import (
-    EXPERIENCE_GATE_CONTEXTS_KEY,
-    _stored_session_contexts,
-)
 from openviking.session.train.gates.identifiers import ExperienceIdentifierGate
 from openviking.session.train.gradients import PatchSemanticGradient
 from openviking.session.train.interfaces import PolicyUpdateGate
-from openviking.session.train.utils import safe_int
+from openviking.session.train.utils import (
+    EXPERIENCE_SOURCE_CONTEXTS_KEY,
+    compact_source_sessions,
+    safe_int,
+)
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
 
@@ -147,8 +147,8 @@ class ExperienceGradientEstimator:
                         "Experience gates must reject with feedback, not filter candidates"
                     )
             for candidate in candidates:
-                candidate.metadata["proposal_source_sessions"] = _stored_session_contexts(
-                    candidate.metadata[EXPERIENCE_GATE_CONTEXTS_KEY]
+                candidate.metadata["proposal_source_sessions"] = compact_source_sessions(
+                    candidate.metadata[EXPERIENCE_SOURCE_CONTEXTS_KEY]
                 )
                 candidate.metadata["experience_proposal_gate"] = {
                     "passed": True,
@@ -214,7 +214,7 @@ class ExperienceGradientEstimator:
         if evaluation:
             for criterion in evaluation.criterion_results:
                 feedback.extend(criterion.feedback)
-        gate_context = {
+        source_context = {
             "source_session_uri": session_uri,
             "case_name": rollout.case.name,
             "case_uri": analysis.metadata.get("case_uri", ""),
@@ -222,7 +222,7 @@ class ExperienceGradientEstimator:
             "score": evaluation.score if evaluation else None,
             "feedback": list(dict.fromkeys(feedback)),
             "experience_execution": dict(analysis.metadata.get("experience_execution") or {}),
-            "evidence": _messages_to_gate_evidence(rollout.messages),
+            "evidence": _messages_to_source_evidence(rollout.messages),
         }
         return [
             PatchSemanticGradient(
@@ -234,7 +234,7 @@ class ExperienceGradientEstimator:
                 links=[
                     StoredLink(
                         from_uri=target_uri,
-                        to_uri=trajectory.uri,
+                        to_uri=trajectory.metadata.get("archive_uri") or trajectory.uri,
                         link_type="derived_from",
                         weight=1.0,
                     )
@@ -248,8 +248,8 @@ class ExperienceGradientEstimator:
                     "case_uri": analysis.metadata.get("case_uri", ""),
                     "source_session_uri": session_uri,
                     "training_category": rollout.case.name,
-                    EXPERIENCE_GATE_CONTEXTS_KEY: context.metadata.get(
-                        EXPERIENCE_GATE_CONTEXTS_KEY, [gate_context]
+                    EXPERIENCE_SOURCE_CONTEXTS_KEY: context.metadata.get(
+                        EXPERIENCE_SOURCE_CONTEXTS_KEY, [source_context]
                     ),
                 },
             )
@@ -291,7 +291,7 @@ class ExperienceGradientEstimator:
         return operations
 
 
-def _messages_to_gate_evidence(messages: list[Any]) -> list[dict[str, str]]:
+def _messages_to_source_evidence(messages: list[Any]) -> list[dict[str, str]]:
     evidence: list[dict[str, str]] = []
     for message_index, message in enumerate(messages):
         role = str(getattr(message, "role", "unknown") or "unknown")

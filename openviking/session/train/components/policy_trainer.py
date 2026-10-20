@@ -530,20 +530,6 @@ def _scope_plan_to_analysis(
         )
     ]
     metadata = dict(getattr(plan, "metadata", {}) or {})
-    gate = metadata.get("experience_improvement_gate")
-    if isinstance(gate, dict) and analysis.rollout is not None:
-        candidates = [
-            candidate
-            for candidate in gate.get("candidates", [])
-            if candidate.get("target_name") == analysis.rollout.case.name
-        ]
-        metadata["experience_improvement_gate"] = {
-            **gate,
-            "candidates": candidates,
-            "accepted_count": sum(bool(item.get("passed")) for item in candidates),
-            "rejected_count": sum(not item.get("passed") for item in candidates),
-            "passed": bool(candidates) and all(item.get("passed") for item in candidates),
-        }
     metadata.update(
         {
             "scoped_to_session_uris": sorted(session_uris),
@@ -563,8 +549,7 @@ def _plan_item_belongs_to_sessions(
         return False
     if case_name and item.memory_type == "experiences" and item.target_name != case_name:
         return False
-    patch_metadata = getattr(item, "metadata", {}).get("patch_metadata", {})
-    for source in patch_metadata.get("source_sessions", []):
+    for source in getattr(item, "metadata", {}).get("source_sessions", []):
         if isinstance(source, dict) and str(source.get("source_session_uri") or "") in session_uris:
             return True
     for link in getattr(item, "links", []) or []:

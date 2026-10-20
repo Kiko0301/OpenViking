@@ -193,8 +193,8 @@ async def test_sources_can_target_a_new_case_without_selecting_existing_candidat
     fields = {
         "case_name": "new",
         "execution_count": 2,
-        "task_signature": "New domain",
-        "input": "context",
+        "domain": "New domain",
+        "description": "context",
         "rubric": '[{"id":"scope","description":"Respect scope."}]',
     }
     if output_format == "python":

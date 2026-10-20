@@ -85,7 +85,6 @@ class TestSchemaModelGenerator:
         """Create a registry with real schemas."""
         return get_default_registry()
 
-
     def test_peer_enabled_false_omits_peer_id_field(self):
         memory_type = MemoryTypeSchema(
             memory_type="cases",
@@ -196,7 +195,6 @@ class TestSchemaModelGenerator:
         # Check business fields
         assert "field1" in model.model_fields
         assert "field2" in model.model_fields
-
 
     def test_page_id_field_is_emitted_before_mutable_content(self, registry_with_sample):
         """page_id should appear before mutable fields so the model anchors target page first."""
@@ -313,9 +311,7 @@ class TestSchemaModelGenerator:
             "Temporary page_id for identifying the target memory item."
         )
 
-    def test_existing_patch_can_omit_immutable_fields_but_new_item_cannot(
-        self, real_registry
-    ):
+    def test_existing_patch_can_omit_immutable_fields_but_new_item_cannot(self, real_registry):
         entities = real_registry.get("entities")
         model = SchemaModelGenerator([entities]).create_flat_data_model(entities)
 
@@ -359,14 +355,10 @@ class TestSchemaModelGenerator:
                 "entities": [
                     {
                         "page_id": 2,
-                        "content": {
-                            "blocks": [{"search": "一周学习计划", "replace": ""}]
-                        },
+                        "content": {"blocks": [{"search": "一周学习计划", "replace": ""}]},
                     }
                 ],
-                "delete_ids": [
-                    {"delete_page_id": 1, "replacement_page_id": None}
-                ],
+                "delete_ids": [{"delete_page_id": 1, "replacement_page_id": None}],
             }
         )
 
@@ -510,6 +502,7 @@ class TestWikiLink:
 
         assert link_type_schema["type"] == "string"
         assert "enum" not in link_type_schema
+
 
 class TestIntegration:
     """Integration tests for the complete schema system."""

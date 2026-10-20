@@ -528,8 +528,8 @@ async def test_merge_prompt_omits_relation_indexes_without_mutating_memories(
         content="New fact.\nKeep [policy](./policy.md).",
     )
     if memory_type == "cases":
-        before.extra_fields["task_signature"] = before.content
-        after.extra_fields["task_signature"] = after.content
+        before.extra_fields["domain"] = before.content
+        after.extra_fields["domain"] = after.content
     snapshots = copy.deepcopy((before.model_dump(), after.model_dump()))
     stored_before = MemoryFileUtils.write(before)
     provider = PatchMergeContextProvider(
@@ -852,7 +852,7 @@ async def test_delete_patch_is_explicit_not_an_empty_content_edit(memory_type):
         uri=uri,
         memory_type=memory_type,
         content="Rendered document",
-        extra_fields={"case_name": "domain", "task_signature": "Domain service", "name": "domain"},
+        extra_fields={"case_name": "domain", "domain": "Domain service", "name": "domain"},
     )
     patch = PatchMergePatch(before_file=memory, after_file=None)
     provider = PatchMergeContextProvider(memory_type=memory_type, patches=[patch])

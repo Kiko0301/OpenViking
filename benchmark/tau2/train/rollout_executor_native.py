@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from benchmark.tau2.common.tau2_env.tau2_environment import (
-    Tau2UserSimulatorFormatError,
+    Tau2UserSimulatorError,
     _install_tau2_litellm_rate_limit_retry,
 )
 from benchmark.tau2.train._rollout_helpers import (
@@ -157,7 +157,7 @@ class NativeTau2RolloutExecutor:
                     rollout = await asyncio.to_thread(self._execute_one_sync, case, context, index)
                     progress.complete_one()
                     return rollout
-                except Tau2UserSimulatorFormatError as exc:
+                except Tau2UserSimulatorError as exc:
                     progress.fail_one()
                     return _failed_tau2_simulator_rollout(case, context, exc)
                 except Exception:

@@ -10,6 +10,8 @@ from typing import Any
 
 from openviking.session.train.domain import Rollout, RolloutAnalysis
 
+EXPERIENCE_SOURCE_CONTEXTS_KEY = "_experience_source_contexts"
+
 
 def average_score(analyses: list[RolloutAnalysis | None]) -> float | None:
     """Return the mean evaluation score across analyses, ignoring None entries."""
@@ -66,3 +68,13 @@ async def call_hook(hook: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Invoke a sync or async hook, preserving its result and exceptions."""
     result = hook(*args, **kwargs)
     return await result if inspect.isawaitable(result) else result
+
+
+def compact_source_sessions(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep attribution/outcome fields without copying raw evidence into plans."""
+    stored_keys = {"source_session_uri", "case_name", "case_uri", "passed", "score"}
+    return [
+        {key: value for key, value in context.items() if key in stored_keys}
+        for context in contexts
+        if context.get("source_session_uri")
+    ]

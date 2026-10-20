@@ -53,6 +53,7 @@ def fs(monkeypatch):
 
 
 async def record(fs, value):
+    fs.files.setdefault(value.uri, MemoryFileUtils.write(value))
     return await record_experience_feedback_stats(value, registry=registry(), viking_fs=fs, ctx=CTX)
 
 
@@ -147,7 +148,13 @@ async def test_statistics_use_normal_writer_and_are_idempotent(fs, monkeypatch):
     assert set(calls[0].upsert_operations[0].memory_fields) == {"action_feedback"}
     assert action_stats(fs)["useful_count"] == 1
     assert stats(fs)["schema_version"] == 2
-    assert stats(fs)["observed_trajectories"] == [trajectory().uri]
+    assert "observed_trajectories" not in stats(fs)
+    assert (
+        MemoryFileUtils.read(fs.files[trajectory().uri]).extra_fields["experience_update"][
+            "feedback_recorded"
+        ]
+        is True
+    )
     assert after.content == before.content
     assert after.extra_fields["version"] == before.extra_fields["version"] + 1
     assert not fs.lock.locked()
@@ -163,7 +170,7 @@ async def test_concurrent_new_and_duplicate_feedback_does_not_lose_counts(fs):
         for i in range(18)
     ]
     await asyncio.gather(*(record(fs, value) for value in values * 2))
-    assert len(stats(fs)["observed_trajectories"]) == 18
+    assert "observed_trajectories" not in stats(fs)
     assert all(
         action_stats(fs)[key] == 6 for key in ("useful_count", "not_useful_count", "unscored_count")
     )
@@ -180,7 +187,7 @@ async def test_two_actions_in_one_experience_get_independent_scores(fs):
     assert action_stats(fs)["useful_count"] == 1
     assert action_stats(fs)["not_useful_count"] == 0
     assert action_stats(fs, "other")["not_useful_count"] == 1
-    assert len(stats(fs)["observed_trajectories"]) == 1
+    assert "observed_trajectories" not in stats(fs)
 
 
 @pytest.mark.asyncio
@@ -254,7 +261,7 @@ async def test_multiple_injected_texts_in_one_trajectory_accumulate_by_slot(fs):
     await record(fs, value)
     assert set(stats(fs)["actions"]) == {"reminder"}
     assert action_stats(fs)["useful_count"] == action_stats(fs)["not_useful_count"] == 1
-    assert len(stats(fs)["observed_trajectories"]) == 1
+    assert "observed_trajectories" not in stats(fs)
     assert len(action_feedback_for_content(stats(fs), SOURCE, config=SINGLE_SAMPLE)["revise"]) == 1
 
 
@@ -302,7 +309,7 @@ async def test_write_failure_is_retryable_without_losing_or_duplicating_feedback
 async def test_missing_experience_is_not_recreated_and_unattributed_history_is_not_backfilled(fs):
     fs.files.clear()
     assert (await record(fs, trajectory()))["skipped_uris"] == [URI]
-    assert not fs.files
+    assert URI not in fs.files
     assert await record(fs, trajectory(sources={})) == {"updated_uris": [], "skipped_uris": []}
 
 
@@ -397,7 +404,9 @@ async def test_invalid_saved_sources_cannot_write(fs):
 
 
 @pytest.mark.asyncio
-async def test_lost_write_ack_does_not_double_count_on_retry(fs, monkeypatch):
+async def test_partial_write_retry_can_repeat_feedback_without_an_experience_ledger(
+    fs, monkeypatch
+):
     original = fs.write_file
 
     async def written_but_ack_lost(*args, **kwargs):
@@ -409,8 +418,12 @@ async def test_lost_write_ack_does_not_double_count_on_retry(fs, monkeypatch):
         await record(fs, trajectory())
     persisted = fs.files[URI]
     monkeypatch.setattr(fs, "write_file", original)
+    assert (await record(fs, trajectory()))["updated_uris"] == [URI]
+    assert fs.files[URI] != persisted and action_stats(fs)["useful_count"] == 2
+    assert "observed_trajectories" not in stats(fs)
+    # Once the Trajectory marker is saved, normal repeated calls are skipped.
     assert (await record(fs, trajectory()))["skipped_uris"] == [URI]
-    assert fs.files[URI] == persisted and action_stats(fs)["useful_count"] == 1
+    assert action_stats(fs)["useful_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -461,10 +474,7 @@ async def test_policy_snapshot_does_not_overwrite_newer_feedback(fs):
     result = await MemoryFilePolicyUpdater(viking_fs=fs).apply(plan, snapshot, CTX)
     assert not result.errors
     assert action_stats(fs)["useful_count"] == 2
-    assert set(stats(fs)["observed_trajectories"]) == {
-        trajectory("first").uri,
-        trajectory("second").uri,
-    }
+    assert "observed_trajectories" not in stats(fs)
 
 
 def test_nested_score_yaml_is_unscored_without_blocking():
@@ -498,13 +508,12 @@ async def test_feedback_view_matches_ask_call_and_tell_actions(fs):
     visible = action_feedback_for_content(stats(fs), program, config=SINGLE_SAMPLE)
     assert [item["slot_name"] for item in visible["unchanged"]] == ["hint", "lookup", "question"]
     assert all(item["feedback"] == "positive 100.0% (1/1)" for item in visible["unchanged"])
-    assert len(stats(fs)["observed_trajectories"]) == 1
+    assert "observed_trajectories" not in stats(fs)
 
 
 def feedback_state(**slots):
     return {
         "schema_version": 2,
-        "observed_trajectories": ["internal_trajectory"],
         "actions": {
             slot: {
                 "useful_count": positive,
@@ -621,9 +630,7 @@ def test_feedback_evidence_is_one_short_existing_example_or_empty():
     assert action_feedback_for_content(state, SOURCE)["unchanged"][0]["evidence"] == ""
 
 
-@pytest.mark.parametrize(
-    "state", [None, {"schema_version": 2, "actions": {}, "observed_trajectories": []}]
-)
+@pytest.mark.parametrize("state", [None, {"schema_version": 2, "actions": {}}])
 def test_absent_feedback_omits_groups_without_parsing_dag(state):
     assert action_feedback_for_content(state, "not a DAG") == {}
 
@@ -658,3 +665,88 @@ def test_feedback_display_config_round_trip():
     config = MemoryConfig.from_dict({"action_feedback": values})
     assert config.action_feedback.model_dump() == values
     assert config.to_dict()["action_feedback"] == values
+
+
+@pytest.mark.asyncio
+async def test_normal_experience_update_drops_old_ledgers_without_resetting_feedback(fs):
+    await record(fs, trajectory())
+    previous = MemoryFileUtils.read(fs.files[URI], uri=URI)
+    previous.extra_fields["source_sessions"] = [{"source_session_uri": "old-session"}]
+    previous.extra_fields["action_feedback"]["observed_trajectories"] = ["old-trajectory"]
+    previous.extra_fields["success_trajectory_refs"] = {"task": "../trajectories/case_a/old.md"}
+    business_link = {
+        "from_uri": URI,
+        "to_uri": URI.replace("experiences", "records"),
+        "link_type": "related_to",
+    }
+    previous.links = [
+        business_link,
+        {"from_uri": URI, "to_uri": trajectory().uri, "link_type": "derived_from"},
+        {"from_uri": URI, "to_uri": "viking://session/old/archives/1", "link_type": "derived_from"},
+    ]
+    # Seed the old on-disk shape directly; the normal serializer now strips these fields.
+    old_fields = previous.to_metadata()
+    old_content = old_fields.pop("content")
+    fs.files[URI] = old_content + "\n\n<!-- MEMORY_FIELDS\n" + json.dumps(old_fields) + "\n-->"
+    trajectory_before = fs.files[trajectory().uri]
+    op = operation(SOURCE.replace("old reminder", "new reminder"))
+    op.memory_fields["source_sessions"] = [{"source_session_uri": "incoming-session"}]
+    updater = MemoryUpdater(registry=registry())
+    updater._viking_fs = fs
+
+    result = await updater.apply_operations(batch(op), CTX)
+
+    assert not result.errors
+    stored = MemoryFileUtils.read(fs.files[URI], uri=URI)
+    assert "source_sessions" not in stored.extra_fields
+    assert "success_trajectory_refs" not in stored.extra_fields
+    assert [(link["to_uri"], link["link_type"]) for link in stored.links] == [
+        (business_link["to_uri"], "related_to")
+    ]
+    assert fs.files[trajectory().uri] == trajectory_before
+    assert "observed_trajectories" not in stored.extra_fields["action_feedback"]
+    assert action_stats(fs)["useful_count"] == 1
+    assert "new reminder" in stored.content
+
+
+@pytest.mark.asyncio
+async def test_lost_trajectory_marker_ack_skips_feedback_on_retry(fs, monkeypatch):
+    original = fs.write_file
+
+    async def lose_marker_ack(uri, *args, **kwargs):
+        await original(uri, *args, **kwargs)
+        if uri == trajectory().uri:
+            raise OSError("marker acknowledgement lost")
+
+    monkeypatch.setattr(fs, "write_file", lose_marker_ack)
+    with pytest.raises(OSError, match="marker acknowledgement lost"):
+        await record(fs, trajectory())
+    assert not fs.lock.locked()
+    monkeypatch.setattr(fs, "write_file", original)
+
+    assert (await record(fs, trajectory()))["skipped_uris"] == [URI]
+    assert action_stats(fs)["useful_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_experience_write_drops_incoming_history_index_and_only_source_links(fs):
+    op = operation(SOURCE)
+    op.memory_fields["success_trajectory_refs"] = {"task": "../trajectories/case_a/t.md"}
+    op.memory_fields["links"] = [
+        {"from_uri": URI, "to_uri": trajectory().uri, "link_type": "derived_from"},
+        {"from_uri": URI, "to_uri": "viking://session/s/archives/1", "link_type": "derived_from"},
+        {
+            "from_uri": URI,
+            "to_uri": URI.replace("experiences", "records"),
+            "link_type": "derived_from",
+        },
+    ]
+    updater = MemoryUpdater(registry=registry())
+    updater._viking_fs = fs
+    result = await updater.apply_operations(batch(op), CTX)
+    assert not result.errors
+    stored = MemoryFileUtils.read(fs.files[URI], uri=URI)
+    assert "success_trajectory_refs" not in stored.extra_fields
+    assert [(link["to_uri"], link["link_type"]) for link in stored.links] == [
+        (URI.replace("experiences", "records"), "derived_from")
+    ]

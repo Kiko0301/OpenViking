@@ -1,10 +1,9 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Analyze Session evidence and persist its immutable Case Trajectory."""
+"""Jointly analyze an archive and persist one new Trajectory per associated Case."""
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -12,21 +11,26 @@ from typing import Any
 from openviking.config.vlm import VLMResolver
 from openviking.message import Message
 from openviking.server.identity import RequestContext
-from openviking.session.archive_store import is_storage_not_found
 from openviking.session.memory import ExtractLoop
-from openviking.session.memory.dataclass import MemoryFile, ResolvedOperations, StoredLink
+from openviking.session.memory.dataclass import (
+    MemoryFile,
+    MemoryTypeSchema,
+    ResolvedOperation,
+    ResolvedOperations,
+    StoredLink,
+)
 from openviking.session.memory.experience.feedback import (
     injected_actions,
     record_experience_feedback_stats,
 )
 from openviking.session.memory.experience.trajectory_context import (
     AgentTrajectoryContextProvider,
+    TrajectoryTarget,
     trajectory_source_steps,
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
-from openviking.session.memory.memory_updater import MemoryUpdater
-from openviking.session.memory.streaming_memory_updater import _acquire_stable_operation_lease
+from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdater
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.uri import generate_uri
 from openviking.session.skill.session_skill_context_provider import (
@@ -36,6 +40,7 @@ from openviking.session.skill.session_skill_context_provider import (
 )
 from openviking.session.train.components.trajectory_observation import (
     TRAJECTORY_FORMAT,
+    TRAJECTORY_OUTCOME_TAG,
     execution_paths,
     observation_evidence,
     trajectory_evaluation_summary,
@@ -46,6 +51,7 @@ from openviking.session.train.gradients import PatchSemanticGradient
 from openviking.session.train.interfaces import RolloutEvaluator
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
+from openviking.utils.tags import merge_search_tags
 
 
 @dataclass(slots=True)
@@ -74,44 +80,67 @@ class SessionRolloutAnalyzer:
 
     @tracer("train.rollout_analyzer.session.analyze", ignore_result=True, ignore_args=True)
     async def analyze(self, rollout: Rollout, context: SessionAnalyzerContext) -> RolloutAnalysis:
+        """Single-rollout interface used by the generic policy trainer."""
+        return (await self.analyze_many([rollout], context))[0]
+
+    @tracer("train.rollout_analyzer.session.analyze_many", ignore_result=True, ignore_args=True)
+    async def analyze_many(
+        self, rollouts: list[Rollout], context: SessionAnalyzerContext
+    ) -> list[RolloutAnalysis]:
+        """Jointly extract this archive's Cases in one model conversation."""
         if context is None or context.request_context is None:
             raise ValueError("SessionAnalyzerContext.request_context is required")
-        evaluation = rollout.evaluation
-        if evaluation is None and self.evaluator is not None:
-            evaluation = await self.evaluator.evaluate(rollout, context.evaluator_context)
-        source_uri = str(rollout.metadata.get("source_session_uri") or context.source_archive_uri)
+        if not rollouts:
+            return []
+        source_uri = str(
+            rollouts[0].metadata.get("source_session_uri") or context.source_archive_uri
+        )
+        if not source_uri:
+            raise ValueError("Trajectory requires a source Session archive")
+        if len({r.case.name for r in rollouts}) != len(rollouts):
+            raise ValueError("Joint Trajectory extraction requires unique Case names")
+        if any(
+            str(r.metadata.get("source_session_uri") or context.source_archive_uri) != source_uri
+            or r.messages != rollouts[0].messages
+            for r in rollouts
+        ):
+            raise ValueError("Joint Trajectory extraction requires the same archive and messages")
         gradients = []
         if context.include_session_skills:
             result = await self.extract_session_skills(
-                messages=rollout.messages,
+                messages=rollouts[0].messages,
                 ctx=context.request_context,
                 source_archive_uri=source_uri,
                 strict_extract_errors=context.strict_extract_errors,
             )
             gradients = result["skill_gradients"]
-        analysis = RolloutAnalysis(
-            evaluation=evaluation,
-            rollout=rollout,
-            gradients=gradients,
-            metadata={
-                "case_uri": rollout.metadata.get("case_uri", ""),
-                "task_spec": rollout.metadata.get("task_spec"),
-                "source_session_uri": source_uri,
-                "policy_snapshot_id": rollout.policy_snapshot_id,
-                "experience_execution": _experience_execution_from_rollout(rollout),
-            },
-        )
-        await self._extract_trajectory(analysis, context)
-        return analysis
+        analyses = []
+        for rollout in rollouts:
+            evaluation = rollout.evaluation
+            if evaluation is None and self.evaluator is not None:
+                evaluation = await self.evaluator.evaluate(rollout, context.evaluator_context)
+            analyses.append(
+                RolloutAnalysis(
+                    evaluation=evaluation,
+                    rollout=rollout,
+                    gradients=gradients if not analyses else [],
+                    metadata={
+                        "case_uri": rollout.metadata.get("case_uri", ""),
+                        "task_spec": rollout.metadata.get("task_spec"),
+                        "source_session_uri": source_uri,
+                        "policy_snapshot_id": rollout.policy_snapshot_id,
+                        "experience_execution": _experience_execution_from_rollout(rollout),
+                    },
+                )
+            )
+        await self._extract_trajectories(analyses, context)
+        return analyses
 
     @tracer("train.trajectory.observe", ignore_args=True, ignore_result=True)
-    async def _extract_trajectory(
-        self, analysis: RolloutAnalysis, context: SessionAnalyzerContext
+    async def _extract_trajectories(
+        self, analyses: list[RolloutAnalysis], context: SessionAnalyzerContext
     ) -> None:
-        """Extract or reuse the immutable observation for this Case and Session."""
-        rollout = analysis.rollout
-        if rollout is None or not analysis.metadata.get("source_session_uri"):
-            raise ValueError("Trajectory requires a Case rollout and source Session archive")
+        """Create one new observation per Case, without scanning/reusing historical sources."""
         registry = context.memory_registry
         if registry is None:
             from openviking.session.memory.memory_type_registry import get_default_registry
@@ -120,88 +149,117 @@ class SessionRolloutAnalyzer:
         schema = registry.get("trajectories")
         if schema is None or not schema.enabled:
             raise ValueError("Trajectory schema is required for Experience learning")
-        source = analysis.metadata["source_session_uri"]
-        identity = hashlib.sha256((rollout.case.name + "\0" + source).encode()).hexdigest()
-        fields = {"trajectory_name": identity, "case_name": rollout.case.name}
-        ctx = context.request_context
-        uri = generate_uri(schema, fields, user_space=ctx.user.user_id)
         exp_schema = registry.get("experiences")
         if exp_schema is None or not exp_schema.enabled:
             raise ValueError("Experience schema is required for deferred learning")
-        target = generate_uri(
-            exp_schema, {"experience_name": rollout.case.name}, user_space=ctx.user.user_id
-        )
         fs = self.viking_fs or get_viking_fs()
         if fs is None:
             raise RuntimeError("VikingFS is required for Trajectory extraction")
-        raw = await self._read_trajectory(fs, uri, ctx)
-        if raw is None:
-            paths = execution_paths(analysis.metadata.get("experience_execution") or {})
-            source_steps = trajectory_source_steps(rollout.messages)
+        ctx = context.request_context
+        targets = []
+        naming_contexts = {}
+        created_at = datetime.now(timezone.utc)
+        for analysis in analyses:
+            rollout = analysis.rollout
+            if rollout is None or not analysis.metadata.get("source_session_uri"):
+                raise ValueError("Trajectory requires a Case rollout and source Session archive")
             outcome = (
                 "unknown"
                 if analysis.evaluation is None
-                else ("success" if analysis.evaluation.passed else "failure")
+                else "success"
+                if analysis.evaluation.passed
+                else "failure"
             )
-            model = self.vlm
-            if model is None:
-                if self.vlm_resolver is None:
-                    raise RuntimeError("Trajectory extraction requires a VLM or VLM resolver")
-                model = await self.vlm_resolver.get_vlm(ctx.account_id)
-            provider = AgentTrajectoryContextProvider(
-                messages=rollout.messages,
-                case=asdict(rollout.case),
-                task_spec=analysis.metadata.get("task_spec"),
-                external_evaluation=asdict(analysis.evaluation) if analysis.evaluation else None,
-                trajectory_name=identity,
-                case_name=rollout.case.name,
-                outcome=outcome,
-                target_uri=uri,
-                source_steps=source_steps,
-                injected_actions=injected_actions(
-                    analysis.metadata.get("experience_execution") or {}
-                ),
-                memory_registry=registry,
-                ctx=ctx,
-                viking_fs=fs,
-                vlm_config=model,
+            naming = ExtractContext(rollout.messages, split_long_text_messages=False)
+            naming._session_timestamp = created_at.strftime("%Y%m%d%H%M%S")
+            fields = {
+                "trajectory_name": naming.get_random_id(),
+                "case_name": rollout.case.name,
+                "outcome": outcome,
+            }
+            uri = await self._allocate_trajectory_uri(fs, schema, fields, ctx, naming)
+            naming_contexts[rollout.case.name] = naming
+            targets.append(
+                TrajectoryTarget(
+                    case=asdict(rollout.case),
+                    trajectory_name=fields["trajectory_name"],
+                    outcome=outcome,
+                    target_uri=uri,
+                    task_spec=analysis.metadata.get("task_spec"),
+                    external_evaluation=asdict(analysis.evaluation)
+                    if analysis.evaluation
+                    else None,
+                    injected_actions=injected_actions(
+                        analysis.metadata.get("experience_execution") or {}
+                    ),
+                )
             )
-            extract_context = provider.get_extract_context()
-            isolation = MemoryIsolationHandler(
-                ctx,
-                extract_context,
-                allowed_memory_types={"trajectories"},
-            )
-            isolation.prepare_messages()
-            provider._isolation_handler = isolation
-            operations, _ = await ExtractLoop(
-                vlm=model,
-                viking_fs=fs,
-                ctx=ctx,
-                context_provider=provider,
-                isolation_handler=isolation,
-                thinking=True,
-            ).run()
-            if operations.errors or operations.delete_file_contents:
-                raise ValueError(f"Invalid Trajectory operations: {operations.errors}")
-            if len(operations.upsert_operations) != 1:
-                raise ValueError("Trajectory extraction must create exactly one memory")
-            operation = operations.upsert_operations[0]
-            if operation.memory_type != "trajectories" or operation.uris != [uri]:
-                raise ValueError("Trajectory extraction changed the fixed target")
-            evaluation = trajectory_evaluation_summary(analysis.evaluation)
-            fields.update(
+        model = self.vlm
+        if model is None:
+            if self.vlm_resolver is None:
+                raise RuntimeError("Trajectory extraction requires a VLM or VLM resolver")
+            model = await self.vlm_resolver.get_vlm(ctx.account_id)
+        provider = AgentTrajectoryContextProvider(
+            messages=analyses[0].rollout.messages,
+            targets=targets,
+            source_steps=trajectory_source_steps(analyses[0].rollout.messages),
+            memory_registry=registry,
+            ctx=ctx,
+            viking_fs=fs,
+            vlm_config=model,
+        )
+
+        async def allocate_targets(operations: ResolvedOperations) -> list[dict[str, Any]]:
+            # Another creator may claim a name while the model runs. Rebind before
+            # ExtractLoop's create guards; the file lease still performs the final check.
+            for operation in operations.upsert_operations:
+                target = provider.targets[operation.memory_fields["case_name"]]
+                target.target_uri = await self._allocate_trajectory_uri(
+                    fs, schema, operation.memory_fields, ctx, naming_contexts[target.case_name]
+                )
+                target.trajectory_name = operation.memory_fields["trajectory_name"]
+                operation.uris = [target.target_uri]
+            return []
+
+        provider.operation_validator = allocate_targets
+        await provider.prepare_extraction_messages()
+        extract_context = provider.get_extract_context()
+        extract_context._random_id = targets[0].trajectory_name
+        extract_context._session_timestamp = naming_contexts[
+            targets[0].case_name
+        ].get_session_timestamp()
+        isolation = MemoryIsolationHandler(
+            ctx, extract_context, allowed_memory_types={"trajectories"}
+        )
+        isolation.prepare_messages()
+        provider._isolation_handler = isolation
+        operations, _ = await ExtractLoop(
+            vlm=model,
+            viking_fs=fs,
+            ctx=ctx,
+            context_provider=provider,
+            isolation_handler=isolation,
+            thinking=True,
+        ).run()
+        errors = await provider.validate_resolved_operations(operations)
+        if errors:
+            raise ValueError(f"Invalid joint Trajectory operations: {errors}")
+        by_case = {op.memory_fields["case_name"]: op for op in operations.upsert_operations}
+        # Validate the entire model result before the first write; the destinations
+        # and provenance are server-owned, not generated by the model.
+        for analysis, target in zip(analyses, targets, strict=True):
+            operation = by_case[target.case_name]
+            paths = execution_paths(analysis.metadata.get("experience_execution") or {})
+            operation.memory_fields.update(
                 {
-                    "outcome": outcome,
                     "task_spec": analysis.metadata.get("task_spec"),
                     "trajectory_format": TRAJECTORY_FORMAT,
-                    "evaluation": evaluation,
+                    "evaluation": trajectory_evaluation_summary(analysis.evaluation),
                     "experience_execution": paths,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "created_at": created_at.isoformat(),
                     "experience_update": {
                         "state": "pending",
                         "attempts": 0,
-                        "experience_uri": target,
                         "batch_id": None,
                         "lease_until": None,
                         "processed_at": None,
@@ -209,82 +267,129 @@ class SessionRolloutAnalyzer:
                     },
                 }
             )
-            links = [
-                StoredLink(
-                    from_uri=uri, to_uri=source, link_type="derived_from", weight=1.0
-                ).model_dump()
-            ]
-            case_uri = str(analysis.metadata.get("case_uri") or "")
-            if case_uri:
-                links.append(
-                    StoredLink(
-                        from_uri=uri, to_uri=case_uri, link_type="related_to", weight=1.0
-                    ).model_dump()
+            uri, raw = await self._write_trajectory(
+                operation,
+                analysis.metadata["source_session_uri"],
+                fs,
+                schema,
+                registry,
+                ctx,
+                naming_contexts[target.case_name],
+            )
+            memory = MemoryFileUtils.read(raw, uri=uri)
+            linked_source = trajectory_source_session_uri(memory)
+            if (
+                memory.extra_fields.get("case_name") != target.case_name
+                or linked_source != analysis.metadata["source_session_uri"]
+            ):
+                raise ValueError("Trajectory identity mismatch")
+            if memory.extra_fields.get("task_spec") != analysis.metadata.get("task_spec"):
+                raise ValueError("Trajectory task identity mismatch")
+            metadata = dict(memory.extra_fields)
+            metadata["source_session_uri"] = linked_source
+            metadata["gate_evidence"] = observation_evidence(
+                analysis.rollout.messages,
+                analysis.evaluation,
+                metadata.get("experience_execution") or {},
+            )
+            metadata["feedback"] = (
+                list(analysis.evaluation.feedback) if analysis.evaluation is not None else []
+            )
+            analysis.trajectories = [
+                Trajectory(
+                    name=memory.extra_fields["trajectory_name"],
+                    uri=uri,
+                    content=memory.content,
+                    outcome=memory.extra_fields["outcome"],
+                    metadata=metadata,
                 )
-            operation.memory_fields.update(fields)
-            # The common writer renders the schema's content_template from these fields
-            # once. Lifecycle updates preserve the resulting immutable body.
-            operations.resolved_links = [StoredLink.model_validate(link) for link in links]
-            lock = await _acquire_stable_operation_lease(operations, fs, ctx)
+            ]
+            analysis.metadata["trajectory_memory"] = memory
+            analysis.metadata["experience_feedback_stats"] = await record_experience_feedback_stats(
+                memory, registry=registry, viking_fs=fs, ctx=ctx
+            )
+
+    async def _write_trajectory(
+        self,
+        operation: ResolvedOperation,
+        source: str,
+        fs: Any,
+        schema: MemoryTypeSchema,
+        registry: MemoryTypeRegistry,
+        ctx: RequestContext,
+        naming_context: ExtractContext,
+    ) -> tuple[str, str]:
+        """Lock only the actual write set; a filename collision never becomes an overwrite."""
+        fields = operation.memory_fields
+        for _ in range(5):
+            uri = generate_uri(
+                schema, fields, user_space=ctx.user.user_id, extract_context=naming_context
+            )
+            write_uris = [uri]
+            if schema.overview_template:
+                write_uris.append(uri.rsplit("/", 1)[0] + "/.overview.md")
+            lock = await fs._async_agfs.pathlock_acquire_exact_batch(
+                sorted(fs._uri_to_path(value, ctx=ctx) for value in write_uris), timeout_secs=30
+            )
+            if lock is None:
+                raise RuntimeError("Trajectory creation requires a file write lock")
             try:
-                existing = await self._read_trajectory(fs, uri, ctx)
-                if existing is None:
-                    updater = MemoryUpdater(
-                        registry=registry,
-                        vikingdb=self.vikingdb,
-                        transaction_handle=lock,
-                    )
-                    updater._viking_fs = fs
-                    update_result = await updater.apply_operations(operations, ctx)
-                    if update_result.errors:
-                        raise ValueError(
-                            "; ".join(
-                                f"{target}: {error}" for target, error in update_result.errors
-                            )
+                from openviking.session.train.components.trajectory_lifecycle import (
+                    trajectory_archive_uri,
+                )
+
+                if await fs.exists(uri, ctx=ctx) or await fs.exists(
+                    trajectory_archive_uri(uri), ctx=ctx
+                ):
+                    fields["trajectory_name"] = naming_context.get_random_id(refresh=True)
+                    continue
+                operation.uris = [uri]
+                operation.create_only = True
+                operation.old_memory_file_content = None
+                operation.search_tags = merge_search_tags(
+                    operation.search_tags, [f"{TRAJECTORY_OUTCOME_TAG}={fields['outcome']}"]
+                )
+                fields["archive_uri"] = trajectory_archive_uri(uri)
+                fields["experience_update"]["search_tags"] = list(operation.search_tags)
+                operations = ResolvedOperations(
+                    upsert_operations=[operation],
+                    delete_file_contents=[],
+                    errors=[],
+                    resolved_links=[
+                        StoredLink(
+                            from_uri=uri, to_uri=source, link_type="derived_from", weight=1.0
                         )
-                    raw = await fs.read_file(uri, ctx=ctx)
-                else:
-                    raw = existing
+                    ],
+                )
+                # Inbox is a durable work queue, not a retrieval corpus. Enqueue
+                # embedding at the final URI during archival, before removing inbox.
+                updater = MemoryUpdater(registry=registry, transaction_handle=lock)
+                updater._viking_fs = fs
+                result = await updater.apply_operations(operations, ctx)
+                if result.errors:
+                    raise ValueError(
+                        "; ".join(f"{target}: {error}" for target, error in result.errors)
+                    )
+                return uri, await fs.read_file(uri, ctx=ctx)
             finally:
-                if lock is not None:
-                    await fs._async_agfs.pathlock_release(lock)
-        memory = MemoryFileUtils.read(raw, uri=uri)
-        linked_source = trajectory_source_session_uri(memory)
-        if memory.extra_fields.get("case_name") != rollout.case.name or linked_source != source:
-            raise ValueError("Trajectory identity mismatch")
-        if memory.extra_fields.get("task_spec") != analysis.metadata.get("task_spec"):
-            raise ValueError("Trajectory task identity mismatch")
-        metadata = dict(memory.extra_fields)
-        metadata["source_session_uri"] = linked_source
-        metadata["gate_evidence"] = observation_evidence(
-            rollout.messages,
-            analysis.evaluation,
-            metadata.get("experience_execution") or {},
-        )
-        metadata["feedback"] = (
-            list(analysis.evaluation.feedback) if analysis.evaluation is not None else []
-        )
-        trajectory = Trajectory(
-            name=memory.extra_fields["trajectory_name"],
-            uri=uri,
-            content=memory.content,
-            outcome=memory.extra_fields["outcome"],
-            metadata=metadata,
-        )
-        analysis.trajectories = [trajectory]
-        analysis.metadata["trajectory_memory"] = memory
-        analysis.metadata["experience_feedback_stats"] = await record_experience_feedback_stats(
-            memory, registry=registry, viking_fs=fs, ctx=ctx
-        )
+                await fs._async_agfs.pathlock_release(lock)
+        raise RuntimeError("Could not allocate an unused Trajectory filename")
 
     @staticmethod
-    async def _read_trajectory(fs: Any, uri: str, ctx: RequestContext) -> str | None:
-        try:
-            return await fs.read_file(uri, ctx=ctx)
-        except Exception as exc:
-            if is_storage_not_found(exc):
-                return None
-            raise
+    async def _allocate_trajectory_uri(fs, schema, fields, ctx, naming_context) -> str:
+        from openviking.session.train.components.trajectory_lifecycle import trajectory_archive_uri
+
+        # Point lookups only. The definitive collision check is under the file lock.
+        for _ in range(5):
+            uri = generate_uri(
+                schema, fields, user_space=ctx.user.user_id, extract_context=naming_context
+            )
+            if not await fs.exists(uri, ctx=ctx) and not await fs.exists(
+                trajectory_archive_uri(uri), ctx=ctx
+            ):
+                return uri
+            fields["trajectory_name"] = naming_context.get_random_id(refresh=True)
+        raise RuntimeError("Could not allocate an unused Trajectory filename")
 
     async def extract_session_skills(
         self,

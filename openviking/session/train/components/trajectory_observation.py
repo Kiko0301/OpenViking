@@ -12,11 +12,19 @@ from openviking.session.memory.dataclass import (
     StoredLink,
 )
 from openviking.session.memory.experience.dag import clip_evidence_summary, tool_evidence_summary
-from openviking.session.train.domain import RolloutAnalysis, RubricEvaluation
+from openviking.session.train.domain import RolloutAnalysis, RubricEvaluation, Trajectory
+from openviking.telemetry import tracer
+from openviking.utils.path_safety import normalize_storage_target_uri
+from openviking.utils.tags import build_search_tags_filter
+from openviking.utils.token_estimation import truncate_text_to_token_budget
+from openviking_cli.exceptions import InvalidArgumentError
 
 MAX_EVIDENCE_CHARS = 64_000
 EXPERIENCE_EXECUTION_EVIDENCE_ID = "experience_execution"
 TRAJECTORY_FORMAT = "ordered_markdown_v3"
+TRAJECTORY_OUTCOME_TAG = "trajectory_outcome"
+TRAJECTORY_ANN_QUERY_TOKENS = 2048
+_TRAJECTORY_ANN_CANDIDATES = 8
 
 
 def execution_paths(execution: dict) -> dict:
@@ -155,6 +163,44 @@ def trajectory_source_session_uri(memory: MemoryFile) -> str:
     return sources[0]
 
 
+async def list_trajectory_uris(viking_fs: Any, ctx: Any, directory: str) -> list[str]:
+    """List one flat inbox; never recurse into archive or date directories."""
+    from openviking.session.archive_store import is_storage_not_found
+
+    directory = directory.rstrip("/")
+    result = set()
+    offset = 0
+    while True:
+        try:
+            entries = await viking_fs.ls(
+                directory,
+                output="original",
+                node_limit=1000,
+                offset=offset,
+                sort_by="name",
+                sort_order="asc",
+                ctx=ctx,
+            )
+        except Exception as exc:
+            if is_storage_not_found(exc):
+                break
+            raise
+        for entry in entries:
+            uri = str(entry.get("uri") or "").rstrip("/")
+            name = uri.rsplit("/", 1)[-1]
+            if (
+                uri.rsplit("/", 1)[0] == directory
+                and not name.startswith(".")
+                and name.endswith(".md")
+                and not (entry.get("isDir") or entry.get("is_dir"))
+            ):
+                result.add(uri)
+        if len(entries) < 1000:
+            break
+        offset += len(entries)
+    return sorted(result)
+
+
 @dataclass(slots=True)
 class ObservationGradient:
     """A persisted observation awaiting synthesis, not an Experience patch."""
@@ -169,3 +215,107 @@ class ObservationGradient:
     confidence: float = 1.0
     links: list[StoredLink] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _processed_success(memory: MemoryFile, case_name: str) -> Trajectory | None:
+    """Validate factual outcome/provenance after retrieval, never trust index tags alone."""
+    metadata = memory.extra_fields
+    if (
+        memory.memory_type != "trajectories"
+        or metadata.get("case_name") != case_name
+        or metadata.get("outcome") != "success"
+        or metadata.get("trajectory_format") != TRAJECTORY_FORMAT
+        or not metadata.get("trajectory_name")
+    ):
+        return None
+    state = metadata.get("experience_update")
+    if isinstance(state, str):
+        try:
+            state = json.loads(state)
+        except ValueError:
+            return None
+    if not isinstance(state, dict) or state.get("state") not in {"applied", "no_op"}:
+        return None
+    try:
+        source = trajectory_source_session_uri(memory)
+    except ValueError:
+        return None
+    return Trajectory(
+        name=metadata["trajectory_name"],
+        uri=memory.uri,
+        outcome="success",
+        content=memory.content,
+        metadata={**metadata, "source_session_uri": source},
+    )
+
+
+@tracer("train.trajectory.success_ann", ignore_args=True, ignore_result=True)
+async def find_successful_trajectory(
+    viking_fs: Any,
+    ctx: Any,
+    *,
+    trajectory: Trajectory,
+    directory: str,
+    case_name: str,
+    exclude_uris: set[str],
+) -> Trajectory | None:
+    """Return at most one ranked, validated success; never scan the filesystem as fallback."""
+    from openviking.session.archive_store import is_storage_not_found
+    from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+
+    # Stored steps omit result headers, lifecycle metadata and policy boilerplate.
+    # The domain object's content is the query for trajectories without extracted steps.
+    text = trajectory.metadata.get("steps", trajectory.content)
+    if not isinstance(text, str) or not text.strip():
+        return None
+    query = truncate_text_to_token_budget(text, TRAJECTORY_ANN_QUERY_TOKENS)
+    tracer.info(
+        f"Trajectory ANN query: uri={trajectory.uri} chars={len(query)} truncated={query != text}"
+    )
+    conditions = [build_search_tags_filter([f"{TRAJECTORY_OUTCOME_TAG}=success"])]
+    if exclude_uris:
+        conditions.append({"op": "must_not", "field": "uri", "conds": sorted(exclude_uris)})
+    try:
+        result = await viking_fs.find(
+            query=query,
+            target_uri=directory,
+            limit=_TRAJECTORY_ANN_CANDIDATES,
+            filter={"op": "and", "conds": conditions},
+            ctx=ctx,
+            level=[2],
+        )
+    except Exception as exc:
+        if is_storage_not_found(exc):
+            return None
+        raise
+    prefix = directory.rstrip("/") + "/"
+    seen = set()
+    for match in result.memories[:_TRAJECTORY_ANN_CANDIDATES]:
+        uri = match.uri
+        try:
+            canonical = normalize_storage_target_uri(uri)
+        except (ValueError, InvalidArgumentError):
+            continue
+        if canonical != uri or not uri.startswith(prefix) or not uri.endswith(".md"):
+            continue
+        if any(part.startswith(".") for part in uri[len(prefix) :].split("/")):
+            continue
+        if uri in exclude_uris or uri in seen:
+            continue
+        seen.add(uri)
+        try:
+            raw = await viking_fs.read_file(uri, ctx=ctx)
+        except Exception as exc:
+            if is_storage_not_found(exc):
+                continue
+            raise
+        if not raw:
+            continue
+        memory = MemoryFileUtils.read(raw, uri=uri)
+        selected = _processed_success(memory, case_name)
+        if selected is not None:
+            tracer.info(
+                f"Trajectory ANN match: query_uri={trajectory.uri} success_uri={uri} score={match.score}"
+            )
+            return selected
+    return None

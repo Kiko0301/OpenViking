@@ -27,6 +27,7 @@ from openviking.session.memory.dataclass import (
     StoredLink,
     WikiLink,
 )
+from openviking.session.memory.edit_repair import EditRepair, EditRepairResult
 from openviking.session.memory.extraction_output_protocol import (
     ExtractionOutputContext,
     ExtractionOutputProtocol,
@@ -241,6 +242,9 @@ class ExtractLoop:
         self._link_enabled = config.memory.link_enabled if config.memory else False
 
         self._resolve_effective_max_output_tokens()
+        edit_repair = EditRepair(
+            self.vlm, thinking=self.thinking, max_output_tokens=self._effective_max_output_tokens
+        )
 
         # 获取 ExtractContext（整个流程复用）
         self._extract_context = self.context_provider.get_extract_context()
@@ -287,8 +291,7 @@ class ExtractLoop:
 {reference_rules}
 ## Read Format Rules
 - Memory read functions accept optional `offset` (0-indexed) and `limit` arguments.
-- Some read results include line-number prefixes in the form `line_number<TAB>`; SDK object fields are shown as plain text.
-- When you copy text from read results into SEARCH/REPLACE or DELETE operations, copy the exact text after the line-number prefix. Never include the line-number prefix itself in `search`, `replace`, or `delete`.
+- SDK object fields are shown as plain text.
 {output_contract}
         """,
             }
@@ -369,6 +372,13 @@ class ExtractLoop:
                     raw_links = candidate_links
                 provider_errors = await self._validate_provider_operations(final_operations)
                 if provider_errors:
+                    repaired = await self._try_edit_repair(
+                        edit_repair, final_operations, provider_errors
+                    )
+                    final_operations = repaired.operations
+                    if repaired.repaired:
+                        provider_errors = []
+                if provider_errors:
                     if provider_validation_repair_count == 0:
                         provider_validation_repair_count += 1
                         max_iterations += 1
@@ -380,14 +390,12 @@ class ExtractLoop:
                                     "content": self._last_operations_content,
                                 }
                             )
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": self._build_provider_validation_repair_instruction(
-                                    provider_errors
-                                ),
-                            }
+                        feedback = self._build_provider_validation_repair_instruction(
+                            provider_errors
                         )
+                        if repaired.failure_reason:
+                            feedback += "\n\nLocal Edit repair failed: " + repaired.failure_reason
+                        messages.append({"role": "user", "content": feedback})
                         tracer.info(
                             "Extended max_iterations to "
                             f"{max_iterations} for provider validation repair"
@@ -481,6 +489,14 @@ class ExtractLoop:
                     continue
                 gate_errors = await self._validate_content_gates(final_operations)
                 patch_errors = await self._validate_patch_operations(final_operations)
+                if gate_errors or patch_errors:
+                    repaired = await self._try_edit_repair(
+                        edit_repair, final_operations, [*gate_errors, *patch_errors]
+                    )
+                    final_operations = repaired.operations
+                    if repaired.repaired:
+                        gate_errors = []
+                        patch_errors = []
                 if (gate_errors or patch_errors) and patch_repair_count == 0:
                     patch_repair_count += 1
                     max_iterations += 1
@@ -498,6 +514,8 @@ class ExtractLoop:
                             "Re-emit corrected operations. Errors: "
                             + json.dumps(gate_errors, ensure_ascii=False)
                         )
+                    if repaired.failure_reason:
+                        repair_parts.append("Local Edit repair failed: " + repaired.failure_reason)
                     messages.append({"role": "user", "content": "\n\n".join(repair_parts)})
                     tracer.info(
                         f"Extended max_iterations to {max_iterations} for retry patch repair"
@@ -1398,6 +1416,30 @@ class ExtractLoop:
         """Build schema-aware final-iteration instructions for the LLM."""
         return self._output_protocol.render_final_instruction(self._output_context)
 
+    async def _try_edit_repair(
+        self, repairer: EditRepair, operations: ResolvedOperations, errors: List[Dict[str, Any]]
+    ) -> EditRepairResult:
+        result = await repairer.repair(
+            operations, schemas=self._output_context.schemas, errors=errors
+        )
+        if not result.repaired:
+            return result
+        # Accept the copy only after all gates pass. Otherwise the original SDK
+        # draft and operations remain consistent for the existing full-loop retry.
+        validation_errors = [
+            *await self._validate_content_gates(result.operations),
+            *await self._validate_patch_operations(result.operations),
+        ]
+        if not validation_errors:
+            validation_errors = await self._validate_provider_operations(result.operations)
+        if validation_errors:
+            reason = "candidate_validation_failed: " + json.dumps(
+                validation_errors, ensure_ascii=False
+            )
+            tracer.info("Local Edit repair rejected; retaining original operations: " + reason)
+            return EditRepairResult(operations, failure_reason=reason)
+        return result
+
     async def _validate_content_gates(self, operations: ResolvedOperations) -> List[Dict[str, Any]]:
         from openviking.session.memory.streaming_memory_updater import (
             clone_operation_for_uri,
@@ -1455,81 +1497,61 @@ class ExtractLoop:
         self,
         operations: ResolvedOperations,
     ) -> List[Dict[str, Any]]:
-        from openviking.session.memory.merge_op.base import (
-            DeleteBlock,
-            SearchReplaceBlock,
-            StrPatch,
-        )
-        from openviking.session.memory.merge_op.patch_handler import unescape_markers
+        from openviking.session.memory.merge_op.base import StrPatch
+        from openviking.session.memory.merge_op.patch_handler import PatchParseError
 
         errors = []
         patch_op = PatchOp(FieldType.STRING)
         read_files = self.context_provider.read_file_contents or {}
         for operation in operations.upsert_operations:
-            if operation.old_memory_file_content is None:
+            previous = operation.old_memory_file_content
+            if previous is None:
                 continue
-            current_content = operation.old_memory_file_content.plain_content() or ""
-            target_uri = (
-                operation.uris[0] if operation.uris else operation.old_memory_file_content.uri
-            )
+            target_uri = operation.uris[0] if operation.uris else previous.uri
             for field_name, patch_value in operation.memory_fields.items():
-                blocks = []
-                if isinstance(patch_value, StrPatch):
-                    blocks = patch_value.blocks
-                elif isinstance(patch_value, dict) and "blocks" in patch_value:
-                    for raw_block in patch_value.get("blocks", []):
-                        if isinstance(raw_block, (SearchReplaceBlock, DeleteBlock)):
-                            blocks.append(raw_block)
-                        elif isinstance(raw_block, dict):
-                            blocks.extend(StrPatch.model_validate({"blocks": [raw_block]}).blocks)
-                if not blocks:
+                if isinstance(patch_value, dict) and "blocks" in patch_value:
+                    patch_value = StrPatch.model_validate(patch_value)
+                if not isinstance(patch_value, StrPatch):
                     continue
-                working_content = current_content
-                for block_index, block in enumerate(blocks, start=1):
-                    search = block.search or ""
-                    if not search or search == block.replace:
-                        continue
-                    effective_search = unescape_markers(search)
-                    match_count = working_content.count(effective_search)
-                    apply_failed = False
-                    try:
-                        applied_content = await patch_op.apply(
-                            working_content,
-                            StrPatch(blocks=[block]),
+                current = (
+                    previous.plain_content()
+                    if field_name == "content"
+                    else previous.extra_fields.get(field_name)
+                )
+                try:
+                    await patch_op.apply(current, patch_value, path=f"{target_uri}#{field_name}")
+                except PatchParseError as exc:
+                    index = exc.edit_index
+                    block = patch_value.blocks[index] if index is not None else None
+                    search = block.search if block is not None else ""
+                    found_in = []
+                    for uri, memory_file in read_files.items():
+                        other = (
+                            memory_file.plain_content()
+                            if field_name == "content"
+                            else memory_file.extra_fields.get(field_name)
                         )
-                    except Exception:
-                        apply_failed = True
-                        applied_content = working_content
-                    if applied_content != working_content:
-                        working_content = applied_content
-                        continue
-                    if match_count > 1:
-                        reason = "non_unique"
-                    elif match_count == 0:
-                        reason = "not_found"
-                    elif apply_failed:
-                        reason = "apply_error"
-                    else:
-                        reason = "not_applied"
-                    found_in = [
-                        uri
-                        for uri, memory_file in read_files.items()
-                        if uri != target_uri and search in (memory_file.plain_content() or "")
-                    ]
+                        if (
+                            uri != target_uri
+                            and search
+                            and isinstance(other, str)
+                            and search in other
+                        ):
+                            found_in.append(uri)
                     errors.append(
                         {
                             "uri": target_uri,
                             "page_id": operation.page_id,
                             "field": field_name,
-                            "block_index": block_index,
+                            "block_index": index + 1 if index is not None else None,
                             "search": search,
-                            "replace": block.replace,
-                            "reason": reason,
-                            "match_count": match_count,
+                            "replace": block.replace if block is not None else None,
+                            "reason": exc.reason,
+                            "match_count": exc.match_count,
+                            "error": str(exc),
                             "found_in_other_uris": found_in,
                         }
                     )
-                    break
         if errors:
             tracer.info(f"String patch validation failed before apply: {errors}")
         return errors

@@ -250,15 +250,7 @@ def case_experience_plan_items(
         raise ValueError("Case Experience merge produced empty content")
     current = _find_policy_by_uri(policy_set, target_uri)
     links: dict[str, StoredLink] = {}
-    source_sessions: dict[str, dict[str, Any]] = (
-        {
-            str(source["source_session_uri"]): _compact_source_session(source)
-            for source in (current.metadata.get("source_sessions") or [])
-            if isinstance(source, dict) and source.get("source_session_uri")
-        }
-        if current is not None
-        else {}
-    )
+    source_sessions: dict[str, dict[str, Any]] = {}
     for gradient in gradients:
         for link in gradient.links:
             if link.link_type == "derived_from" and link.to_uri:
@@ -281,10 +273,8 @@ def case_experience_plan_items(
             links=list(links.values()),
             metadata={
                 "merge_gradient_count": len(gradients),
-                "patch_metadata": {
-                    "case_name": name,
-                    "source_sessions": list(source_sessions.values()),
-                },
+                "source_sessions": list(source_sessions.values()),
+                "patch_metadata": {"case_name": name},
             },
         )
     ]

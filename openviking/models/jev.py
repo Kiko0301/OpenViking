@@ -7,12 +7,16 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from time import monotonic
 from typing import Any
 
 import httpx
 
 from openviking.telemetry import tracer
 from openviking_cli.utils.config.jev_config import JevConfig
+from openviking_cli.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class JevError(RuntimeError):
@@ -168,6 +172,8 @@ class JevClient:
 
     async def _post_with_retry(self, client: Any, payload: dict[str, Any]) -> dict[str, Any]:
         for attempt in range(self.config.max_retries + 1):
+            started = monotonic()
+            response = None
             try:
                 response = await client.post(self.config.api_url, json=payload)
                 response.raise_for_status()
@@ -176,17 +182,63 @@ class JevClient:
                     raise JevError("Jev decision response must be a JSON object")
                 return body
             except Exception as exc:
+                if isinstance(exc, httpx.HTTPStatusError):
+                    response = exc.response
+                oversized = isinstance(exc, JevPayloadTooLarge) or _payload_too_large_jev_error(exc)
+                retrying = (
+                    not oversized
+                    and attempt < self.config.max_retries
+                    and _retryable_jev_error(exc)
+                )
+                delay = _retry_delay(self.config, attempt=attempt, error=exc) if retrying else 0
+                headers = getattr(response, "headers", {})
+                # Do not log the payload, response body, URL or exception message: they may
+                # contain session content or credentials. No response means no HTTP code.
+                logger.warning(
+                    "[JEV_REQUEST_FAILED] %s",
+                    json.dumps(
+                        {
+                            "trace_id": tracer.get_trace_id(),
+                            "attempt": attempt + 1,
+                            "max_attempts": self.config.max_retries + 1,
+                            "elapsed_s": round(monotonic() - started, 3),
+                            "timeout_s": self.config.timeout,
+                            "error_type": type(exc).__name__,
+                            "http_status": getattr(response, "status_code", None),
+                            "provider_error_code": _response_error_code(response),
+                            "server_request_id": headers.get("x-request-id")
+                            or headers.get("x-tt-logid"),
+                            "retrying": retrying,
+                            "retry_delay_s": delay,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
                 if isinstance(exc, JevPayloadTooLarge):
                     raise
-                if _payload_too_large_jev_error(exc):
+                if oversized:
                     raise JevPayloadTooLarge(
                         f"Jev provider rejected oversized input with HTTP "
                         f"{exc.response.status_code}"
                     ) from exc
-                if attempt >= self.config.max_retries or not _retryable_jev_error(exc):
+                if not retrying:
                     raise JevError(f"Jev decision request failed: {exc}") from exc
-                await asyncio.sleep(_retry_delay(self.config, attempt=attempt, error=exc))
+                await asyncio.sleep(delay)
         raise AssertionError("unreachable")
+
+
+def _response_error_code(response: Any) -> str | int | None:
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    error = body.get("error", body) if isinstance(body, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    if isinstance(code, str):
+        return code[:128]
+    return code if type(code) is int else None
 
 
 def _retryable_jev_error(exc: Exception) -> bool:

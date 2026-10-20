@@ -42,7 +42,7 @@ class RemoteExperienceLearner:
         policy_set: ExperienceSet,
         context: PipelineContext | Any = None,
     ) -> RolloutTrainingResult:
-        """Learn once from all successful Phase 1 outputs, never resubmit their Sessions."""
+        """Use Phase 1 outputs to trigger their Case inboxes, never resubmit Sessions."""
         analyses = [analysis for batch in batches for analysis in batch.analyses]
         commits = [
             item
@@ -98,16 +98,20 @@ class RemoteExperienceLearner:
                 **progress,
             )
 
-        # Exact Phase 1 outputs only. Empty/missing URIs must not trigger a broad pending scan.
+        # URIs notify the server which canonical Cases have work. It consumes both
+        # old and new pending records in those inboxes, not only these URI entries.
+        # No notifications must still not trigger a global scan of unrelated Cases.
         if trajectory_uris:
             print(
-                f"[EXPERIENCE_LEARN_START] Processing {len(trajectory_uris)} pending Trajectories",
+                "[EXPERIENCE_LEARN_START] Consuming Case inboxes triggered by "
+                f"{len(trajectory_uris)} Trajectories",
                 flush=True,
             )
             await self._record_learning_event(
                 "experience_learn_start",
                 execution_metadata=execution_metadata,
-                trajectory_count=len(trajectory_uris),
+                trigger_trajectory_count=len(trajectory_uris),
+                selection_mode="case_inbox",
             )
             try:
                 submission = await self.client.learn_experiences(
@@ -158,7 +162,8 @@ class RemoteExperienceLearner:
                     "error": error,
                     "progress": last_progress,
                     "incomplete": True,
-                    "trajectory_count": len(trajectory_uris),
+                    # Trigger count is not work count: inbox can contain older work.
+                    "trajectory_count": None,
                 }
                 if last_progress is not None:
                     learning.update(
@@ -173,6 +178,8 @@ class RemoteExperienceLearner:
                 if printer is not None:
                     printer.finish()
                 learning["task_id"] = task_id
+                learning["trigger_trajectory_count"] = len(trajectory_uris)
+                learning["selection_mode"] = "case_inbox"
                 await self._record_learning_event(
                     "experience_learn_done",
                     execution_metadata=execution_metadata,
@@ -182,6 +189,8 @@ class RemoteExperienceLearner:
                         for key in (
                             "case_count",
                             "trajectory_count",
+                            "trigger_trajectory_count",
+                            "selection_mode",
                             "applied_count",
                             "no_op_count",
                             "failed_count",

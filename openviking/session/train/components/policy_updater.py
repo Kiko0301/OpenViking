@@ -6,15 +6,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
-from openviking.core.namespace import is_session_uri
 from openviking.session.memory.dataclass import (
     MemoryFile,
     ResolvedOperation,
     ResolvedOperations,
-    StoredLink,
 )
 from openviking.session.memory.memory_type_registry import get_default_registry
 from openviking.session.memory.memory_updater import MemoryUpdater
@@ -177,6 +174,8 @@ def _apply_items_to_snapshot(items: list[PolicyPlanItem], policy_set: PolicySet)
         )
         metadata = dict(existing.metadata) if existing is not None else {}
         metadata.update(item.metadata.get("patch_metadata", {}))
+        metadata.pop("source_sessions", None)
+        metadata.pop("success_trajectory_refs", None)
         metadata.setdefault("memory_type", item.memory_type or "experiences")
         metadata["experience_name"] = item.target_name
         version = (existing.version + 1) if existing is not None else 1
@@ -234,7 +233,6 @@ def _plan_to_resolved_operations(
 ) -> tuple[ResolvedOperations, list[str]]:
     upserts: list[ResolvedOperation] = []
     deletes: list[MemoryFile] = []
-    links: list[StoredLink] = []
     errors: list[str] = []
 
     for item in plan.items:
@@ -283,15 +281,8 @@ def _plan_to_resolved_operations(
                     "experience_name": updated.name,
                     "content": updated.content,
                     "status": updated.status,
-                    # Store forward provenance links without writing backlinks into immutable
-                    # Trajectories or source Session archives.
-                    "links": [
-                        *updated.links,
-                        *[
-                            link.model_dump()
-                            for link in _source_evidence_links(exp_uri=uri, links=item.links)
-                        ],
-                    ],
+                    # Training provenance stays in the plan; Case directories locate history.
+                    "links": list(updated.links),
                 },
                 memory_type=item.memory_type or "experiences",
                 uris=[uri],
@@ -303,7 +294,7 @@ def _plan_to_resolved_operations(
             upsert_operations=upserts,
             delete_file_contents=deletes,
             errors=[],
-            resolved_links=links,
+            resolved_links=[],
         ),
         errors,
     )
@@ -346,31 +337,6 @@ def _policy_to_memory_file(policy: Policy | None) -> MemoryFile | None:
             "status": policy.status,
         },
     )
-
-
-def _source_evidence_links(
-    *,
-    exp_uri: str,
-    links: list[StoredLink],
-) -> list[StoredLink]:
-    result: list[StoredLink] = []
-    seen: set[tuple[str, str | None]] = set()
-    for link in links or []:
-        if (
-            link.link_type != "derived_from"
-            or not link.to_uri
-            or not (is_session_uri(link.to_uri) or "/memories/trajectories/" in link.to_uri)
-        ):
-            continue
-        key = (link.to_uri, link.match_text)
-        if key in seen:
-            continue
-        seen.add(key)
-        update = {"from_uri": exp_uri, "match_text": None, "description": ""}
-        if not link.created_at:
-            update["created_at"] = datetime.now(timezone.utc).isoformat()
-        result.append(link.model_copy(update=update))
-    return result
 
 
 def _safe_experience_filename(name: str) -> str:

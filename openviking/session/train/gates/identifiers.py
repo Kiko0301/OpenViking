@@ -20,7 +20,8 @@ _IDENTIFIER_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{5,64}(?![A-Z
 
 @dataclass(slots=True)
 class ExperienceIdentifierGate:
-    ENABLED: ClassVar[bool] = True
+    # Temporarily disabled: the token heuristic rejects policy terms such as "24-hour".
+    ENABLED: ClassVar[bool] = False
 
     analysis: RolloutAnalysis
 
