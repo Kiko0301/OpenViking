@@ -115,6 +115,7 @@ class CompileScheduler:
         self._fs = viking_fs
         self._expiry: Any = None
         self._identity_resolver: Any = None
+        self._group_resolver: Any = None
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         # Installed by OpenVikingService; see build_credential_encryptor.
@@ -122,9 +123,10 @@ class CompileScheduler:
 
     # ---------- wiring ----------
 
-    def set_identity_resolver(self, resolver: Any) -> None:
-        """Install an async ``api_key -> ResolvedIdentity`` callable (APIKeyManager)."""
+    def set_identity_resolver(self, resolver: Any, group_resolver: Any) -> None:
+        """Install async API-key identity and account/user group resolvers."""
         self._identity_resolver = resolver
+        self._group_resolver = group_resolver
 
     async def save_credential(self, ctx: RequestContext) -> tuple[Dict[str, Any], Dict[str, str]]:
         """Return ``(executor, credential)``; a trusted-mode root key is saved as ``key_type=root``."""
@@ -261,7 +263,7 @@ class CompileScheduler:
         return outcome
 
     async def _executor(self, record: Dict[str, Any]) -> tuple[RequestContext, Dict[str, Any]]:
-        """Decrypt the saved key and check it still authorizes the saved executor.
+        """Verify the saved key and load the executor's current account groups.
 
         A user key must resolve to the same user; a root key must still be the
         root key, and the run acts as the saved user (as trusted requests do).
@@ -280,6 +282,7 @@ class CompileScheduler:
             api_key = json.loads(plaintext.decode("utf-8"))["api_key"]
         except Exception as exc:
             raise invalid from exc
+        group_ids = ()
         if self._identity_resolver is not None:
             try:
                 identity = await self._identity_resolver(api_key)
@@ -292,9 +295,13 @@ class CompileScheduler:
                 != (executor["account_id"], executor["user_id"])
             ):
                 raise invalid
+            group_ids = tuple(
+                await self._group_resolver(executor["account_id"], executor["user_id"])
+            )
         ctx = RequestContext(
             user=UserIdentifier(account_id=executor["account_id"], user_id=executor["user_id"]),
             role=Role.USER,
+            group_ids=group_ids,
             api_key=api_key,
         )
         connection = {

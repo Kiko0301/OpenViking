@@ -66,7 +66,8 @@ async def test_trusted_root_key_enables_and_triggers_schedule(service, tmp_path,
     await manager.load()
     app.state.api_key_manager = manager
     app.state.auth_plugin = TrustedAuthPlugin()
-    scheduler.set_identity_resolver(manager.resolve_identity)
+    resolve_groups = AsyncMock(return_value=("engineering",))
+    scheduler.set_identity_resolver(manager.resolve_identity, resolve_groups)
 
     alice = RequestContext(user=UserIdentifier("acct", "alice"), role=Role.ROOT)
     for uri, text in [(f"{SRC}/a.md", "a"), (f"{SKILL}/SKILL.md", "s")]:
@@ -114,6 +115,7 @@ async def test_trusted_root_key_enables_and_triggers_schedule(service, tmp_path,
     async def capture(record, *, ctx, connection, idempotency_key):
         submitted.append(connection)
         assert record["instruction"] == "scheduled instruction"
+        assert ctx.group_ids == ("engineering",)
 
     monkeypatch.setattr(service.compile, "create_scheduled", capture)
     async with store.edit("acct", record["id"]) as record:
@@ -145,3 +147,10 @@ async def test_trusted_root_key_enables_and_triggers_schedule(service, tmp_path,
     record = await store.get("acct", record["id"])
     assert record["last_triggered_slot"] == "2026-10-13T08:30:00+08:00"
     assert next_run_at(record, now) == "2026-10-20T08:30:00+08:00"
+    resolve_groups.assert_awaited_once_with("acct", "alice")
+    resolve_groups.return_value = ()
+    ctx, _ = await scheduler._executor(record)
+    assert ctx.group_ids == ()
+    resolve_groups.side_effect = OSError("account store unavailable")
+    with pytest.raises(OSError, match="account store unavailable"):
+        await scheduler._executor(record)

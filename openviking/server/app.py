@@ -174,7 +174,9 @@ async def _initialize_runtime_state(
     compile_scheduler = getattr(service, "compile_scheduler", None)
     if manager is not None and compile_scheduler is not None:
         # Scheduled Compile re-verifies its saved key before every submission.
-        compile_scheduler.set_identity_resolver(manager.resolve_identity)
+        compile_scheduler.set_identity_resolver(
+            manager.resolve_identity, manager.get_user_group_ids
+        )
     from openviking.service.deletion import setup_deletion
 
     app.state.deletion_service = await setup_deletion(
