@@ -126,6 +126,8 @@ The update body requires `to`, `from` (a non-empty source URI array), `skill`, `
 
 `update_schedule` requires `frequency` (`daily` or `weekly`). Optional `hour` (0–23) and `minute` (0–59) default to 0. Weekly schedules also accept `weekday` (1=Monday through 7=Sunday, default 1). Schedules use `Asia/Shanghai` time.
 
+Scheduled updates require `compile_api.scheduler_enabled=true` (default `false`) and valid `expiry.service_name` and `expiry.redis` configuration. `compile_api.scheduler_backend` only accepts `redis` (the default); `local` is invalid. Enabling `auto_update` while scheduling is disabled returns `COMPILE_SCHEDULER_DISABLED`. Manual incremental Compile and version management do not require Redis.
+
 Both history endpoints accept optional query parameters `limit` (1–100, default 20) and `cursor`. Pass the returned `next_cursor` unchanged; `null` marks the last page. `operation_id` is 1–128 characters, starts with a letter or digit, and otherwise allows letters, digits, `:`, `.`, `_`, and `-`. Operations remain queryable after target deletion. Missing targets, operations, or output manifests return `404`; an output result with `versions_available: false` indicates that frozen versions are unavailable.
 
 ### Check Compile availability

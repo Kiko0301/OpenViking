@@ -637,7 +637,6 @@ class OpenVikingService:
                 self._compile_service,
                 compile_store,
                 self._viking_fs,
-                backend=compile_config.scheduler_backend,
             )
             self._compile_scheduler.credential_encryptor = build_credential_encryptor(
                 self._config.encryption
@@ -704,9 +703,7 @@ class OpenVikingService:
             self._queue_manager.start()
             logger.info("QueueManager workers started")
 
-        compile_expiry_enabled = (
-            self._compile_scheduler is not None and compile_config.scheduler_backend == "redis"
-        )
+        compile_expiry_enabled = self._compile_scheduler is not None
         if session_expiry_enabled or compile_expiry_enabled:
             from openviking.scheduling.expiry.runtime import ExpiryRuntime, ExpiryRuntimeRoles
 
@@ -735,7 +732,7 @@ class OpenVikingService:
 
         if self._compile_scheduler is not None:
             await self._compile_scheduler.start()
-            logger.info("CompileScheduler started (backend=%s)", compile_config.scheduler_backend)
+            logger.info("CompileScheduler started (backend=redis)")
 
         # Preflight the MinerU endpoint when it will be used, so endpoint
         # misconfiguration or a stopped service surfaces now instead of on the

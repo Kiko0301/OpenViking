@@ -1,12 +1,11 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Scheduled Compile: due-slot checks, task submission and two discovery backends.
+"""Scheduled Compile: due-slot checks and task submission via Redis expiry.
 
 ``trigger_if_due`` owns the decision and submission under the target record
-lock. Backends only discover candidates: ``local`` scans each account's
-target_folders.json every minute; ``redis`` registers each target's next slot with the
-distributed ExpiryScheduler and also runs a slower compensation scan, because
-the record (not Redis) is the source of truth.
+lock. The distributed ExpiryScheduler discovers candidates; a startup scan and
+six-hour compensation scans repair registrations and recover missed triggers,
+because the target record (not Redis) is the source of truth.
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
@@ -29,7 +27,6 @@ logger = get_logger(__name__)
 
 TZ = ZoneInfo("Asia/Shanghai")
 COMPILE_TARGET_ITEM_TYPE = "compile_target"
-LOCAL_SCAN_SECONDS = 60.0
 COMPENSATION_SCAN_SECONDS = 6 * 3600.0
 CREDENTIAL_PROVIDER = "encrypted_api_key"
 
@@ -112,13 +109,10 @@ class CompileScheduler:
         compile_service: Any,
         store: CompileStore,
         viking_fs: Any,
-        *,
-        backend: str = "local",
     ) -> None:
         self._compile = compile_service
         self._store = store
         self._fs = viking_fs
-        self._backend = backend
         self._expiry: Any = None
         self._identity_resolver: Any = None
         self._task: Optional[asyncio.Task] = None
@@ -174,13 +168,8 @@ class CompileScheduler:
                 await self.scan_once()
             except Exception:
                 logger.exception("Compile scheduler scan failed")
-            if self._backend == "redis":
-                interval = COMPENSATION_SCAN_SECONDS
-            else:
-                # Wake 1s after the next minute boundary, where slots fall.
-                interval = LOCAL_SCAN_SECONDS + 1 - time.time() % LOCAL_SCAN_SECONDS
             try:
-                await asyncio.wait_for(self._stop.wait(), interval)
+                await asyncio.wait_for(self._stop.wait(), COMPENSATION_SCAN_SECONDS)
             except asyncio.TimeoutError:
                 pass
 
@@ -193,7 +182,7 @@ class CompileScheduler:
                 try:
                     if is_due(item, current_slot(item["update_schedule"], now)):
                         await self.trigger_if_due(account_id, item["id"], now)
-                    elif self._backend == "redis" and item.get("auto_update"):
+                    elif item.get("auto_update"):
                         await self.reschedule(account_id, item)
                 except Exception:
                     logger.exception("Compile schedule check failed for %s", item.get("id"))

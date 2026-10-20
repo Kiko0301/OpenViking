@@ -179,10 +179,9 @@ class CompileApiConfig(BaseModel):
     gateway_token: str = ""
     http_timeout_seconds: float = 10.0
     poll_interval_ms: int = 30000
-    # Run CompileScheduler on this instance.
-    scheduler_enabled: bool = True
-    # How due targets are discovered: hourly scan (local) or ExpiryScheduler callbacks (redis).
-    scheduler_backend: Literal["local", "redis"] = "local"
+    # Run Redis-backed Compile scheduling on this instance.
+    scheduler_enabled: bool = False
+    scheduler_backend: Literal["redis"] = "redis"
 
     @model_validator(mode="after")
     def _validate(self) -> "CompileApiConfig":
@@ -505,7 +504,7 @@ class OpenVikingConfig(BaseModel):
         return idle.enabled and idle.idle_backend == "redis"
 
     def uses_redis_compile_schedule(self) -> bool:
-        return self.compile_api.scheduler_enabled and self.compile_api.scheduler_backend == "redis"
+        return self.compile_api.scheduler_enabled
 
     def uses_redis_expiry(self) -> bool:
         """Whether any feature needs the distributed ExpiryScheduler."""

@@ -28,7 +28,7 @@ def load_expiry_config(path: Path):
     if not config.uses_redis_expiry():
         raise ValueError(
             "expiry publisher requires memory.session_auto_commit.idle_backend='redis' "
-            "or compile_api.scheduler_backend='redis'"
+            "or compile_api.scheduler_enabled=true (Redis)"
         )
     if not config.expiry.publisher_separate_process:
         raise ValueError("expiry publisher process is disabled by configuration")
