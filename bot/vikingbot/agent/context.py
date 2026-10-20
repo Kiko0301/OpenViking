@@ -397,6 +397,7 @@ IMPORTANT:
         experience_recall_enable: bool | None = None,
         exp_exclude_uris: list[str] | None = None,
         experience_case_lookup: dict[str, Any] | None = None,
+        include_system: bool = True,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -414,6 +415,8 @@ IMPORTANT:
                 from exposing OpenViking tools. Defaults to ov_tools_enable.
             exp_exclude_uris: Optional list of experience URIs that have already been recalled
                 in this session and should be skipped (deduplication).
+            include_system: Whether to prepend the system prompt. Steer inputs reuse the active
+                turn's existing system prompt and set this to False.
 
         Returns:
             List of messages including system prompt.
@@ -421,14 +424,15 @@ IMPORTANT:
         messages = []
 
         # System prompt
-        system_prompt = await self.build_system_prompt(
-            session_key,
-            ov_tools_enable=ov_tools_enable,
-            profile_user_list=profile_user_list,
-            memory_peer_ids=memory_peer_ids,
-            memory_owner_user_ids=memory_owner_user_ids,
-        )
-        messages.append({"role": "system", "content": system_prompt})
+        if include_system:
+            system_prompt = await self.build_system_prompt(
+                session_key,
+                ov_tools_enable=ov_tools_enable,
+                profile_user_list=profile_user_list,
+                memory_peer_ids=memory_peer_ids,
+                memory_owner_user_ids=memory_owner_user_ids,
+            )
+            messages.append({"role": "system", "content": system_prompt})
 
         # History
         if not self._eval:

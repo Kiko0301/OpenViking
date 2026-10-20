@@ -33,7 +33,6 @@ type AddResourceOptions struct {
 	Reason              string
 	Instruction         string
 	Wait                bool
-	Timeout             *float64
 	Strict              bool
 	IgnoreDirs          string
 	Include             string
@@ -52,7 +51,6 @@ type AddResourceOptions struct {
 // AddSkillOptions controls AddSkill.
 type AddSkillOptions struct {
 	Wait      bool
-	Timeout   *float64
 	Telemetry any
 	Extra     map[string]any
 	// TargetURI scopes the operation to a skills root such as
@@ -141,7 +139,6 @@ type GetSkillOptions struct {
 // UpdateSkillOptions controls UpdateSkill.
 type UpdateSkillOptions struct {
 	Wait           bool
-	Timeout        *float64
 	SourceMetadata map[string]any
 	Telemetry      any
 	TargetURI      any
@@ -176,11 +173,6 @@ type MCPToolMount struct {
 	TimeoutSeconds int
 	Arguments      map[string]any
 	Tags           []string
-}
-
-// WaitProcessedOptions controls WaitProcessed.
-type WaitProcessedOptions struct {
-	Timeout *float64 `json:"timeout,omitempty"`
 }
 
 // ObserverStatusOptions controls observer status formatting.
@@ -264,7 +256,6 @@ type TreePage struct {
 type RemoveOptions struct {
 	Recursive bool
 	Wait      bool
-	Timeout   *float64
 }
 
 // WriteOptions controls Write.
@@ -272,7 +263,6 @@ type WriteOptions struct {
 	ACL            *ACLSpec
 	Mode           string
 	Wait           bool
-	Timeout        *float64
 	Telemetry      any
 	ProcessingMode string
 	Tags           []string
@@ -294,7 +284,6 @@ type BatchWriteOperation struct {
 // BatchWriteOptions controls BatchWrite.
 type BatchWriteOptions struct {
 	Wait           *bool
-	Timeout        *float64
 	Telemetry      any
 	ProcessingMode string
 	Extra          map[string]any

@@ -10,6 +10,8 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as PlaygroundRouteImport } from './routes/playground'
+import { Route as MemoriesRouteImport } from './routes/memories'
+import { Route as ConfigRouteImport } from './routes/config'
 import { Route as WatchesRouteRouteImport } from './routes/watches/route'
 import { Route as VikingbotRouteRouteImport } from './routes/vikingbot/route'
 import { Route as UsersRouteRouteImport } from './routes/users/route'
@@ -24,6 +26,7 @@ import { Route as MonitoringRouteRouteImport } from './routes/monitoring/route'
 import { Route as HomeRouteRouteImport } from './routes/home/route'
 import { Route as GatewayRouteRouteImport } from './routes/gateway/route'
 import { Route as FilesystemRouteRouteImport } from './routes/filesystem/route'
+import { Route as DirectoryRouteRouteImport } from './routes/directory/route'
 import { Route as ArrangerRouteRouteImport } from './routes/arranger/route'
 import { Route as AgentExperienceRouteRouteImport } from './routes/agent-experience/route'
 import { Route as IndexRouteImport } from './routes/index'
@@ -52,6 +55,16 @@ import { Route as CompileTasksTaskIdRouteImport } from './routes/compile/tasks/$
 const PlaygroundRoute = PlaygroundRouteImport.update({
   id: '/playground',
   path: '/playground',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const MemoriesRoute = MemoriesRouteImport.update({
+  id: '/memories',
+  path: '/memories',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ConfigRoute = ConfigRouteImport.update({
+  id: '/config',
+  path: '/config',
   getParentRoute: () => rootRouteImport,
 } as any)
 const WatchesRouteRoute = WatchesRouteRouteImport.update({
@@ -122,6 +135,11 @@ const GatewayRouteRoute = GatewayRouteRouteImport.update({
 const FilesystemRouteRoute = FilesystemRouteRouteImport.update({
   id: '/filesystem',
   path: '/filesystem',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DirectoryRouteRoute = DirectoryRouteRouteImport.update({
+  id: '/directory',
+  path: '/directory',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ArrangerRouteRoute = ArrangerRouteRouteImport.update({
@@ -252,6 +270,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/agent-experience': typeof AgentExperienceRouteRouteWithChildren
   '/arranger': typeof ArrangerRouteRoute
+  '/directory': typeof DirectoryRouteRoute
   '/filesystem': typeof FilesystemRouteRoute
   '/gateway': typeof GatewayRouteRouteWithChildren
   '/home': typeof HomeRouteRoute
@@ -266,6 +285,8 @@ export interface FileRoutesByFullPath {
   '/users': typeof UsersRouteRouteWithChildren
   '/vikingbot': typeof VikingbotRouteRouteWithChildren
   '/watches': typeof WatchesRouteRoute
+  '/config': typeof ConfigRoute
+  '/memories': typeof MemoriesRoute
   '/playground': typeof PlaygroundRoute
   '/agent-experience/$experienceUri': typeof AgentExperienceExperienceUriRoute
   '/compile/new': typeof CompileNewRoute
@@ -292,6 +313,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/arranger': typeof ArrangerRouteRoute
+  '/directory': typeof DirectoryRouteRoute
   '/filesystem': typeof FilesystemRouteRoute
   '/home': typeof HomeRouteRoute
   '/monitoring': typeof MonitoringRouteRoute
@@ -302,6 +324,8 @@ export interface FileRoutesByTo {
   '/skills': typeof SkillsRouteRoute
   '/tasks': typeof TasksRouteRoute
   '/watches': typeof WatchesRouteRoute
+  '/config': typeof ConfigRoute
+  '/memories': typeof MemoriesRoute
   '/playground': typeof PlaygroundRoute
   '/agent-experience/$experienceUri': typeof AgentExperienceExperienceUriRoute
   '/compile/new': typeof CompileNewRoute
@@ -330,6 +354,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/agent-experience': typeof AgentExperienceRouteRouteWithChildren
   '/arranger': typeof ArrangerRouteRoute
+  '/directory': typeof DirectoryRouteRoute
   '/filesystem': typeof FilesystemRouteRoute
   '/gateway': typeof GatewayRouteRouteWithChildren
   '/home': typeof HomeRouteRoute
@@ -344,6 +369,8 @@ export interface FileRoutesById {
   '/users': typeof UsersRouteRouteWithChildren
   '/vikingbot': typeof VikingbotRouteRouteWithChildren
   '/watches': typeof WatchesRouteRoute
+  '/config': typeof ConfigRoute
+  '/memories': typeof MemoriesRoute
   '/playground': typeof PlaygroundRoute
   '/agent-experience/$experienceUri': typeof AgentExperienceExperienceUriRoute
   '/compile/new': typeof CompileNewRoute
@@ -373,6 +400,7 @@ export interface FileRouteTypes {
     | '/'
     | '/agent-experience'
     | '/arranger'
+    | '/directory'
     | '/filesystem'
     | '/gateway'
     | '/home'
@@ -387,6 +415,8 @@ export interface FileRouteTypes {
     | '/users'
     | '/vikingbot'
     | '/watches'
+    | '/config'
+    | '/memories'
     | '/playground'
     | '/agent-experience/$experienceUri'
     | '/compile/new'
@@ -413,6 +443,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/arranger'
+    | '/directory'
     | '/filesystem'
     | '/home'
     | '/monitoring'
@@ -423,6 +454,8 @@ export interface FileRouteTypes {
     | '/skills'
     | '/tasks'
     | '/watches'
+    | '/config'
+    | '/memories'
     | '/playground'
     | '/agent-experience/$experienceUri'
     | '/compile/new'
@@ -450,6 +483,7 @@ export interface FileRouteTypes {
     | '/'
     | '/agent-experience'
     | '/arranger'
+    | '/directory'
     | '/filesystem'
     | '/gateway'
     | '/home'
@@ -464,6 +498,8 @@ export interface FileRouteTypes {
     | '/users'
     | '/vikingbot'
     | '/watches'
+    | '/config'
+    | '/memories'
     | '/playground'
     | '/agent-experience/$experienceUri'
     | '/compile/new'
@@ -492,6 +528,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AgentExperienceRouteRoute: typeof AgentExperienceRouteRouteWithChildren
   ArrangerRouteRoute: typeof ArrangerRouteRoute
+  DirectoryRouteRoute: typeof DirectoryRouteRoute
   FilesystemRouteRoute: typeof FilesystemRouteRoute
   GatewayRouteRoute: typeof GatewayRouteRouteWithChildren
   HomeRouteRoute: typeof HomeRouteRoute
@@ -506,6 +543,8 @@ export interface RootRouteChildren {
   UsersRouteRoute: typeof UsersRouteRouteWithChildren
   VikingbotRouteRoute: typeof VikingbotRouteRouteWithChildren
   WatchesRouteRoute: typeof WatchesRouteRoute
+  ConfigRoute: typeof ConfigRoute
+  MemoriesRoute: typeof MemoriesRoute
   PlaygroundRoute: typeof PlaygroundRoute
   CompileNewRoute: typeof CompileNewRoute
   OauthConsentRoute: typeof OauthConsentRoute
@@ -521,6 +560,20 @@ declare module '@tanstack/react-router' {
       path: '/playground'
       fullPath: '/playground'
       preLoaderRoute: typeof PlaygroundRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/memories': {
+      id: '/memories'
+      path: '/memories'
+      fullPath: '/memories'
+      preLoaderRoute: typeof MemoriesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/config': {
+      id: '/config'
+      path: '/config'
+      fullPath: '/config'
+      preLoaderRoute: typeof ConfigRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/watches': {
@@ -619,6 +672,13 @@ declare module '@tanstack/react-router' {
       path: '/filesystem'
       fullPath: '/filesystem'
       preLoaderRoute: typeof FilesystemRouteRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/directory': {
+      id: '/directory'
+      path: '/directory'
+      fullPath: '/directory'
+      preLoaderRoute: typeof DirectoryRouteRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/arranger': {
@@ -877,6 +937,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AgentExperienceRouteRoute: AgentExperienceRouteRouteWithChildren,
   ArrangerRouteRoute: ArrangerRouteRoute,
+  DirectoryRouteRoute: DirectoryRouteRoute,
   FilesystemRouteRoute: FilesystemRouteRoute,
   GatewayRouteRoute: GatewayRouteRouteWithChildren,
   HomeRouteRoute: HomeRouteRoute,
@@ -891,6 +952,8 @@ const rootRouteChildren: RootRouteChildren = {
   UsersRouteRoute: UsersRouteRouteWithChildren,
   VikingbotRouteRoute: VikingbotRouteRouteWithChildren,
   WatchesRouteRoute: WatchesRouteRoute,
+  ConfigRoute: ConfigRoute,
+  MemoriesRoute: MemoriesRoute,
   PlaygroundRoute: PlaygroundRoute,
   CompileNewRoute: CompileNewRoute,
   OauthConsentRoute: OauthConsentRoute,

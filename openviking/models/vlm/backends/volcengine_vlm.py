@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from openviking.models.model_error import model_error_boundary
 from openviking.models.network import (
     create_optional_async_httpx_client,
     create_optional_sync_httpx_client,
@@ -120,12 +121,12 @@ class VolcEngineVLM(OpenAIVLM):
                 raise ImportError(
                     "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
                 )
-            kwargs = dict(
-                api_key=self.api_key,
-                base_url=self.api_base,
-                timeout=self.timeout,
-                max_retries=0,
-            )
+            kwargs = {
+                "api_key": self.api_key,
+                "base_url": self.api_base,
+                "timeout": self.timeout,
+                "max_retries": 0,
+            }
             http_client = create_optional_sync_httpx_client(
                 self.api_base,
                 timeout=self.timeout,
@@ -143,12 +144,12 @@ class VolcEngineVLM(OpenAIVLM):
             raise ImportError(
                 "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
             )
-        kwargs = dict(
-            api_key=self.api_key,
-            base_url=self.api_base,
-            timeout=self.timeout,
-            max_retries=0,
-        )
+        kwargs = {
+            "api_key": self.api_key,
+            "base_url": self.api_base,
+            "timeout": self.timeout,
+            "max_retries": 0,
+        }
         http_client = create_optional_async_httpx_client(
             self.api_base,
             timeout=self.timeout,
@@ -190,6 +191,7 @@ class VolcEngineVLM(OpenAIVLM):
             media_type=media_type,
         )
 
+    @model_error_boundary
     def get_completion(
         self,
         prompt: str = "",
@@ -198,7 +200,7 @@ class VolcEngineVLM(OpenAIVLM):
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, VLMResponse]:
-        """Get text completion via Chat Completions API."""
+        """Get text completion; configured effort applies only when thinking is enabled."""
         effective_thinking = self.thinking if thinking is None else thinking
         kwargs_messages = sanitize_openai_messages(
             messages or [{"role": "user", "content": prompt}]
@@ -214,6 +216,8 @@ class VolcEngineVLM(OpenAIVLM):
             kwargs["extra_body"] = dict(self.extra_request_body)
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
+        if effective_thinking and self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -232,6 +236,7 @@ class VolcEngineVLM(OpenAIVLM):
             return result
         return self._clean_response(str(result))
 
+    @model_error_boundary
     async def get_completion_async(
         self,
         prompt: str = "",
@@ -242,8 +247,10 @@ class VolcEngineVLM(OpenAIVLM):
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> Union[str, VLMResponse]:
-        """Get text completion; per-call reasoning effort applies only with thinking enabled."""
+        """Get text completion; explicit effort overrides configured effort when thinking is enabled."""
         effective_thinking = self.thinking if thinking is None else thinking
+        if reasoning_effort is None:
+            reasoning_effort = self.reasoning_effort
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         kwargs_messages = sanitize_openai_messages(
             messages or [{"role": "user", "content": prompt}]
@@ -409,6 +416,7 @@ class VolcEngineVLM(OpenAIVLM):
         else:
             return {"type": "image_url", "image_url": {"url": image}}
 
+    @model_error_boundary
     def get_vision_completion(
         self,
         prompt: str = "",
@@ -459,6 +467,7 @@ class VolcEngineVLM(OpenAIVLM):
             return result
         return self._clean_response(str(result))
 
+    @model_error_boundary
     async def get_vision_completion_async(
         self,
         prompt: str = "",

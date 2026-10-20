@@ -1,3 +1,5 @@
+import onboarding from './en/onboarding'
+import studio from './en/studio'
 import vikingbot from './en/vikingbot'
 import compile from './en/compile'
 import memoryPolicy from './en/user-memory-policy'
@@ -9,6 +11,8 @@ import gateway from './en/gateway'
 import arranger from './en/arranger'
 
 const en = {
+  studio,
+  onboarding,
   arranger,
   gateway,
   compile,

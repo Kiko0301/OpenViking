@@ -31,6 +31,7 @@ from .consts import (
 )
 from .embedding_config import EmbeddingConfig
 from .encryption_config import EncryptionConfig
+from .expiry_config import ExpiryConfig
 from .git_config import GitConfig
 from .glob_config import GlobConfig
 from .grep_config import GrepConfig
@@ -159,6 +160,18 @@ class ParserApiConfig(BaseModel):
         return self
 
 
+class ParserRuntimeConfig(BaseModel):
+    """Runtime directories used by built-in parser download/extraction paths."""
+
+    download_temp_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Directory for parser-owned downloads, Git checkouts, and archive extraction. "
+            "Defaults to the system temporary directory."
+        ),
+    )
+
+
 class CompileApiConfig(BaseModel):
     """Configuration for the external Compile task API."""
 
@@ -210,6 +223,11 @@ class OpenVikingConfig(BaseModel):
 
     storage: StorageConfig = Field(
         default_factory=StorageConfig, description="Storage configuration"
+    )
+
+    parser: ParserRuntimeConfig = Field(
+        default_factory=ParserRuntimeConfig,
+        description="Runtime directories used by built-in parsers",
     )
 
     embedding: EmbeddingConfig = Field(
@@ -464,6 +482,21 @@ class OpenVikingConfig(BaseModel):
 
     memory: MemoryConfig = Field(default_factory=MemoryConfig, description="Memory configuration")
 
+    expiry: ExpiryConfig = Field(
+        default_factory=ExpiryConfig,
+        description="Distributed expiry scheduling configuration",
+    )
+
+    @model_validator(mode="after")
+    def _validate_expiry_backend(self) -> "OpenVikingConfig":
+        self._check_expiry_backend()
+        return self
+
+    def _check_expiry_backend(self) -> None:
+        idle = self.memory.session_auto_commit
+        if idle.enabled and idle.idle_backend == "redis":
+            self.expiry.validate_for_runtime()
+
     agent_evolution: AgentEvolutionConfig = RuntimeField(
         default_factory=AgentEvolutionConfig,
         description="Dynamic cluster default for Agent Evolution.",
@@ -495,7 +528,7 @@ class OpenVikingConfig(BaseModel):
         ),
     )
 
-    model_config = {"arbitrary_types_allowed": True}
+    model_config = {"arbitrary_types_allowed": True, "hide_input_in_errors": True}
 
     @classmethod
     def from_dict(cls, config: Dict[str, Any]) -> "OpenVikingConfig":
@@ -532,6 +565,8 @@ class OpenVikingConfig(BaseModel):
 
             # Handle parser configurations from nested "parsers" section
             parser_configs = {}
+            missing_parser_download_temp_dir = object()
+            parser_download_temp_dir = missing_parser_download_temp_dir
             if "parsers" in config_copy:
                 parser_configs = config_copy.pop("parsers")
                 if parser_configs is None:
@@ -545,9 +580,12 @@ class OpenVikingConfig(BaseModel):
                         "Config field 'parsers.excel' was removed and is ignored; "
                         "spreadsheet parsing now uses 'parsers.anydoc'."
                     )
+                parser_download_temp_dir = parser_configs.pop(
+                    "download_temp_dir", missing_parser_download_temp_dir
+                )
                 warn_unknown_fields(
                     data=parser_configs,
-                    valid_fields=set(parser_types),
+                    valid_fields=set(parser_types) | {"download_temp_dir"},
                     path_prefix="parsers",
                     logger=_get_config_logger(),
                 )
@@ -582,9 +620,13 @@ class OpenVikingConfig(BaseModel):
                             error=e,
                             path_prefix="memory",
                         )
-                    ) from e
+                    ) from None
+            instance._check_expiry_backend()
 
             # Apply parser configurations
+            if parser_download_temp_dir is not missing_parser_download_temp_dir:
+                instance.parser = ParserRuntimeConfig(download_temp_dir=parser_download_temp_dir)
+
             for parser_type in parser_types:
                 if parser_type in parser_configs:
                     parser_data = parser_configs[parser_type]
@@ -615,7 +657,9 @@ class OpenVikingConfig(BaseModel):
                     )
             return instance
         except ValidationError as e:
-            raise ValueError(format_validation_error(root_model=cls, error=e)) from e
+            # The formatted error omits input values; do not reattach a raw
+            # validation traceback which could expose nested credentials.
+            raise ValueError(format_validation_error(root_model=cls, error=e)) from None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""

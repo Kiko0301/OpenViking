@@ -1,3 +1,5 @@
+import onboarding from './zh-CN/onboarding'
+import studio from './zh-CN/studio'
 import vikingbot from './zh-CN/vikingbot'
 import gateway from './zh-CN/gateway'
 import compile from './zh-CN/compile'
@@ -10,6 +12,8 @@ import arranger from './zh-CN/arranger'
 
 const zhCN = {
   arranger,
+  studio,
+  onboarding,
   gateway,
   compile,
   vikingbot,
