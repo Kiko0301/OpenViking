@@ -2494,6 +2494,25 @@ class ResourceService:
         telemetry_id = get_current_telemetry().telemetry_id
         telemetry_cleanup_scheduled = False
 
+        async def record_package(skill_uri: str, lease_ref: Any) -> None:
+            """Preserve standalone ordinary packages under their lease for Compile rollback."""
+            if (
+                self.compile_versions is not None
+                and owner_lease_ref is None
+                and (source_metadata or {}).get("source") != "compile"
+                and (target := await self.compile_versions.owning_target(ctx.account_id, skill_uri))
+                and await self.compile_versions._write_meta(ctx.account_id, target)
+            ):
+                await self.compile_versions.record_operation(
+                    [skill_uri],
+                    ctx,
+                    "agent_revise",
+                    {},
+                    lambda: self.compile_versions.register_transfer(
+                        skill_uri, skill_uri, ctx, lease_ref=lease_ref
+                    ),
+                )
+
         try:
             # Establish ownership before any queue work can start. Descendant
             # semantic and embedding messages inherit this same cancellable task.
@@ -2535,6 +2554,7 @@ class ResourceService:
                             target_uri=target_uri,
                             source_metadata=source_metadata,
                             owner_lease_ref=owner_lease_ref,
+                            on_package_written=record_package,
                         )
                     else:
                         result = await self._skill_processor.process_skill(
@@ -2548,6 +2568,7 @@ class ResourceService:
                             target_uri=target_uri,
                             source_metadata=source_metadata,
                             owner_lease_ref=owner_lease_ref,
+                            on_package_written=record_package,
                         )
                 if isinstance(result, dict) and "root_uri" not in result and result.get("uri"):
                     result["root_uri"] = result["uri"]

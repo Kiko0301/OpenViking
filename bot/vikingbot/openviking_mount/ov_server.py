@@ -668,9 +668,15 @@ class VikingClient:
         target_uri: str,
         wait: bool = True,
     ) -> Dict[str, Any]:
+        """Publish a Compile-created package so failed tasks can roll back their own output."""
         return await self.client.add_skill(
             path,
-            options={"target_uri": target_uri},
+            options={
+                "target_uri": target_uri,
+                "extra": {
+                    "source_metadata": {"type": "api", "source": "compile", "operation": "add"}
+                },
+            },
             wait=wait,
         )
 
