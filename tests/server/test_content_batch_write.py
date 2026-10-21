@@ -147,6 +147,21 @@ def _coordinator_queue_for_unit_tests(monkeypatch, request):
 
 
 @pytest.mark.asyncio
+async def test_batch_coalesces_compile_target_updates(service, monkeypatch):
+    """A batch saves its managed target's content-update time once."""
+    ctx = RequestContext(user=service.user, role=Role.USER)
+    root = "viking://resources/batch-metadata"
+    store = service.compile.lifecycle.store
+    await service.viking_fs.write_file(f"{root}/seed.md", "seed", ctx=ctx)
+    await store.register(ctx.account_id, root)
+    update_time = AsyncMock(wraps=store.mark_content_updated)
+    monkeypatch.setattr(store, "mark_content_updated", update_time)
+    ops = [{"uri": f"{root}/{i}.md", "content": "changed"} for i in range(100)]
+    await service.fs.batch_write(root_uri=root, operations=ops, ctx=ctx, defer_processing=True)
+    update_time.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_batch_accepts_more_than_256_operations(monkeypatch):
     root = "viking://resources/wiki"
     vfs = _VFS(root)

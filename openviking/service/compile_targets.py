@@ -1712,6 +1712,7 @@ class CompileVersions:
             "outputs": {target["id"]: {} for target, _ in entries},
             "targets": {target["id"]: target for target, _ in entries},
             "changed": set(),
+            "batch": params.get("batch", False),
         }
         token = _operation_outputs.set(context)
         outcome = {}
@@ -2175,6 +2176,7 @@ class CompileVersions:
         """Write under the content lease and register ordinary versions with provenance.
 
         Unversioned writes still record actual content changes.
+        Ordinary batches save each target's change time during batch finalization.
         Active Compile writes defer the directory timestamp to task finalization.
         Operation outputs select rollback content; after_compile_snapshot protects newer
         ordinary versions from a retry of the frozen finish snapshot.
@@ -2228,7 +2230,15 @@ class CompileVersions:
                     )
                 else:
                     run = None
-            if write is not None and run is None:
+            is_batch = (
+                context is not None
+                and context["account_id"] == ctx.account_id
+                and context.get("batch", False)
+                and target_id in context["outputs"]
+            )
+            if run is None and (
+                (write is not None and not is_batch) or (write is None and is_batch)
+            ):
                 await self._store.mark_content_updated(ctx.account_id, target_id)
             if context and context["account_id"] == ctx.account_id:
                 context["changed"].update(targets)
