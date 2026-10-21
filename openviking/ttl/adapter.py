@@ -103,11 +103,12 @@ class TTLAdapter(Protocol):
         ctx: Optional["RequestContext"],
         written_at_ms: int,
     ) -> None:
-        """Handle one committed write: register the owning directory in Redis.
+        """Buffer a committed write for background directory registration.
 
         Runs after the storage write is committed and must never turn a
         successful write into a failure; the kernel already swallows and logs
-        exceptions raised here.
+        exceptions raised here. Commercial implementations only merge into a
+        bounded local buffer here; Redis registration belongs to their worker.
         """
 
     async def register_initial_backfill(self, request: TTLBackfillRequest) -> None:
