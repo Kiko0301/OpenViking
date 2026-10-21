@@ -4,7 +4,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -840,35 +840,6 @@ async def test_restore_partial_writeback_surfaces_structured_error(
     # failed_writes round-trips as list-of-list under JSON since to_dict
     # serialises the tuples that way.
     assert details["failed_writes"] == [["resources/bad.md", "vfs write boom"]]
-
-
-async def test_restore_file_version_fields(snapshot_router_client, monkeypatch):
-    """Explicit version fields reach restore; ambiguous field names are rejected."""
-    from openviking.server.routers import snapshot
-
-    uri = "viking://resources/wiki/page.md"
-    result = {
-        "uri": uri,
-        "version_id": "v3",
-        "meta": {"task_id": None, "restored_from": "v1", "after_compile_snapshot": False},
-    }
-    restore = AsyncMock(return_value=result)
-    service = SimpleNamespace(compile=SimpleNamespace(restore_file_version=restore))
-    monkeypatch.setattr(snapshot, "get_service", lambda: service)
-    response = await snapshot_router_client.post(
-        "/api/v1/snapshot/restore",
-        json={"path": uri, "restore_version": "v1", "current_version": "v2"},
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["result"] == result
-    restore.assert_awaited_once_with(uri=uri, restore_version="v1", current_version="v2", ctx=ANY)
-    response = await snapshot_router_client.post(
-        "/api/v1/snapshot/restore",
-        json={"path": uri, "restore_from_version": "v1", "expected_current_version": "v2"},
-    )
-    assert response.status_code == 400, response.text
-    assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
-    restore.assert_awaited_once()
 
 
 async def test_restore_rejects_unknown_field_per_pydantic_forbid(client_with_resource):

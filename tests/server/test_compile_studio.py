@@ -137,177 +137,280 @@ async def test_concurrent_submission_retry_and_restart(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_http_contract_preserves_legacy_list_and_retries(monkeypatch):
-    import httpx
-    from fastapi import FastAPI
-    from fastapi.responses import JSONResponse
+async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
+    service, app, client, monkeypatch, tmp_path
+):
+    """One target keeps its history, ordinary edits and live permissions across runs."""
+    import base64
+    from datetime import datetime, timedelta
 
-    import openviking.server.routers.compile as compile_router
-    import openviking.server.routers.tasks as task_router
     import openviking.service.external_task_service as external
-    import openviking.service.task_tracker as tracker_module
     from openviking.server.auth import get_request_context
-    from openviking.service.compile_service import CompileService
-    from openviking_cli.exceptions import OpenVikingError
-    from openviking_cli.utils.config.open_viking_config import CompileApiConfig
+    from openviking.server.identity import ResolvedIdentity
+    from openviking.service.compile_scheduler import (
+        TZ,
+        CompileScheduler,
+        build_credential_encryptor,
+    )
+    from openviking.service.compile_service import CompileSessionAccepted, CompileSessionStatus
+    from openviking.service.task_tracker import get_task_tracker
+    from openviking.storage.acl import AclMode
+    from openviking_cli.exceptions import NotFoundError, PermissionDeniedError
 
-    agfs = _FakeAgfs()
-    store = PersistentTaskStore(agfs)
-    tracker = TaskTracker(store)
-    monkeypatch.setattr(external, "get_task_tracker", lambda: tracker)
-    monkeypatch.setattr(task_router, "get_task_tracker", lambda: tracker)
-    monkeypatch.setattr(tracker_module, "get_task_tracker", lambda: tracker)
-    monkeypatch.setattr(external, "get_queue_manager", lambda: SimpleNamespace(enqueue=AsyncMock()))
-    tasks = ExternalTaskService()
-    fs = SimpleNamespace(
-        stat=AsyncMock(
-            side_effect=lambda uri, ctx: {"uri": uri, "isDir": not uri.endswith("SKILL.md")}
-        ),
-        ensure_write_access=AsyncMock(),
+    ctx = RequestContext(
+        user=service.user, role=Role.USER, group_ids=("engineering",), api_key="test-compile-key"
     )
-    compile_service = CompileService(CompileApiConfig(), tasks, fs)
-    compile_service.configure_local_backend("http://localhost:1", "")
-    tasks.register(compile_service)
-    monkeypatch.setattr(
-        compile_router, "get_service", lambda: SimpleNamespace(compile=compile_service)
-    )
-    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
-    app = FastAPI()
-    app.include_router(compile_router.router)
-    app.include_router(task_router.router)
+    admin = RequestContext(user=service.user, role=Role.ADMIN)
     app.dependency_overrides[get_request_context] = lambda: ctx
+    owner = {"account_id": ctx.account_id, "user_id": ctx.user.user_id}
+    source, target = "viking://resources/source", "viking://resources/wiki"
+    skill = f"viking://user/{ctx.user.user_id}/skills/wiki"
+    page, picture = f"{target}/page.md", f"{target}/diagram.png"
+    png = b"\x89PNG\r\n\x1a\noriginal"
+    for uri, content in {
+        f"{source}/a.md": "source",
+        f"{skill}/SKILL.md": "Build a wiki",
+        f"{target}/old.md": "keep renamed",
+        f"{target}/discard.md": "remove",
+        "viking://resources/inbox/note.md": "keep imported",
+        "viking://resources/inbox/copy.md": "keep copied",
+        picture: png,
+    }.items():
+        await service.viking_fs.write_file(uri, content, ctx=admin)
+    await service.runtime_config_manager.patch_account(ctx.account_id, {"acl": {"enabled": True}})
+    await service.vikingdb_manager.upsert(
+        {
+            "id": "compile-source",
+            "uri": source,
+            "account_id": ctx.account_id,
+            "context_type": "resource",
+            "level": 0,
+            "vector": [0.1] * service.vikingdb_manager.vector_dim,
+        },
+        ctx=admin,
+    )
+    await service.fs.set_acl(
+        source,
+        [{"principal": "group:engineering", "level": "read"}],
+        ctx=admin,
+        acl_mode=AclMode.RESTRICTED,
+    )
 
-    @app.exception_handler(OpenVikingError)
-    async def on_error(request, error):
-        return JSONResponse(
-            status_code=409 if error.code == "CONFLICT" else 400, content={"error": error.code}
-        )
+    # Drive the real task provider explicitly; generation and derived refresh are external work.
+    monkeypatch.setattr(external, "get_queue_manager", lambda: SimpleNamespace(enqueue=AsyncMock()))
+    monkeypatch.setattr(service, "reindex", AsyncMock(return_value={"status": "accepted"}))
+    monkeypatch.setattr(service.fs, "_enqueue_copy_refresh", AsyncMock(return_value="queued"))
+    monkeypatch.setattr(service.fs, "_enqueue_delete_refresh", AsyncMock(return_value="skipped"))
+    monkeypatch.setattr("openviking.service.fs_service.vectorize_directory_meta", AsyncMock())
+    monkeypatch.setattr(service.viking_fs, "_schedule_restore_reindex_for_paths", AsyncMock())
+    service.compile.configure_local_backend("http://localhost:1", "")
+    calls = []
+    runtime_status = "completed"
 
-    payload = {
-        "from": ["viking://resources/source"],
-        "to": "viking://resources/wiki",
-        "skill": "viking://agent/skills/wiki",
-        "args": {"api_key": "synthetic-private-key", "mode": "summary"},
-    }
-    headers = {"Idempotency-Key": "http-retry-key-123", "X-Request-ID": "original-request-id"}
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        empty_page = await client.get(
-            "/api/v1/tasks", params={"pagination": "cursor", "task_type": "compile", "limit": 30}
+    async def generate(payload, **kwargs):
+        calls.append(payload["payload"])
+        operations = [{"uri": page, "content": "generated"}]
+        if runtime_status == "failed":
+            operations.append({"uri": f"{target}/partial.md", "content": "unfinished"})
+        await service.fs.batch_write(
+            root_uri=target,
+            operations=operations,
+            ctx=ctx,
+            defer_processing=True,
+            edit_source="compile",
         )
-        assert empty_page.status_code == 200, empty_page.text
-        assert empty_page.json()["result"] == {
-            "items": [],
-            "has_more": False,
-            "next_cursor": None,
-        }
-        first = await client.post("/api/v1/compile", json=payload, headers=headers)
-        assert first.status_code == 202, first.text
-        second = await client.post(
+        if runtime_status == "failed":
+            await service.fs.mv("viking://resources/inbox/note.md", f"{target}/imported.md", ctx)
+            await service.fs.cp(
+                "viking://resources/inbox/copy.md", f"{target}/copied.md", recursive=False, ctx=ctx
+            )
+            await service.fs.mv(f"{target}/old.md", f"{target}/renamed.md", ctx)
+            await service.fs.rm(f"{target}/discard.md", ctx, wait=True)
+            await service.fs.batch_write(
+                root_uri=target,
+                operations=[{"uri": page, "content": "ordinary edit"}],
+                ctx=ctx,
+                defer_processing=True,
+            )
+        return CompileSessionAccepted(session_id="runtime-task")
+
+    runtime = SimpleNamespace(
+        create=generate,
+        get=AsyncMock(
+            side_effect=lambda *a, **kw: CompileSessionStatus(
+                status=runtime_status,
+                stage=runtime_status,
+                error="generation failed" if runtime_status == "failed" else None,
+            )
+        ),
+    )
+    monkeypatch.setattr(service.compile, "_client", lambda: runtime)
+    tracker = get_task_tracker()
+
+    async def submit(payload, key):
+        response = await client.post(
             "/api/v1/compile",
             json=payload,
-            headers={**headers, "X-Request-ID": "retry-request-id"},
+            headers={"Idempotency-Key": key, "X-Request-ID": "original-request-id"},
         )
-        task_id = first.json()["result"]["task_id"]
-        assert second.json()["result"]["task_id"] == task_id
-        auth = await tracker.get_task_auth(task_id, account_id="acme", user_id="alice")
-        assert auth["openviking_connection"]["request_id"] == "original-request-id"
-        recovery = await client.get("/api/v1/compile/submissions/http-retry-key-123")
-        assert recovery.json()["result"]["task_id"] == task_id
-        assert isinstance((await client.get("/api/v1/tasks")).json()["result"], list)
-        paged = await client.get(
-            "/api/v1/tasks", params={"pagination": "cursor", "task_type": "compile"}
-        )
-        assert paged.json()["result"]["items"][0]["task_id"] == task_id
-        assert (await client.get("/api/v1/tasks", params={"limit": 0})).status_code == 422
-        conflict = await client.post(
-            "/api/v1/compile", json={**payload, "instruction": "changed"}, headers=headers
-        )
-        assert conflict.status_code == 409
-        stopped = await client.post(f"/api/v1/tasks/{task_id}/cancel")
-        assert stopped.status_code == 200
-        assert stopped.json()["result"]["status"] in {"cancelled", "cancelling"}
-        retry_after_cancel = await client.post("/api/v1/compile", json=payload, headers=headers)
-        assert retry_after_cancel.json()["result"]["task_id"] == task_id
-        assert "submission_hash" not in retry_after_cancel.json()["result"]["meta"]
-        ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.ROOT)
-        store = PersistentTaskStore(agfs)
-        tracker = TaskTracker(store)
-        root_page = await client.get(
-            "/api/v1/tasks", params={"pagination": "cursor", "task_type": "compile"}
-        )
-        assert root_page.json()["result"]["items"][0]["task_id"] == task_id
-        assert tracker.count() == 0
-        detail = await client.get(f"/api/v1/tasks/{task_id}")
-        assert detail.status_code == 200
-        assert detail.json()["result"]["task_id"] == task_id
+        assert response.status_code == 202, response.text
+        task_id = response.json()["result"]["task_id"]
+        await service.compile._tasks.execute(task_id, **owner)
+        return task_id
 
-        # Recovery must not need the old resources or a currently configured backend.
-        from openviking_cli.exceptions import NotFoundError
-
-        fs.stat.side_effect = NotFoundError("deleted-source", "resource")
-        compile_service._local_endpoint = None
-        restored = await client.post("/api/v1/compile", json=payload, headers=headers)
-        assert restored.status_code == 202, restored.text
-        assert restored.json()["result"]["task_id"] == task_id
-        changed = await client.post(
-            "/api/v1/compile", json={**payload, "args": {"api_key": "different"}}, headers=headers
-        )
-        assert changed.status_code == 409
-        compile_service.configure_local_backend("http://localhost:1", "")
-        rejected = await client.post(
-            "/api/v1/compile", json=payload, headers={"Idempotency-Key": "new-invalid-request-key"}
-        )
-        assert rejected.status_code != 202
-        ctx = RequestContext(user=UserIdentifier("acme", "bob"), role=Role.USER)
-        assert (await client.get("/api/v1/tasks", params={"pagination": "cursor"})).json()[
-            "result"
-        ]["items"] == []
-
-
-@pytest.mark.asyncio
-async def test_provider_start_hook_can_defer_or_finish_without_runtime(monkeypatch):
-    import openviking.service.external_task_service as module
-
-    tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
-    monkeypatch.setattr(module, "get_task_tracker", lambda: tracker)
-    finished = []
-
-    class Provider:
-        task_type, task_id_prefix, poll_max_attempts = "compile", "cmp_", 1
-        start_result = "busy"
-        submit = AsyncMock()
-
-        def serialization_key(self, payload):
-            return payload["to"]
-
-        async def on_start(self, task):
-            return self.start_result
-
-        async def on_finish(self, task, snapshot):
-            finished.append(snapshot.status)
-            return snapshot
-
-    provider = Provider()
-    service = ExternalTaskService()
-    service.register(provider)
-    task = await tracker.create(
-        "compile",
-        account_id="acme",
-        user_id="alice",
-        task_id="cmp_hook",
-        meta={"request": {"to": "viking://resources/wiki"}},
+    payload = {
+        "from": [source],
+        "to": target,
+        "skill": skill,
+        "args": {"api_key": "private-runtime-key"},
+    }
+    accepted = await client.post(
+        "/api/v1/compile",
+        json=payload,
+        headers={"Idempotency-Key": "compile-initial-key", "X-Request-ID": "original-request-id"},
     )
-    assert await service.execute(task.task_id, "acme", "alice") is False
-    assert not service._owners
-    from openviking.service.external_task_service import ExternalTaskSnapshot
+    assert accepted.status_code == 202, accepted.text
+    first = accepted.json()["result"]["task_id"]
+    retry = await client.post(
+        "/api/v1/compile",
+        json=payload,
+        headers={"Idempotency-Key": "compile-initial-key", "X-Request-ID": "retry-request-id"},
+    )
+    assert retry.json()["result"]["task_id"] == first
+    assert "private-runtime-key" not in retry.text and "submission_hash" not in retry.text
+    auth = await tracker.get_task_auth(first, **owner)
+    assert auth["openviking_connection"]["request_id"] == "original-request-id"
+    await service.compile._tasks.execute(first, **owner)
+    assert (await tracker.get(first, **owner)).status == "completed"
+    assert await service.fs.read(page, ctx) == "generated"
+    recovery = await client.get("/api/v1/compile/submissions/compile-initial-key")
+    assert recovery.json()["result"]["task_id"] == first
+    assert isinstance((await client.get("/api/v1/tasks")).json()["result"], list)
+    paged = await client.get(
+        "/api/v1/tasks", params={"pagination": "cursor", "task_type": "compile"}
+    )
+    assert paged.json()["result"]["items"][0]["task_id"] == first
+    conflict = await client.post(
+        "/api/v1/compile",
+        json={**payload, "instruction": "changed"},
+        headers={"Idempotency-Key": "compile-initial-key"},
+    )
+    assert conflict.status_code == 409
 
-    provider.start_result = ExternalTaskSnapshot(status="completed", result={})
-    assert await service.execute(task.task_id, "acme", "alice") is True
-    assert (await tracker.get(task.task_id, "acme", "alice")).status == TaskStatus.COMPLETED
-    assert finished == ["completed"]
-    provider.submit.assert_not_awaited()
+    queued = await client.post(
+        "/api/v1/compile", json=payload, headers={"Idempotency-Key": "compile-cancel-key"}
+    )
+    cancelled_id = queued.json()["result"]["task_id"]
+    stopped = await client.post(f"/api/v1/tasks/{cancelled_id}/cancel")
+    assert stopped.status_code == 200 and stopped.json()["result"]["status"] == "cancelled"
+    cancelled_retry = await client.post(
+        "/api/v1/compile", json=payload, headers={"Idempotency-Key": "compile-cancel-key"}
+    )
+    assert cancelled_retry.json()["result"]["task_id"] == cancelled_id
+
+    unchanged = await submit(payload, "compile-unchanged-key")
+    assert (await tracker.get(unchanged, **owner)).status == "completed" and len(calls) == 1
+    payload = {**payload, "instruction": "Change the title"}
+    await submit(payload, "compile-instruction-key")
+    assert len(calls) == 2 and calls[-1]["args"]["changes"]["execution"]["mode"] == "full"
+    await service.viking_fs.write_file(f"{source}/a.md", "new source", ctx=admin)
+    await submit(payload, "compile-source-update-key")
+    changes = calls[-1]["args"]["changes"]
+    assert changes["execution"]["mode"] == "incremental"
+    assert changes["scopes"] == [
+        {"uri": f"{source}/a.md", "change_type": "modified", "recursive": False}
+    ]
+
+    runtime_status = "failed"
+    failed = await submit({**payload, "instruction": "Regenerate"}, "compile-failure-key")
+    assert (await tracker.get(failed, **owner)).status == "failed"
+    assert await service.fs.read(page, ctx) == "ordinary edit"
+    assert await service.fs.read(f"{target}/imported.md", ctx) == "keep imported"
+    assert await service.fs.read(f"{target}/copied.md", ctx) == "keep copied"
+    assert await service.fs.read(f"{target}/renamed.md", ctx) == "keep renamed"
+    for uri in (f"{target}/old.md", f"{target}/discard.md", f"{target}/partial.md"):
+        assert not await service.viking_fs.exists(uri, ctx=ctx)
+    history = (await client.get("/api/v1/compile/operations", params={"to": target})).json()[
+        "result"
+    ]
+    assert next(op for op in history["operations"] if op["task_id"] == failed)["status"] == "failed"
+
+    # Binary version restore is guarded by the version the caller last observed.
+    await service.fs.batch_write(
+        root_uri=target,
+        operations=[
+            {"uri": picture, "content_base64": base64.b64encode(png + b" edited").decode()}
+        ],
+        ctx=ctx,
+        defer_processing=True,
+    )
+    versions = (await client.get("/api/v1/snapshot/versions", params={"uri": picture})).json()[
+        "result"
+    ]
+    restore = {
+        "path": picture,
+        "restore_version": versions["versions"][-1]["version_id"],
+        "current_version": versions["current_version"],
+    }
+    restored = await client.post("/api/v1/snapshot/restore", json=restore)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["result"]["meta"]["restored_from"] == restore["restore_version"]
+    await service.resources.wait_processed()
+    assert await service.fs.read_file_bytes(picture, ctx) == png
+    assert (await client.post("/api/v1/snapshot/restore", json=restore)).status_code == 409
+
+    # Scheduled submissions reuse the target but resolve current group permissions on each trigger.
+    scheduler = CompileScheduler(
+        service.compile, service.compile.lifecycle.store, service.viking_fs
+    )
+    scheduler.credential_encryptor = build_credential_encryptor(service._config.encryption)
+    scheduler.credential_encryptor.provider.key_file = tmp_path / "compile-key"
+    groups = AsyncMock(return_value=ctx.group_ids)
+    scheduler.set_identity_resolver(
+        AsyncMock(return_value=ResolvedIdentity(role=Role.USER, **owner)), groups
+    )
+    service.compile.lifecycle.save_credential = scheduler.save_credential
+    configured = await client.post(
+        "/api/v1/compile/config/update",
+        json={
+            "from": [source],
+            "to": target,
+            "skill": skill,
+            "auto_update": True,
+            "update_schedule": {"frequency": "daily"},
+        },
+    )
+    assert configured.status_code == 200, configured.text
+    target_id = configured.json()["result"]["target_id"]
+    now = datetime.now(TZ) + timedelta(days=1)
+    runtime_status = "completed"
+    assert await scheduler.trigger_if_due(ctx.account_id, target_id, now) == "submitted"
+    operations = await service.compile.list_operations(target, ctx, limit=20, cursor=None)
+    scheduled = next(
+        op["task_id"] for op in operations["operations"] if op["trigger"] == "scheduled"
+    )
+    await service.compile._tasks.execute(scheduled, **owner)
+    assert (await tracker.get(scheduled, **owner)).status == "completed"
+    assert await scheduler.trigger_if_due(ctx.account_id, target_id, now) == "not_due"
+    groups.return_value = ()
+    with pytest.raises(PermissionDeniedError):
+        await scheduler.trigger_if_due(ctx.account_id, target_id, now + timedelta(days=1))
+
+    # Submission recovery remains available after inputs disappear or the backend is disabled.
+    with monkeypatch.context() as patch:
+        patch.setattr(service.fs, "stat", AsyncMock(side_effect=NotFoundError(source)))
+        patch.setattr(service.compile, "_local_endpoint", None)
+        recovered = await client.post(
+            "/api/v1/compile",
+            json={**payload, "instruction": None},
+            headers={"Idempotency-Key": "compile-initial-key"},
+        )
+        assert recovered.status_code == 202, recovered.text
+        assert recovered.json()["result"]["task_id"] == first
+    ctx = RequestContext(user=UserIdentifier(owner["account_id"], "bob"), role=Role.USER)
+    assert (await client.get("/api/v1/tasks", params={"pagination": "cursor"})).json()["result"][
+        "items"
+    ] == []
 
 
 @pytest.mark.asyncio

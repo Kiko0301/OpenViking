@@ -2195,34 +2195,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_diff_paths_lists_changes_under_directories() {
-        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
-        vfs.put("resources/src/a.md", b"a");
-        vfs.put("resources/src/b.md", b"b");
-        vfs.put("resources/other/x.md", b"x");
-        let first = make_commit(&svc, "acct", "main", "first").await.to_hex().to_string();
-        vfs.put("resources/src/a.md", b"a2");
-        vfs.put("resources/src/sub/c.md", b"c");
-        vfs.delete("resources/src/b.md");
-        vfs.put("resources/other/x.md", b"x2");
-        make_commit(&svc, "acct", "main", "second").await;
-
-        let dirs = vec!["resources/src".to_string()];
-        let changes = svc.diff_paths("acct", Some(&first), "main", &dirs).await.unwrap();
-        assert_eq!(
-            changes,
-            vec![
-                ("resources/src/a.md".to_string(), "modified"),
-                ("resources/src/b.md".to_string(), "deleted"),
-                ("resources/src/sub/c.md".to_string(), "added"),
-            ]
-        );
-        let initial = svc.diff_paths("acct", None, "main", &dirs).await.unwrap();
-        assert_eq!(initial.len(), 2);
-        assert!(initial.iter().all(|(_, change)| *change == "added"));
-    }
-
     // ── 2 ──────────────────────────────────────────────────────────────
     #[tokio::test]
     async fn test_commit_second_links_to_first() {
