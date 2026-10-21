@@ -262,6 +262,19 @@ class UsageReporterConfig(BaseModel):
     sinks: List[UsageReporterSinkConfig] = Field(default_factory=list)
 
 
+class TTLAdapterConfig(BaseModel):
+    """Commercial directory-TTL adapter configuration.
+
+    Open-source leaves this unset, so TTL stays unsupported (501) and no Redis
+    dependency is loaded. A commercial deployment sets ``class_path`` to its
+    ``openviking.ttl.adapter.TTLAdapter`` implementation; ``config`` is passed
+    as keyword arguments to the adapter constructor.
+    """
+
+    class_path: Optional[str] = None
+    config: Dict[str, object] = Field(default_factory=dict)
+
+
 class TraceDumpBodyConfig(BaseModel):
     """HTTP body dump configuration.
 
@@ -371,6 +384,9 @@ class ServerConfig(BaseModel):
     trusted_identity_pending_max_size: int = Field(10_000, gt=0)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     usage_reporter: UsageReporterConfig = Field(default_factory=UsageReporterConfig)
+    # Commercial directory-TTL adapter. Unset in the open-source edition, which
+    # keeps TTL unsupported (501) and loads no Redis dependency.
+    ttl_adapter: Optional[TTLAdapterConfig] = None
     # Public-facing base URL emitted in MCP-issued upload instructions. See
     # ``openviking.server.mcp_endpoint._resolve_public_base_url`` for the full
     # resolution chain: env var > this field > X-Forwarded-Host/Proto > Host header

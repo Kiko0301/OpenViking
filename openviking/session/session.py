@@ -538,6 +538,13 @@ class Session:
         except Exception as exc:
             if not _is_storage_not_found(exc):
                 raise
+            from openviking.ttl.wiring import get_ttl_adapter
+
+            adapter = get_ttl_adapter()
+            if adapter is not None and await adapter.requires_existing_session(
+                self._session_uri, self.ctx
+            ):
+                raise
             content = None
         self._messages = self._parse_live_messages(content or "")
         await self._load_meta()
@@ -726,8 +733,9 @@ class Session:
                 f"{self._session_uri}/messages.jsonl",
                 "",
                 ctx=self.ctx,
+                lease_ref=lease,
             )
-            await self._save_meta()
+            await self._save_meta(lease_ref=lease)
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
 
@@ -744,6 +752,16 @@ class Session:
             session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
         )
         try:
+            from openviking.ttl.wiring import get_ttl_adapter
+
+            adapter = get_ttl_adapter()
+            if adapter is not None and await adapter.requires_existing_session(
+                self._session_uri, self.ctx
+            ):
+                # Commercial writes share this unit lock. Read live messages
+                # before leaf locks, whose sidecars could recreate a deleted root.
+                yield session_lease
+                return
             file_lease = await agfs.pathlock_acquire_exact_batch(
                 [f"{session_path}/{name}" for name in filenames],
                 timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
@@ -3082,7 +3100,21 @@ class Session:
                 # a clean auto-commit even after Phase 2 reloads the latest meta.
                 latest_meta.last_auto_commit_at = get_current_timestamp()
             self._meta = latest_meta
-            await self._save_meta()
+            from contextlib import AsyncExitStack
+
+            from openviking.ttl.wiring import get_ttl_adapter
+
+            adapter = get_ttl_adapter()
+            async with AsyncExitStack() as guards:
+                if adapter is not None:
+                    await guards.enter_async_context(
+                        adapter.source_guard(
+                            f"{self._session_uri}/history/archive_{archive_index:03d}",
+                            self.ctx,
+                            lease,
+                        )
+                    )
+                await self._save_meta(lease_ref=lease)
             return latest_meta
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)

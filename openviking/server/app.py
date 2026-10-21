@@ -161,6 +161,40 @@ async def _initialize_auth_plugin(
     logger.info("Auth plugin initialized: %s", effective_auth_mode)
 
 
+async def _initialize_ttl_adapter(
+    app: FastAPI,
+    service: OpenVikingService,
+    config: ServerConfig,
+) -> None:
+    """Load and wire the commercial directory-TTL adapter when configured.
+
+    Open-source leaves ``server.ttl_adapter`` unset, so this registers no
+    adapter: the post-write hook stays uninstalled and the admin routes keep
+    rejecting explicit TTL configuration with 501.
+    """
+    from openviking.ttl.loader import build_ttl_adapter
+    from openviking.ttl.wiring import install_ttl_hook, set_ttl_adapter
+
+    adapter = build_ttl_adapter(config.ttl_adapter)
+    set_ttl_adapter(adapter)
+    app.state.ttl_adapter = adapter
+    if adapter is None:
+        return
+    bind_runtime = getattr(adapter, "bind_runtime", None)
+    if bind_runtime is not None:
+        bind_runtime(service, app.state.api_key_manager)
+    viking_fs = service.viking_fs
+    if viking_fs is not None:
+        install_ttl_hook(viking_fs, adapter)
+    await adapter.start()
+    if not getattr(app.state, "ttl_routes_registered", False):
+        from openviking.ttl.internal import router as ttl_internal_router
+
+        app.include_router(ttl_internal_router)
+        app.state.ttl_routes_registered = True
+    logger.info("TTL adapter initialized")
+
+
 async def _initialize_runtime_state(
     app: FastAPI,
     service: OpenVikingService,
@@ -170,6 +204,7 @@ async def _initialize_runtime_state(
     await service.initialize()
     await service.apply_agent_evolution_config()
     await _initialize_auth_plugin(app, service, config)
+    await _initialize_ttl_adapter(app, service, config)
     from openviking.service.deletion import setup_deletion
 
     app.state.deletion_service = await setup_deletion(

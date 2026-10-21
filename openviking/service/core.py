@@ -771,6 +771,16 @@ class OpenVikingService:
             self._queue_manager = None
             logger.info("Queue manager stopped")
 
+        # Draining writers still need the adapter's source and directory guards.
+        # Stop TTL consumers only after those writers settle, while their storage
+        # and vector clients remain available for in-flight recycling.
+        from openviking.ttl.wiring import get_ttl_adapter, set_ttl_adapter
+
+        ttl_adapter = get_ttl_adapter()
+        if ttl_adapter is not None:
+            await ttl_adapter.aclose()
+            set_ttl_adapter(None)
+
         # Queue workers and scheduled producers persist their final Task/Work
         # transitions while stopping, so keep their store open until they drain.
         await get_task_tracker().close()

@@ -3,6 +3,7 @@
 """Admin endpoints for OpenViking multi-tenant HTTP Server."""
 
 import asyncio
+import json
 from collections.abc import Mapping
 from typing import Any, Literal, Optional
 
@@ -53,6 +54,7 @@ from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
     PermissionDeniedError,
+    UnimplementedError,
 )
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config import get_openviking_config
@@ -61,6 +63,8 @@ from openviking_cli.utils.logger import get_logger
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
+
+_TTL_UNSUPPORTED_MESSAGE = "TTL is not supported in the open-source edition."
 
 
 class CreateAccountRequest(BaseModel):
@@ -140,6 +144,33 @@ class ConfigPatchRequest(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
     revision: str | None = None
     content: str | None = None
+
+
+def _reject_unsupported_ttl_config(
+    settings: Mapping[str, object] | None = None,
+    content: str | None = None,
+) -> None:
+    """Reject an explicit TTL section unless a commercial TTL adapter is loaded.
+
+    The open-source edition registers no adapter, so TTL configuration stays
+    unsupported and returns 501. A commercial deployment that loads an adapter
+    reporting ``supports_config()`` lets TTL writes through to normal config
+    validation.
+    """
+    from openviking.ttl.wiring import ttl_config_supported
+
+    if ttl_config_supported():
+        return
+    if settings is not None and "ttl" in settings:
+        raise UnimplementedError(_TTL_UNSUPPORTED_MESSAGE)
+    if content is None:
+        return
+    try:
+        parsed = json.loads(content.lstrip("\ufeff"))
+    except (TypeError, ValueError):
+        return
+    if isinstance(parsed, dict) and "ttl" in parsed:
+        raise UnimplementedError(_TTL_UNSUPPORTED_MESSAGE)
 
 
 _ROOT_ONLY_ACCOUNT_CONFIG_SECTIONS = frozenset({"vlm", "query_planner", "embedding", "vectordb"})
@@ -455,6 +486,7 @@ async def create_account(
     ctx: RequestContext = Depends(get_request_context),
 ):
     """Create a new account (workspace) with its first admin user."""
+    _reject_unsupported_ttl_config(body.settings)
     service = get_service()
     account_ctx = RequestContext(
         user=UserIdentifier(body.account_id, body.admin_user_id),
@@ -660,20 +692,34 @@ async def patch_account_settings(
 async def get_account_configuration(
     request: Request,
     account_id: str = Path(..., description="Account ID"),
+    path: Optional[str] = Query(None),
     ctx: RequestContext = Depends(get_request_context),
 ):
     """Return this account layer's explicit runtime configuration."""
     _check_account_access(ctx, account_id)
     await _check_account_exists(request, account_id)
-    settings = await _get_runtime_config_manager().get_settings(
-        ConfigScope.account(account_id)
-    )
+    settings = await _get_runtime_config_manager().get_settings(ConfigScope.account(account_id))
+    result = {
+        "account_id": account_id,
+        "settings": _visible_account_config(ctx, settings),
+    }
+    if path is not None:
+        from openviking.config.ttl import resolve_effective_ttl
+        from openviking_cli.utils.config.ttl_config import TTLConfig
+
+        _reject_unsupported_ttl_config({"ttl": {}})
+        try:
+            TTLConfig(roots={path: "disabled"})
+        except ValueError as exc:
+            raise InvalidArgumentError(str(exc)) from exc
+        policy = await _get_runtime_config_manager().resolve_account(
+            account_id, lambda view: resolve_effective_ttl(view.cluster.ttl, view.account.ttl, path)
+        )
+        result["path"] = path
+        result["effective_policy"] = policy.days if policy.enabled else "disabled"
     return Response(
         status="ok",
-        result={
-            "account_id": account_id,
-            "settings": _visible_account_config(ctx, settings),
-        },
+        result=result,
     )
 
 
@@ -796,6 +842,7 @@ async def patch_account_configuration(
     _check_account_access(ctx, account_id)
     await _check_account_exists(request, account_id)
     _authorize_account_config_patch(ctx, body.settings)
+    _reject_unsupported_ttl_config(body.settings)
     try:
         await _get_runtime_config_manager().patch_account(account_id, body.settings)
     except (ConfigPatchError, ValueError) as exc:
@@ -928,6 +975,7 @@ async def patch_cluster_configuration(
     ctx: RequestContext = Depends(get_request_context),
 ):
     """Apply a three-state PATCH to the cluster configuration layer."""
+    _reject_unsupported_ttl_config(body.settings, body.content)
     if dry_run and (source != "file" or body.content is None):
         raise InvalidArgumentError("dry_run requires source=file and full file content")
     if source == "file":
