@@ -9,12 +9,14 @@ import resources from './zh-CN/resources'
 import activity from './zh-CN/activity'
 import memoryTemplates from './zh-CN/memory-templates'
 import arranger from './zh-CN/arranger'
+import dataManagement from './zh-CN/data-management'
 
 const zhCN = {
   arranger,
   studio,
   onboarding,
   gateway,
+  dataManagement,
   compile,
   vikingbot,
   ...workspace,
