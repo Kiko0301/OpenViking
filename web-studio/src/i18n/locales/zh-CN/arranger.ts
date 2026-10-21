@@ -7,7 +7,6 @@ const arranger = {
   loading: '正在加载上下文',
   searchPlaceholder: '筛选已加载节点',
   emptySummary: '暂无目录摘要',
-  confirmDelete: '确定从 OpenViking 删除 {{uri}}？',
   start: {
     liveDescription:
       '选择 MCP 工具并预置确定参数，Agent 读取节点时按需获取最新数据。',
@@ -117,6 +116,16 @@ const arranger = {
     copy: {
       title: '复制资源',
       description: '选择当前根目录内的新 URI。',
+    },
+    delete: {
+      confirm: '确认删除',
+      deleting: '正在删除',
+      directoryDescription:
+        '此目录及其中的所有内容都将被永久删除，此操作无法撤销。',
+      fileDescription: '此文件将从 OpenViking 中永久删除，此操作无法撤销。',
+      liveDescription:
+        '此实时上下文节点及其挂载关系将被永久删除，此操作无法撤销。',
+      title: '删除“{{name}}”？',
     },
     file: {
       title: '新建文档',

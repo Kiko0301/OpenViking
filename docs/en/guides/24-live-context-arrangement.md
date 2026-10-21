@@ -1,5 +1,5 @@
 ---
-description: Connect remote MCP servers, mount tools as live context, and arrange nodes through the CLI, SDK, Studio, and Context as Code.
+description: Connect remote MCP servers, mount tools as live context, and arrange nodes with the CLI, SDK, Studio, and Context as Code.
 ---
 
 # Live context integration and arrangement

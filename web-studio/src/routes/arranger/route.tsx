@@ -633,6 +633,7 @@ function ArrangerWorkbench() {
                     error instanceof Error ? error.message : String(error),
                   )
                   await refresh()
+                  throw error
                 }
               }}
               onSaved={refresh}
@@ -888,85 +889,133 @@ function ResourceInspector({
 }) {
   const { t } = useTranslation('arranger')
   const [deleting, setDeleting] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
   return (
-    <aside className="flex min-h-0 flex-col bg-muted/15">
-      <div className="space-y-2 border-b p-4">
-        <div className="flex items-center gap-2">
-          <h2 className="min-w-0 flex-1 truncate text-sm font-semibold">
-            {entry.name || entry.uri}
-          </h2>
-          {liveMount && <Badge variant="secondary">{t('live.badge')}</Badge>}
-        </div>
-        <p className="break-all font-mono text-[11px] text-muted-foreground">
-          {entry.uri}
-        </p>
-        {!isRoot && (
-          <div className="flex flex-wrap gap-1 pt-1">
-            {liveMount && (
+    <>
+      <aside className="flex min-h-0 flex-col bg-muted/15">
+        <div className="space-y-2 border-b p-4">
+          <div className="flex items-center gap-2">
+            <h2 className="min-w-0 flex-1 truncate text-sm font-semibold">
+              {entry.name || entry.uri}
+            </h2>
+            {liveMount && <Badge variant="secondary">{t('live.badge')}</Badge>}
+          </div>
+          <p className="break-all font-mono text-[11px] text-muted-foreground">
+            {entry.uri}
+          </p>
+          {!isRoot && (
+            <div className="flex flex-wrap gap-1 pt-1">
+              {liveMount && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onAction('mount')}
+                >
+                  <PencilIcon />
+                  {t('actions.editMount')}
+                </Button>
+              )}
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => onAction('mount')}
+                disabled={!mountsComplete}
+                onClick={() => onAction('move')}
               >
                 <PencilIcon />
-                {t('actions.editMount')}
+                {t('actions.move')}
               </Button>
-            )}
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!mountsComplete}
-              onClick={() => onAction('move')}
-            >
-              <PencilIcon />
-              {t('actions.move')}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!mountsComplete}
-              onClick={() => onAction('copy')}
-            >
-              <CopyIcon />
-              {t('actions.copy')}
-            </Button>
-            <Button
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!mountsComplete}
+                onClick={() => onAction('copy')}
+              >
+                <CopyIcon />
+                {t('actions.copy')}
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={deleting || !mountsComplete}
+                onClick={() => setDeleteOpen(true)}
+              >
+                <Trash2Icon />
+                {t('actions.delete')}
+              </Button>
+            </div>
+          )}
+        </div>
+        <div className="min-h-0 flex-1">
+          {entry.isDir ? (
+            <div className="space-y-3 p-4 text-sm">
+              <Label>{t('fields.summary')}</Label>
+              <p className="whitespace-pre-wrap text-muted-foreground">
+                {entry.overview || entry.abstract || t('emptySummary')}
+              </p>
+            </div>
+          ) : (
+            <TextInspector
+              key={entry.uri}
+              catalog={catalog}
+              entry={entry}
+              liveMount={liveMount}
+              onSaved={onSaved}
+            />
+          )}
+        </div>
+      </aside>
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t('dialogs.delete.title', { name: entry.name || entry.uri })}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                liveMount
+                  ? 'dialogs.delete.liveDescription'
+                  : entry.isDir
+                    ? 'dialogs.delete.directoryDescription'
+                    : 'dialogs.delete.fileDescription',
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="rounded-md border bg-muted/50 px-3 py-2 font-mono text-xs break-all text-muted-foreground">
+            {entry.uri}
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>
+              {t('actions.cancel')}
+            </AlertDialogCancel>
+            <AlertDialogAction
               variant="destructive"
-              size="sm"
-              disabled={deleting || !mountsComplete}
-              onClick={() => {
-                if (!window.confirm(t('confirmDelete', { uri: entry.uri }))) {
-                  return
-                }
+              disabled={deleting}
+              onClick={async (event) => {
+                event.preventDefault()
                 setDeleting(true)
-                void onDelete().finally(() => setDeleting(false))
+                try {
+                  await onDelete()
+                  setDeleteOpen(false)
+                } catch {
+                  // The parent reports the error and refreshes authoritative data.
+                } finally {
+                  setDeleting(false)
+                }
               }}
             >
-              <Trash2Icon />
-              {t('actions.delete')}
-            </Button>
-          </div>
-        )}
-      </div>
-      <div className="min-h-0 flex-1">
-        {entry.isDir ? (
-          <div className="space-y-3 p-4 text-sm">
-            <Label>{t('fields.summary')}</Label>
-            <p className="whitespace-pre-wrap text-muted-foreground">
-              {entry.overview || entry.abstract || t('emptySummary')}
-            </p>
-          </div>
-        ) : (
-          <TextInspector
-            key={entry.uri}
-            catalog={catalog}
-            entry={entry}
-            liveMount={liveMount}
-            onSaved={onSaved}
-          />
-        )}
-      </div>
-    </aside>
+              {deleting ? (
+                <Loader2Icon className="animate-spin" />
+              ) : (
+                <Trash2Icon />
+              )}
+              {deleting
+                ? t('dialogs.delete.deleting')
+                : t('dialogs.delete.confirm')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   )
 }
 
@@ -1227,7 +1276,7 @@ function ActionDialog({
   const [name, setName] = useState('')
   const [target, setTarget] = useState(
     action.kind === 'copy' || action.kind === 'move'
-      ? `${defaultParent}/${action.source?.name || ''}`
+      ? joinVikingUri(defaultParent, action.source?.name || '')
       : defaultParent,
   )
   const [toolUri, setToolUri] = useState('')
@@ -1344,6 +1393,8 @@ function ActionDialog({
         await onComplete(input.node_uri)
         return
       }
+      // Internal invariant: every non-create action has a source resource.
+      // eslint-disable-next-line studio-i18n/no-literal-message
       if (!action.source) throw new Error('Missing source resource')
       const mount = liveIndex.mounts.get(action.source.uri)
       if (mount) {

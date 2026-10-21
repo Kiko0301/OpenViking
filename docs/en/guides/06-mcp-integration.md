@@ -4,7 +4,7 @@ OpenViking Server includes an [MCP (Model Context Protocol)](https://modelcontex
 
 > **Quick setup?** See [MCP Clients](../agent-integrations/06-mcp-clients.md) for client configuration snippets and platform-specific notes. This page covers the full tool reference and advanced configuration.
 >
-> **Connecting an external MCP server?** See [Live context integration and arrangement](23-live-context-arrangement.md) for `ov mcps`, the Tool Catalog, live nodes, Studio Arranger, and Context as Code.
+> **Connecting an external MCP server?** See [Live context integration and arrangement](24-live-context-arrangement.md) for `ov mcps`, the Tool Catalog, live nodes, Studio Arranger, and Context as Code.
 
 ## Prerequisites
 

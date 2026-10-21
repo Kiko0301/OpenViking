@@ -7,7 +7,6 @@ const arranger = {
   loading: 'Loading context',
   searchPlaceholder: 'Filter loaded nodes',
   emptySummary: 'No directory summary',
-  confirmDelete: 'Delete {{uri}} from OpenViking?',
   start: {
     liveDescription:
       'Choose an MCP tool and preset known arguments so agents can fetch current data when reading the node.',
@@ -121,6 +120,17 @@ const arranger = {
     copy: {
       title: 'Copy resource',
       description: 'Choose the new URI inside the loaded root.',
+    },
+    delete: {
+      confirm: 'Delete',
+      deleting: 'Deleting',
+      directoryDescription:
+        'This directory and all of its contents will be permanently deleted. This action cannot be undone.',
+      fileDescription:
+        'This file will be permanently deleted from OpenViking. This action cannot be undone.',
+      liveDescription:
+        'This live context node and its mount will be permanently deleted. This action cannot be undone.',
+      title: 'Delete “{{name}}”?',
     },
     file: {
       title: 'New document',

@@ -82,6 +82,9 @@ describe('arranger Viking URI boundaries', () => {
     expect(joinVikingUri('viking://resources/arrange', 'notes.md')).toBe(
       'viking://resources/arrange/notes.md',
     )
+    expect(joinVikingUri('viking://resources/arrange/', 'notes.md')).toBe(
+      'viking://resources/arrange/notes.md',
+    )
   })
 
   it('derives the MCP server from a Tool URI', () => {

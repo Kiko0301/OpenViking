@@ -1,5 +1,5 @@
 ---
-description: 接入远程 MCP Server，将工具挂载为实时上下文，并通过 CLI、SDK、Studio 和 Context as Code 编排节点。
+description: 接入远程 MCP Server，将工具挂载为实时上下文，并使用 CLI、SDK、Studio 和 Context as Code 编排节点。
 ---
 
 # 实时上下文接入与编排
