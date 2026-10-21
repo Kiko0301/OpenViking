@@ -15,7 +15,7 @@ from openviking.core.namespace import classify_uri
 from openviking.utils.path_safety import safe_join_viking_uri
 from vikingbot.compile import entry
 from vikingbot.compile.hashing import content_hash, digest
-from vikingbot.compile.models import CompileFailure, utc_now
+from vikingbot.compile.models import CompileFailure, has_directory_plan, utc_now
 from vikingbot.compile.ops import finalize as finalize_op
 from vikingbot.compile.ops import map as map_op
 from vikingbot.compile.ops import reduce as reduce_op
@@ -52,7 +52,7 @@ The user message contains a JSON object with the following fields:
 - request.instruction: the user's requirements for this compile task.
 - request.to: the destination for the generated outputs.
 - target_has_content: whether request.to contains any visible files or subdirectories.
-- changes: when present, this is an incremental Compile; scopes identifies changed sources.
+- changes: the fixed execution mode, snapshots and source directories for this Compile.
 - source_summary: file counts, sizes and splitting statistics; sizes are Unicode characters.
 - runtime.time: the task timestamp for interpreting relative dates in the request.
 
@@ -104,6 +104,7 @@ class Pipeline:
         self.model.resources = self.resources
         self.contract: Contract
         self.direct_output_format: str | None = None
+        self.noop = False
         self.system = ""
         self.records: dict[str, Record] = {}
         self.evidence: dict[str, dict] = {}
@@ -147,9 +148,14 @@ class Pipeline:
         self.catalog.clear()
         self.owners.clear()
         self.direct_output_format = None
+        self.noop = False
         failed = False
         try:
-            sources = await self.seed(batches)
+            sources = (
+                []
+                if has_directory_plan(self.changes) and self.changes.get("head")
+                else await self.seed(batches)
+            )
             runtime = await self.files.get("runtime")
             if runtime is None:
                 runtime = {
@@ -189,10 +195,13 @@ class Pipeline:
                 planning_context["changes"] = self.changes
             direct = await entry.run(self, sources, planning_context)
             if direct is not None:
-                result = await finalize_op.run(self, direct)
+                result = await finalize_op.run(self, direct) if direct else RenderedBundle()
                 complete = not self.failures
                 self.metrics["direct_completed"] = 1
                 return result
+            planning_context["source_summary"] = self.summarize_sources(sources)
+            self.metrics["input_ranges"] = len(sources)
+            self.metrics["input_files"] = len({x["uri"] for x in self.evidence.values()})
             proposal = await self.model.ask(
                 "plan",
                 planner_prompt,
@@ -453,8 +462,8 @@ class Pipeline:
             "max_ranges_per_file": max(ranges.values(), default=0),
         }
 
-    async def seed(self, batches) -> list[Record]:
-        """Seed current ranges and reconciliation notices with stable, traceable input IDs."""
+    async def seed(self, batches, *, notices=None) -> list[Record]:
+        """Seed source ranges and deleted-file notices with stable, traceable input IDs."""
         result = []
         pending = []
         seen = set(self.records)
@@ -507,29 +516,20 @@ class Pipeline:
                     await flush()
         if pending:
             await flush()
-        notices = {
-            scope["uri"]: scope
-            for scope in (self.changes or {}).get("scopes") or []
-            if scope.get("change_type") in {"deleted", "rescan"}
-        }
-        if notices:
+        deleted = sorted(
+            {notice["uri"] for notice in notices or [] if notice.get("change_type") == "deleted"}
+        )
+        if deleted:
             manifest = await self.files.get("inputs") or {}
-            for uri, scope in sorted(notices.items()):
+            for uri in deleted:
                 text = (
-                    "Source rescan notice: reconcile outputs derived from this directory "
-                    "against the supplied current files under it. Sources absent from that "
-                    "inventory no longer support output content; the directory may still "
-                    "contain unchanged files. Preserve other sources and manual edits. "
-                    "This notice is not a source body or evidence for new facts."
-                    if scope["change_type"] == "rescan"
-                    else "Source deletion notice: this source was deleted. Remove or revise only "
+                    "Source deletion notice: this source was deleted. Remove or revise only "
                     "content derived from it; preserve other sources and manual edits. "
                     "This notice is not the deleted source body or evidence for new facts."
                 )
                 metadata = {
                     "uri": uri,
-                    "change_type": scope["change_type"],
-                    "recursive": bool(scope.get("recursive")),
+                    "change_type": "deleted",
                     "hash": content_hash(text),
                     "start_char": 0,
                     "end_char": len(text),

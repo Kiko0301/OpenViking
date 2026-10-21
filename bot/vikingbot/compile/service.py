@@ -58,6 +58,7 @@ from vikingbot.compile.models import (
     CompileResult,
     CompileTask,
     SanitizedCompileRequest,
+    has_directory_plan,
     utc_now,
 )
 from vikingbot.compile.ops import finalize as finalize_op
@@ -81,6 +82,7 @@ from vikingbot.sandbox.base import SandboxBackend as WorkspaceSandbox
 _COMPILE_CORE_TOOLS = ("read_file", "write_file", "edit_file", "list_dir", "exec")
 _COMPILE_READ_TOOLS = (
     "openviking_multi_read",
+    "openviking_diff_paths",
     "openviking_list",
     "openviking_grep",
     "openviking_search",
@@ -507,12 +509,45 @@ class BotCompileService:
                 stage="queued",
             )
         changes = args.get("changes")
-        if changes is not None and not (
-            isinstance(changes, dict) and isinstance(changes.get("scopes"), list)
-        ):
-            raise CompileFailure(
-                "INVALID_ARGUMENT", "args.changes.scopes must be a list", stage="queued"
+        if changes is not None:
+            valid = (
+                has_directory_plan(changes)
+                and "base" in changes
+                and "head" in changes
+                and all(
+                    isinstance(changes[key], list)
+                    and all(isinstance(uri, str) and uri.strip() for uri in changes[key])
+                    for key in ("diff_dirs", "full_dirs")
+                )
             )
+            valid = valid and all(
+                changes.get(key) is None
+                or isinstance(changes[key], str)
+                and bool(changes[key].strip())
+                for key in ("base", "head")
+            )
+            execution = changes.get("execution") if isinstance(changes, dict) else None
+            valid = (
+                valid
+                and isinstance(execution, dict)
+                and execution.get("mode") in ("full", "incremental")
+            )
+            if not valid:
+                raise CompileFailure(
+                    "INVALID_ARGUMENT", "Invalid args.changes directory plan", stage="queued"
+                )
+            if changes["diff_dirs"] and (
+                not changes.get("base") or not changes.get("head") or execution["mode"] == "full"
+            ):
+                raise CompileFailure(
+                    "INVALID_ARGUMENT", "diff_dirs require incremental base/head", stage="queued"
+                )
+            if not changes.get("head") and execution["mode"] != "full":
+                raise CompileFailure(
+                    "INVALID_ARGUMENT",
+                    "Unavailable snapshots require full execution",
+                    stage="queued",
+                )
         wiki_links = args.get("wiki_links", False)
         if not isinstance(wiki_links, bool):
             raise CompileFailure(
@@ -534,6 +569,14 @@ class BotCompileService:
                 canonical = str(attrs.get("uri") or "").rstrip("/")
                 if canonical not in sources:
                     sources.append(canonical)
+            if changes is not None:
+                diff_dirs, full_dirs = changes["diff_dirs"], changes["full_dirs"]
+                if set(diff_dirs) & set(full_dirs) or set(diff_dirs + full_dirs) != set(sources):
+                    raise CompileFailure(
+                        "INVALID_ARGUMENT",
+                        "Directory plan must partition the canonical from list",
+                        stage="queued",
+                    )
             skill_uri = request.skill.strip().rstrip("/")
             if skill_uri.endswith("/SKILL.md"):
                 skill_uri = skill_uri[: -len("/SKILL.md")]
@@ -758,23 +801,20 @@ class BotCompileService:
             full_execution = execution.get("mode") == "full" or (
                 not execution and request.instruction_provided
             )
-            if full_execution:
+            directory_plan = has_directory_plan(request.changes)
+            if directory_plan and request.changes.get("head"):
+                pass
+            elif full_execution:
                 source_files = await self._list_source_files(
                     client, request.from_, allow_empty=True
                 )
                 source_request = request.model_copy(update={"last_compile_time": None})
-            elif request.changes is not None:
-                source_files = await self._list_changed_files(client, request.changes)
             elif request.last_compile_time is not None:
                 source_files = await self._list_source_files(
                     client, request.from_, cutoff=request.last_compile_time
                 )
             if source_files is not None:
-                if (
-                    not full_execution
-                    and not source_files
-                    and not (request.changes or {}).get("scopes")
-                ):
+                if not full_execution and not source_files and request.changes is None:
 
                     def complete_without_sources(task: CompileTask) -> None:
                         """Finish an incremental no-op without model calls or target writes."""
@@ -805,7 +845,7 @@ class BotCompileService:
                         fail_task=lambda failure: self._fail(task_id, failure),
                     )
                 )
-            if target_type in {"resource", "skill"}:
+            if target_type in {"resource", "skill"} or directory_plan:
                 focused_loop = None
 
                 async def run_focused_agent(*args, **kwargs):
@@ -1066,7 +1106,7 @@ class BotCompileService:
         pipeline.model.agent_runner = agent_runner
         pipeline.tools = {
             name: tool
-            for name in ("openviking_search", "openviking_multi_read")
+            for name in ("openviking_search", "openviking_multi_read", "openviking_diff_paths")
             if (tool := self.agent_loop.tools.get(name)) is not None
         }
         pipeline.tool_context = tool_context
@@ -1085,11 +1125,14 @@ class BotCompileService:
             }
 
         await self._set_state(task_id, status="running", stage="pipeline")
-        ordered = (
-            source_files
-            if source_files is not None
-            else await self._list_source_files(client, request.from_)
-        )
+        directory_plan = has_directory_plan(request.changes)
+        ordered = []
+        if not (directory_plan and request.changes.get("head")):
+            ordered = (
+                source_files
+                if source_files is not None
+                else await self._list_source_files(client, request.from_)
+            )
         if not resume:
             await pipeline.files.put("inputs", dict.fromkeys(ordered, "pending"))
 
@@ -1139,7 +1182,7 @@ class BotCompileService:
             await self._set_state(task_id, status="committing", stage="writing")
             skill_target = classify_uri(request.to).context_type == "skill"
             result = {"created": [], "updated": [], "unchanged": []}
-            if skill_target:
+            if skill_target and not pipeline.noop:
                 result = await self._write_skill_bundle(
                     client=client, target_uri=request.to, rendered=rendered
                 )
@@ -1197,14 +1240,14 @@ class BotCompileService:
             def complete(task):
                 if task.status not in TERMINAL_STATUSES and task.status != "cancelling":
                     record_metrics(task)
-                    task.status = "completed" if published else "failed"
-                    task.stage = "completed" if published else "writing"
+                    task.status = "completed" if published or pipeline.noop else "failed"
+                    task.stage = "completed" if published or pipeline.noop else "writing"
                     task.result = compiled
                     task.error = (
                         CompileErrorInfo(
                             code="COMPILE_INCOMPLETE", message="No output was acknowledged."
                         )
-                        if not published
+                        if not published and not pipeline.noop
                         else None
                     )
 
@@ -1473,22 +1516,15 @@ class BotCompileService:
         *,
         cutoff: datetime | None = None,
         allow_empty: bool = False,
-        allow_missing: bool = False,
     ) -> list[str]:
         """List unique sources, excluding files strictly older than the UTC cutoff.
 
         Unknown file times are retained; directory times never prune descendants.
-        Full reprocessing allows empty roots; rescans also allow removed roots.
-        Other listing failures propagate.
+        Full reprocessing allows empty roots; listing failures propagate.
         """
 
         async def inventory(root: str) -> list[dict[str, Any]]:
-            try:
-                entry = await client.stat(root)
-            except OpenVikingError as exc:
-                if allow_missing and exc.code == "NOT_FOUND":
-                    return []
-                raise
+            entry = await client.stat(root)
             if not entry.get("isDir", entry.get("is_dir", False)):
                 return [{**entry, "uri": root}]
             entries = []
@@ -1531,27 +1567,6 @@ class BotCompileService:
                 files.add(uri)
         if not files and cutoff is None and not allow_empty:
             raise ValueError("Compile sources contain no files")
-        return sorted(files)
-
-    async def _list_changed_files(self, client: VikingClient, changes: dict[str, Any]) -> list[str]:
-        """Expand the kernel's change scopes into existing source files to read.
-
-        Rescans retain surviving files and tolerate empty or removed directories.
-        Pipeline notices carry deletions and rescan boundaries to output reconciliation.
-        """
-        files: set[str] = set()
-        for scope in changes.get("scopes") or []:
-            if scope.get("change_type") == "deleted":
-                continue
-            if scope.get("recursive"):
-                rescan = scope.get("change_type") == "rescan"
-                files.update(
-                    await self._list_source_files(
-                        client, [scope["uri"]], allow_empty=rescan, allow_missing=rescan
-                    )
-                )
-            else:
-                files.add(scope["uri"])
         return sorted(files)
 
     async def _prepare_source_batches(
@@ -1768,27 +1783,6 @@ class BotCompileService:
             system += (
                 "\nThe from list is filtered by last_compile_time. Use only these source files "
                 "or their prepared ranges; do not scan parents or read excluded sources."
-            )
-        if request.changes is not None:
-            deleted = [
-                scope["uri"]
-                for scope in request.changes.get("scopes") or []
-                if "deleted" in {scope.get("change_type"), *(scope.get("change_types") or [])}
-            ]
-            system += (
-                (
-                    "\nThis Compile processes all sources. "
-                    if (request.changes.get("execution") or {}).get("mode") == "full"
-                    else "\nThis is an incremental Compile: the from list holds only changed sources. "
-                )
-                + "Update existing pages in the target instead of rewriting it; you may read "
-                "other target pages when needed."
-                + (
-                    " These sources were deleted; remove or revise content derived from them: "
-                    + ", ".join(deleted)
-                    if deleted
-                    else ""
-                )
             )
         if draft_root is None and subagent_max_concurrency:
             system += (

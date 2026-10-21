@@ -1,10 +1,10 @@
 # Snapshots (Multi-Version Management)
 
-Snapshots save immutable versions of a selected file tree. Use `commit` to save a version, `log` to browse history, `show` to read an older file, `diff` to compare a file between versions, and `restore` to recover saved content. Uncommitted or excluded files are outside the recovery scope; ACLs and vector indexes are not versioned.
+Snapshots save immutable versions of a selected file tree. Use `commit` to save a version, `log` to browse history, `show` to read an older file, `diff` to compare file contents, `diff-paths` to list changed files, and `restore` to recover saved content. Uncommitted or excluded files are outside the recovery scope; ACLs and vector indexes are not versioned.
 
 Snapshots are powered by [gitoxide](https://github.com/Byron/gitoxide) embedded in the Rust RAGFS layer, maintaining one logical Git repository per `account_id`. Use the snapshot APIs to manage versions; direct edits to the underlying repository are not part of this workflow.
 
-The five core commands:
+The core commands:
 
 | Command | Purpose |
 |---------|---------|
@@ -12,6 +12,7 @@ The five core commands:
 | `log` | Walk commit history starting from the newest |
 | `show` | View a commit's metadata, or read a file's content from that commit |
 | `diff` | Compare one file between two snapshots as a unified diff |
+| `diff-paths` | Page changed source files under selected directories |
 | `restore` | Restore a directory (or the whole account tree) to a past snapshot |
 
 In addition, account-level `.ovgitignore` exclusion rules can be managed (`get`/`set`/`delete`) to exclude matching files from `commit`. See [Ignore management](#ignore-management).
@@ -30,6 +31,7 @@ Snapshots use the current ACL at operation time. ACLs are not stored in snapshot
 | Operation | Required permission |
 |-----------|---------------------|
 | `show(path=...)` / `diff` / `log` | `read` |
+| `diff_paths` | `read` on requested directories and every changed file; any denied descendant rejects the whole query without exposing its URI |
 | `commit` | `write`; directories recursively check every current descendant and fail as a whole if any node is denied |
 | `restore` overwriting a file | `write` on the file |
 | `restore` creating a file | `write` on the parent directory |
@@ -382,6 +384,61 @@ ov snapshot diff viking://resources/my_project/guide.md \
 ```
 
 `change_type` is `added`, `deleted`, `modified`, or `unchanged`. Each side is limited to 10 MiB and 100,000 lines, and the generated diff is limited to 20 MiB; larger requests return `RESOURCE_EXHAUSTED` rather than a truncated diff.
+
+---
+
+### diff_paths()
+
+List source files added, modified, or deleted under one or more directories between snapshots. Derived summaries (`.abstract.md`, `.overview.md`, `.relations.json`) are excluded. Overlapping directory scopes produce one entry per file, ordered by URI.
+
+| HTTP parameter | Required | Default | Description |
+|----------------|----------|---------|-------------|
+| `paths` | Yes | - | Directory URIs; repeat the query parameter for each directory |
+| `from` | No | null | Base snapshot ref; omit it (SDK `from_ref=None`) to compare against an empty tree and list target files as `added` |
+| `to` | Yes | - | Valid target snapshot ref; cannot be empty or null |
+| `offset` | No | 0 | Non-negative starting position |
+| `limit` | No | 100 | Page size, from 1 to 1000 |
+
+**HTTP API**
+
+```http
+GET /api/v1/snapshot/diff-paths?paths={uri1}&paths={uri2}&from={base}&to={head}&offset=0&limit=100
+```
+
+**CLI**
+
+```bash
+ov snapshot diff-paths \
+  --paths viking://resources/research,viking://resources/notes \
+  --from 3f2a1b9c --to 9a0b1c2d --offset 0 --limit 100 -o json
+```
+
+**Python SDK (HTTP)**
+
+```python
+page = client.snapshot.diff_paths(
+    ["viking://resources/research", "viking://resources/notes"],
+    from_ref="3f2a1b9c", to_ref="9a0b1c2d", offset=0, limit=100,
+)
+```
+
+**Response**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "changes": [{"uri": "viking://resources/research/guide.md", "change_type": "modified"}],
+    "offset": 0,
+    "limit": 100,
+    "total": 1,
+    "has_more": false,
+    "next_offset": null
+  }
+}
+```
+
+`change_type` is `added`, `modified`, or `deleted`. While `has_more` is true, query `next_offset` with the same paths and snapshot IDs; only the final page has `next_offset=null`. Pagination limits the response size; the underlying comparison still computes the complete change list. Use [diff()](#diff) or [show()](#show) to read file contents.
 
 ---
 

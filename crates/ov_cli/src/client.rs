@@ -1989,6 +1989,27 @@ impl HttpClient {
         self.get("/api/v1/snapshot/diff", &params).await
     }
 
+    /// Return one stable page of source-file changes; no base compares an empty tree.
+    pub async fn snapshot_diff_paths(
+        &self,
+        paths: &[String],
+        from_ref: Option<&str>,
+        to_ref: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Value> {
+        let mut params = vec![
+            ("to".to_string(), to_ref.to_string()),
+            ("offset".to_string(), offset.to_string()),
+            ("limit".to_string(), limit.to_string()),
+        ];
+        params.extend(paths.iter().map(|path| ("paths".to_string(), path.clone())));
+        if let Some(from_ref) = from_ref {
+            params.push(("from".to_string(), from_ref.to_string()));
+        }
+        self.get("/api/v1/snapshot/diff-paths", &params).await
+    }
+
     pub async fn snapshot_ignore_get(&self) -> Result<Value> {
         self.get("/api/v1/snapshot/ignore", &[]).await
     }

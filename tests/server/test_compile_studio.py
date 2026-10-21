@@ -318,17 +318,25 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     payload = {**payload, "instruction": "Change the title"}
     await submit(payload, "compile-instruction-key")
     assert len(calls) == 2 and calls[-1]["args"]["changes"]["execution"]["mode"] == "full"
+    assert calls[-1]["args"]["changes"]["full_dirs"] == [source]
+    assert calls[-1]["args"]["changes"]["diff_dirs"] == []
     await service.viking_fs.write_file(f"{source}/a.md", "new source", ctx=admin)
     await submit(payload, "compile-source-update-key")
     changes = calls[-1]["args"]["changes"]
     assert changes["execution"]["mode"] == "incremental"
-    assert changes["scopes"] == [
-        {"uri": f"{source}/a.md", "change_type": "modified", "recursive": False}
-    ]
+    assert changes["diff_dirs"] == [source] and changes["full_dirs"] == []
+    assert "scopes" not in changes
 
+    store = service.compile.lifecycle.store
+    progress = (await store.get_by_to(ctx.account_id, target))["progress"]
+    extra = "viking://resources/extra-source"
+    await service.viking_fs.write_file(f"{extra}/a.md", "extra", ctx=admin)
     runtime_status = "failed"
-    failed = await submit({**payload, "instruction": "Regenerate"}, "compile-failure-key")
+    failed = await submit(
+        {**payload, "from": [source, extra], "instruction": "Regenerate"}, "compile-failure-key"
+    )
     assert (await tracker.get(failed, **owner)).status == "failed"
+    assert (await store.get_by_to(ctx.account_id, target))["progress"] == progress
     assert await service.fs.read(page, ctx) == "ordinary edit"
     assert await service.fs.read(f"{target}/imported.md", ctx) == "keep imported"
     assert await service.fs.read(f"{target}/copied.md", ctx) == "keep copied"
@@ -338,6 +346,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     history = (await client.get("/api/v1/compile/operations", params={"to": target})).json()[
         "result"
     ]
+    assert all(set(op["changes"]) == {"summary"} for op in history["operations"])
     assert next(op for op in history["operations"] if op["task_id"] == failed)["status"] == "failed"
 
     # Binary version restore is guarded by the version the caller last observed.

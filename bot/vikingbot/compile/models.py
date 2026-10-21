@@ -90,6 +90,11 @@ class SanitizedCompileRequest(BaseModel):
     wiki_links: bool = Field(default=False, strict=True)
 
 
+def has_directory_plan(changes: dict[str, Any] | None) -> bool:
+    """Identify directory-based task inputs; request normalization validates their contents."""
+    return isinstance(changes, dict) and "diff_dirs" in changes and "full_dirs" in changes
+
+
 class WikiPageDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

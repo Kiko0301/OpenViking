@@ -296,6 +296,31 @@ async def diff(
     return Response(status="ok", result=result)
 
 
+@router.get("/diff-paths")
+async def diff_paths(
+    paths: List[str] = Query(
+        ..., min_length=1, description="Directory URIs; repeat for each directory"
+    ),
+    from_ref: Optional[str] = Query(None, alias="from", min_length=1),
+    to_ref: str = Query(..., alias="to", min_length=1),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """List changed source files in URI order; omitted ``from`` means an empty tree."""
+    paths = [validate_request_viking_uri(path, _ctx, field_name="paths") for path in paths]
+    try:
+        result = await get_service().fs.diff_paths(
+            paths, from_ref=from_ref, to_ref=to_ref, offset=offset, limit=limit, ctx=_ctx
+        )
+    except (AGFSClientError, ValueError) as exc:
+        mapped = map_exception(exc)
+        if mapped is not None:
+            raise mapped from exc
+        raise
+    return Response(status="ok", result=result)
+
+
 @router.get("/ignore")
 async def get_ignore(
     _ctx: RequestContext = Depends(get_request_context),

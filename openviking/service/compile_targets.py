@@ -592,7 +592,6 @@ class CompileStateStore:
 
 
 CONTROL_ARGS = ("mode", "auto_update", "update_schedule")
-MAX_SCOPES = 1000
 GIT_RETRIES = 3
 SNAPSHOT_BUSY_SECONDS = 30.0
 TERMINAL = frozenset({"completed", "failed", "cancelled"})
@@ -652,37 +651,6 @@ def split_control_args(args: Optional[Mapping[str, Any]]) -> tuple[dict, dict]:
     if not isinstance(control.get("auto_update", False), bool):
         raise InvalidArgumentError("args.auto_update must be a boolean")
     return control, runtime
-
-
-def compress_scopes(changes: List[Dict[str, str]], added_roots: List[str]) -> List[Dict[str, Any]]:
-    """Roots processed in full become one recursive scope; other changes stay per file.
-
-    While the plan exceeds ``MAX_SCOPES``, the densest parent directory is folded
-    into a recursive ``rescan`` scope that keeps its underlying change types.
-    """
-    scopes: List[Dict[str, Any]] = [
-        {"uri": root, "change_type": "added", "recursive": True} for root in added_roots
-    ]
-    files = [
-        {"uri": c["uri"], "change_type": c["change_type"], "recursive": False} for c in changes
-    ]
-    while len(scopes) + len(files) > MAX_SCOPES:
-        counts: Dict[str, int] = {}
-        for item in files:
-            parent = item["uri"].rsplit("/", 1)[0]
-            counts[parent] = counts.get(parent, 0) + 1
-        parent = max(counts, key=counts.get)
-        folded = [item for item in files if item["uri"].rsplit("/", 1)[0] == parent]
-        files = [item for item in files if item not in folded]
-        files.append(
-            {
-                "uri": parent,
-                "change_type": "rescan",
-                "recursive": True,
-                "change_types": sorted({item["change_type"] for item in folded}),
-            }
-        )
-    return scopes + files
 
 
 def new_operation(
@@ -1033,7 +1001,7 @@ class CompileLifecycle:
                     {} if mode == "full" else progress, request["from"], run["target_base"], ctx
                 )
             )
-            if mode == "incremental" and not run["changes"]["scopes"] and record["initialized"]:
+            if mode == "incremental" and not run["changed_roots"] and record["initialized"]:
                 run["status"] = "completed"
             await self._store.put_operation(task.account_id, meta["target_id"], run)
         return run
@@ -1057,16 +1025,13 @@ class CompileLifecycle:
         changed_roots = added_roots + [
             root for root in compared if any(c["uri"].startswith(f"{root}/") for c in changes)
         ]
-        scopes = compress_scopes(changes, added_roots)
         return {
             "base": base,
             "head": head,
+            "diff_dirs": compared,
+            "full_dirs": added_roots,
             "changed_roots": changed_roots,
-            "changes": {
-                "summary": summary,
-                "scope_count": len(scopes),
-                "scopes": scopes,
-            },
+            "changes": {"summary": summary},
         }
 
     async def runtime_changes(
@@ -1082,7 +1047,8 @@ class CompileLifecycle:
         return {
             "base": run["base"],
             "head": run["head"],
-            "scopes": run["changes"]["scopes"],
+            "diff_dirs": run["diff_dirs"],
+            "full_dirs": run["full_dirs"],
             "execution": run.get("execution"),
             "skill_snapshot": run.get("skill_snapshot"),
         }
@@ -1181,7 +1147,6 @@ class CompileLifecycle:
                     run["error"] = snapshot.error_message or snapshot.status
                 run["status"] = snapshot.status
                 run["finished_at"] = time.time()
-                (run.get("changes") or {}).pop("scopes", None)
                 await self._store.put_operation(account_id, target_id, run)
             await self._release(account_id, target_id, task, run)
             return snapshot

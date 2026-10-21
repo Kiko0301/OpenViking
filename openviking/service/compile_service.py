@@ -687,10 +687,7 @@ class CompileService:
             }
             | {
                 "conflicts_num": operation.get("conflicts_num", 0),
-                "changes": {
-                    key: (operation.get("changes") or {}).get(key)
-                    for key in ("summary", "scope_count")
-                },
+                "changes": {"summary": (operation.get("changes") or {}).get("summary")},
             }
             for operation in page
         ]

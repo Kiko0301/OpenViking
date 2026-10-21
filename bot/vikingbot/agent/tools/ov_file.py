@@ -257,6 +257,69 @@ class VikingListTool(OVFileTool):
             await self._release_client(tool_context, client)
 
 
+class VikingDiffPathsTool(OVFileTool):
+    """Expose paginated snapshot changes, including deletions, without reading file bodies."""
+
+    @property
+    def name(self) -> str:
+        return "openviking_diff_paths"
+
+    @property
+    def description(self) -> str:
+        return (
+            "List added, modified and deleted file URIs under directories between snapshots. "
+            "Omit base or pass null to list all files at head. Results include has_more and "
+            "next_offset; query all pages to enumerate the complete change set. "
+            "Read required file contents separately with openviking_multi_read."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                    "description": "Source directory Viking URIs to compare.",
+                },
+                "base": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "Base commit ID; omitted or null means an empty tree.",
+                },
+                "head": {"type": "string", "description": "Required target snapshot commit ID."},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
+            },
+            "required": ["paths", "head"],
+        }
+
+    async def execute(
+        self,
+        tool_context: ToolContext,
+        paths: list[str],
+        head: str,
+        base: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+        **kwargs: Any,
+    ) -> str:
+        """Return the requested change page as JSON, or an explicit query error."""
+        client = None
+        try:
+            client = await self._get_client(tool_context)
+            result = await client.diff_paths(
+                paths, base=base, head=head, offset=offset, limit=limit
+            )
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(f"Error querying Viking snapshot changes: {exc}")
+            return f"Error querying Viking snapshot changes: {exc}"
+        finally:
+            await self._release_client(tool_context, client)
+
+
 class VikingSearchTool(OVFileTool):
     """Tool to search Viking resources."""
 

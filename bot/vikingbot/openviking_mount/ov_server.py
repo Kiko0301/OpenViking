@@ -545,6 +545,20 @@ class VikingClient:
         )
         return self.client._handle_response_data(response).get("result", {})
 
+    async def diff_paths(
+        self,
+        dirs: list[str],
+        *,
+        head: str,
+        base: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Return one authenticated directory-change page; a null base compares an empty tree."""
+        return await self.client.git_diff_paths(
+            dirs, to_ref=head, from_ref=base, offset=offset, limit=limit
+        )
+
     async def list_resources(
         self,
         path: Optional[str] = None,

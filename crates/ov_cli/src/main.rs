@@ -1535,6 +1535,22 @@ pub(crate) enum SnapshotCmd {
         #[arg(long = "to")]
         to_ref: String,
     },
+    /// List changed source files under directories between two snapshots
+    DiffPaths {
+        /// Directory URIs (comma-separated)
+        #[arg(long, value_delimiter = ',', required = true, num_args = 1..)]
+        paths: Vec<String>,
+        /// Older commit oid, branch, or tag; omit to compare an empty tree
+        #[arg(long = "from")]
+        from_ref: Option<String>,
+        /// Newer commit oid, branch, or tag
+        #[arg(long = "to")]
+        to_ref: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
+    },
     /// Get the account .ovgitignore content
     IgnoreGet,
     /// Set the account .ovgitignore content

@@ -57,6 +57,7 @@ from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
     NotInitializedError,
+    PermissionDeniedError,
     ResourceExhaustedError,
 )
 from openviking_cli.utils import VikingURI, get_logger
@@ -1661,6 +1662,46 @@ class FSService:
             raw=raw,
             ctx=ctx,
         )
+
+    async def diff_paths(
+        self,
+        paths: List[str],
+        *,
+        from_ref: Optional[str],
+        to_ref: str,
+        ctx: RequestContext,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Page changed source URIs between snapshots; a null base means an empty tree.
+
+        Every changed path requires current read permission, including deleted paths.
+        Any denied descendant rejects the whole query without exposing its URI.
+        """
+        viking_fs = self._ensure_initialized()
+        if not paths or not to_ref.strip() or (from_ref is not None and not from_ref.strip()):
+            raise InvalidArgumentError("paths and non-empty snapshot refs are required")
+        if offset < 0 or not 1 <= limit <= 1000:
+            raise InvalidArgumentError("offset must be non-negative and limit must be 1..1000")
+        changes = await viking_fs.diff_paths(
+            dirs=list(dict.fromkeys(paths)), base=from_ref, head=to_ref, ctx=ctx
+        )
+        changes_by_uri = {change["uri"]: change for change in changes}
+        uris = sorted(changes_by_uri)
+        access = await viking_fs._can_access_many(uris, ctx, action=AclAction.READ)
+        if any(not access.get(uri, False) for uri in uris):
+            raise PermissionDeniedError("Snapshot changes include inaccessible paths")
+        page = [changes_by_uri[uri] for uri in uris[offset : offset + limit]]
+        next_offset = offset + len(page)
+        has_more = next_offset < len(uris)
+        return {
+            "changes": page,
+            "offset": offset,
+            "limit": limit,
+            "total": len(uris),
+            "has_more": has_more,
+            "next_offset": next_offset if has_more else None,
+        }
 
     async def log(
         self,

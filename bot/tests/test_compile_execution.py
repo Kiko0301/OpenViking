@@ -1,14 +1,18 @@
 """Core regressions for account isolation and advisory Compile execution."""
 
 import asyncio
+import json
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from vikingbot.compile import review
+from vikingbot.agent.tools.base import ToolContext
+from vikingbot.agent.tools.ov_file import VikingDiffPathsTool, VikingMultiReadTool
+from vikingbot.compile import entry, review
 from vikingbot.compile.models import CompileLimits
+from vikingbot.compile.pipeline import Pipeline
 from vikingbot.compile.pipeline_io import JsonModel, ModelCallLimitError
 from vikingbot.compile.plan import Contract, Node, ReviewDecision
 from vikingbot.compile.sandbox import CompileSandboxManager, _CompileSandbox
@@ -135,3 +139,74 @@ def test_compile_workspace_root_is_absolute_for_relative_storage(tmp_path, monke
     config_path = Path(sandbox._config_path)
     assert config_path.is_absolute()
     assert config_path.is_relative_to(manager.workspace)
+
+
+@pytest.mark.parametrize(
+    ("publish", "skill_target"), [(True, False), (False, False), (False, True)]
+)
+async def test_compile_agent_reads_evidence_and_accepts_noop(tmp_path, publish, skill_target):
+    root = "viking://resources/source"
+    page = {
+        "changes": [{"uri": f"{root}/gone.md", "change_type": "deleted"}],
+        "has_more": True,
+        "next_offset": 10,
+    }
+    client = SimpleNamespace(
+        diff_paths=AsyncMock(return_value=page),
+        read_raw=AsyncMock(return_value="Context\nFact\n"),
+    )
+    request = SimpleNamespace(
+        from_=[root],
+        to="viking://resources/output",
+        skill="viking://user/default/skills/test",
+        changes={"base": "old", "head": "new", "diff_dirs": [root], "full_dirs": []},
+    )
+    runtime = Pipeline(
+        client=client,
+        sandbox=SimpleNamespace(sandbox_cwd=str(tmp_path)),
+        provider=SimpleNamespace(),
+        model="test",
+        temperature=0,
+        limits=CompileLimits(),
+        request=request,
+        skill="Test skill",
+        usage={},
+    )
+    stored = {}
+
+    async def put(path, value):
+        stored[path] = value
+
+    runtime.files = SimpleNamespace(
+        get=AsyncMock(side_effect=stored.get), put=AsyncMock(side_effect=put)
+    )
+    runtime.tool_context = ToolContext()
+    runtime.tools = {tool.name: tool for tool in (VikingDiffPathsTool(), VikingMultiReadTool())}
+    runtime.skill_target = skill_target
+    runtime.old["summary.md"] = None
+
+    async def ask(stage, system, data, schema, validate, *, readers):
+        assert data["inputs"] == []
+        client.read_raw.assert_not_awaited()
+        result = json.loads(
+            await readers["openviking_diff_paths"].execute(
+                paths=[root], base="old", head="new", offset=9, limit=1
+            )
+        )
+        assert {key: result[key] for key in page} == page
+        assert result["inputs"][0]["payload"]["change_type"] == "deleted"
+        material = json.loads(
+            await readers["openviking_multi_read"].execute(uris=[f"{root}/a.md"], offset=1, limit=1)
+        )
+        source = material["inputs"][0]
+        assert source["payload"]["start_line"] == 2
+        files = [{"path": "summary.md", "content": "Fact", "inputs": [source["id"]]}]
+        response = schema(files=files if publish else [], no_changes_reason="Already covered.")
+        await validate(response)
+        return response
+
+    runtime.model.ask = AsyncMock(side_effect=ask)
+    assert len(await entry.run(runtime, [], {})) == int(publish)
+    assert runtime.noop is not publish
+    client.diff_paths.assert_awaited_once_with([root], base="old", head="new", offset=9, limit=1)
+    client.read_raw.assert_awaited_once_with(f"{root}/a.md")
