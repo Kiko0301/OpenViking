@@ -20,7 +20,10 @@ class VikingFindMCPToolsTool(OVFileTool):
     @property
     def description(self) -> str:
         return (
-            "Semantically discover OpenViking-managed MCP tools for the user's intent. "
+            "Semantically discover tools from external MCP Servers registered in the "
+            "connected OpenViking service. This catalog is independent of MCP Servers "
+            "configured directly under bot.tools.mcp_servers and does not contain their "
+            "mcp_<server>_<tool> names. "
             "Prefer an already-arranged Live Context resource when one matches the task; "
             "use this tool for low-frequency or custom requests. The result contains each "
             "candidate's routing URI, inputSchema, and annotations. Select one candidate, "
@@ -153,11 +156,12 @@ class VikingInvokeMCPTool(OVFileTool):
     @property
     def description(self) -> str:
         return (
-            "Invoke one OpenViking-managed MCP tool selected by "
-            "openviking_find_mcp_tools. Use the returned URI unchanged and provide only "
-            "arguments allowed by that candidate's inputSchema. Inspect its annotations "
-            "before invocation because the upstream tool may have external side effects. "
-            "OpenViking resolves credentials and validates arguments. Calls are not retried."
+            "Invoke one tool from an external MCP Server registered in OpenViking and selected "
+            "by openviking_find_mcp_tools. This tool does not invoke VikingBot-connected "
+            "mcp_<server>_<tool> tools. Use the returned URI unchanged and provide only "
+            "arguments allowed by that candidate's inputSchema. Inspect its annotations before "
+            "invocation because the upstream tool may have external side effects. OpenViking "
+            "resolves credentials and validates arguments. Calls are not retried."
         )
 
     @property

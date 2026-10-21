@@ -49,7 +49,19 @@ OpenAPI's `disabled_tools` can hide tools per request. A channel with `ov_tools_
 
 ## MCP Extensions
 
-`bot.tools.mcp_servers` connects external MCP Servers over `stdio`, `sse`, or `streamableHttp`. Remote tools are wrapped as ordinary VikingBot Tools and registered as `mcp_<server>_<tool>`.
+VikingBot distinguishes three MCP concepts:
+
+| Concept | Owner and purpose | Tools visible to VikingBot |
+|---------|-------------------|----------------------------|
+| **OpenViking MCP Interface** | OpenViking's public MCP interface for external MCP clients | VikingBot uses its own `openviking_*` bindings to the connected service; this is not a direct Bot MCP connection |
+| **OpenViking-registered MCP Servers** | External services registered in OpenViking for discovery, proxied invocation, and Live Context mounts | `openviking_find_mcp_tools` and `openviking_invoke_mcp_tool`; arranged nodes are read through OpenViking content tools |
+| **VikingBot-connected MCP Servers** | External services connected directly by the Bot through `bot.tools.mcp_servers` | Ordinary tools named `mcp_<server>_<tool>` |
+
+The two external service registries are independent. Registering a server in OpenViking
+does not create a direct VikingBot tool, and configuring it in VikingBot does not add it
+to the OpenViking catalog or make it available for Live Context mounts.
+
+`bot.tools.mcp_servers` connects VikingBot-connected MCP Servers over `stdio`, `sse`, or `streamableHttp`. Remote tools are wrapped as ordinary VikingBot Tools and registered as `mcp_<server>_<tool>`.
 
 Each MCP Server can configure:
 
@@ -60,7 +72,7 @@ Each MCP Server can configure:
 
 MCP parameter Schemas are normalized for compatibility before being passed to the model and ToolRegistry.
 
-When the OpenViking Server connected to VikingBot has registered MCP Servers, VikingBot
+When the OpenViking Server connected to VikingBot has OpenViking-registered MCP Servers, VikingBot
 also exposes two stable OpenViking tools:
 
 - `openviking_find_mcp_tools` dynamically discovers tools by intent and returns their
@@ -75,6 +87,11 @@ validation while VikingBot keeps only the two stable meta-tools. The Agent first
 searches for an arranged Live Context node and reads it; dynamic discovery is the
 fallback when no suitable node exists. `readonly` mode exposes discovery only, and
 Studio-managed group conversations disable both tools by default.
+
+If the same upstream is configured in both registries, the Agent must choose one route
+and avoid duplicate calls. It must not pass a direct `mcp_<server>_<tool>` name to
+`openviking_invoke_mcp_tool`; that tool accepts only a `viking://agent/tools/...` URI
+returned by OpenViking discovery.
 
 ## Subagents
 

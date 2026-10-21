@@ -258,6 +258,7 @@ export const sections: DocSection[] = [
         p('api/19-agent-evolution')
       ]),
       g('Data and extension APIs', '数据与扩展 API', [
+        p('api/26-mcp-live-context'),
         p('api/11-snapshot'),
         p('api/14-ovpack'),
         p('api/22-openviking-assets'),
