@@ -61,7 +61,7 @@ OpenViking resolves credentials -> calls upstream Tool -> returns native Tool re
 MCP_TOKEN='replace-me'
 ov mcps validate "$(jq -cn \
   --arg token "$MCP_TOKEN" \
-  '{mcpServers:{demo:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
+  '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
 验证通过后注册。`add` 会立即写入发现到的 Tool Catalog，并默认让摘要和索引在后台继续处理：
@@ -69,7 +69,7 @@ ov mcps validate "$(jq -cn \
 ```bash
 ov mcps add "$(jq -cn \
   --arg token "$MCP_TOKEN" \
-  '{mcpServers:{demo:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
+  '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
 需要确认 Tool 摘要和索引处理完成后再返回时，加 `-w` 或 `--wait`：
@@ -77,15 +77,15 @@ ov mcps add "$(jq -cn \
 ```bash
 ov mcps add --wait "$(jq -cn \
   --arg token "$MCP_TOKEN" \
-  '{mcpServers:{demo:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
+  '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
 查看注册状态和 Tool 定义：
 
 ```bash
 ov mcps list
-ov mcps show demo
-ov mcps status demo
+ov mcps show weather
+ov mcps status weather
 ```
 
 相关命令：
@@ -104,15 +104,15 @@ ov mcps status demo
 Tool Catalog 支持语义检索：
 
 ```bash
-ov mcps find "add two numbers" --limit 5
+ov mcps find "查询北京的天气" --limit 5
 ```
 
 根据结果中的 Tool URI 和参数定义直接调用：
 
 ```bash
 ov mcps invoke \
-  viking://agent/tools/demo/get-sum.json \
-  --args '{"a":2.718281828,"b":3.141592654}'
+  viking://agent/tools/weather/current.json \
+  --args '{"city":"Beijing"}'
 ```
 
 `invoke` 由服务端解析 MCP Server 地址和 Header，并保留上游 Tool 的原生 `content`、`structuredContent` 和 `isError`。
@@ -123,11 +123,11 @@ ov mcps invoke \
 
 ```bash
 ov mcps mount \
-  viking://agent/tools/demo/get-sum.json \
-  viking://resources/arrange/e-plus-pi.md \
-  --title "e + pi" \
-  --description "Calculate the sum of e and pi." \
-  --args '{"a":2.718281828,"b":3.141592654}' \
+  viking://agent/tools/weather/current.json \
+  viking://resources/arrange/beijing-weather.md \
+  --title "北京天气" \
+  --description "北京地区的实时天气。" \
+  --args '{"city":"Beijing"}' \
   --timeout-seconds 60 \
   --wait
 ```
@@ -135,15 +135,15 @@ ov mcps mount \
 读取节点会执行上游 Tool：
 
 ```bash
-ov read viking://resources/arrange/e-plus-pi.md
+ov read viking://resources/arrange/beijing-weather.md
 ```
 
 查看和删除挂载：
 
 ```bash
-ov mcps mounts --mcp demo
-ov mcps mounts --mcp demo --tool get-sum
-ov mcps unmount viking://resources/arrange/e-plus-pi.md --wait
+ov mcps mounts --mcp weather
+ov mcps mounts --mcp weather --tool current
+ov mcps unmount viking://resources/arrange/beijing-weather.md --wait
 ```
 
 `mount` 对同一个 `node_uri` 是收敛式写入：再次执行会更新 Tool、参数、标题和描述，并保留最初的 `created_at`。删除节点应使用 `ov mcps unmount`，使 Markdown 节点和挂载记录一起删除。
@@ -153,13 +153,13 @@ ov mcps unmount viking://resources/arrange/e-plus-pi.md --wait
 上游 Tool 定义变化后执行：
 
 ```bash
-ov mcps sync demo
+ov mcps sync weather
 ```
 
 摘要和索引默认在后台继续处理。需要等待 Tool Catalog 的新增、更新、删除及索引刷新全部完成时执行：
 
 ```bash
-ov mcps sync demo --wait
+ov mcps sync weather --wait
 ```
 
 同步结果把 Tool 分为 `added`、`changed`、`unchanged` 和 `removed`，并列出受影响的实时节点：
@@ -181,16 +181,15 @@ ov mcps sync demo --wait
 ```markdown
 ---
 type: OpenViking Live Context
-title: e + pi
-description: Calculate the sum of e and pi.
+title: 北京天气
+description: 北京地区的实时天气。
 x-openviking:
   schema_version: v1
   type: mcp
-  definition: viking://agent/tools/demo/get-sum.json
+  definition: viking://agent/tools/weather/current.json
   revision: <tool-revision>
   args:
-    a: 2.718281828
-    b: 3.141592654
+    city: Beijing
   timeout_seconds: 60
   retry:
     max_attempts: 3
@@ -264,11 +263,11 @@ client = SyncHTTPClient(
 client.initialize()
 
 client.mount_mcp_tool(
-    tool_uri="viking://agent/tools/demo/get-sum.json",
-    node_uri="viking://resources/arrange/e-plus-pi.md",
-    title="e + pi",
-    arguments={"a": 2.718281828, "b": 3.141592654},
-    tags=["project=math"],
+    tool_uri="viking://agent/tools/weather/current.json",
+    node_uri="viking://resources/arrange/beijing-weather.md",
+    title="北京天气",
+    arguments={"city": "Beijing"},
+    tags=["project=weather"],
     wait=True,
 )
 ```
@@ -278,7 +277,6 @@ client.mount_mcp_tool(
 ### Context as Code
 
 ```python
-import math
 import os
 
 from openviking_sdk import ContextArranger, SyncHTTPClient
@@ -291,16 +289,16 @@ client.initialize()
 
 arranger = ContextArranger(
     client,
-    name="math-live-context",
+    name="weather-live-context",
     root_uri="viking://resources/arrange",
 )
 
 arranger.live_context(
-    "e-plus-pi.md",
-    tool_uri="viking://agent/tools/demo/get-sum.json",
-    title="e + pi",
-    arguments={"a": math.e, "b": math.pi},
-    tags=["domain=math"],
+    "beijing-weather.md",
+    tool_uri="viking://agent/tools/weather/current.json",
+    title="北京天气",
+    arguments={"city": "Beijing"},
+    tags=["domain=weather"],
 )
 
 raise SystemExit(arranger.main())

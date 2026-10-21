@@ -61,7 +61,7 @@ Validate connectivity and tool discovery without persisting configuration:
 MCP_TOKEN='replace-me'
 ov mcps validate "$(jq -cn \
   --arg token "$MCP_TOKEN" \
-  '{mcpServers:{demo:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
+  '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
 Register it after validation. `add` writes the discovered Tool Catalog immediately and lets summaries and indexing continue in the background by default:
@@ -69,7 +69,7 @@ Register it after validation. `add` writes the discovered Tool Catalog immediate
 ```bash
 ov mcps add "$(jq -cn \
   --arg token "$MCP_TOKEN" \
-  '{mcpServers:{demo:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
+  '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
 Add `-w` or `--wait` when the command must return only after tool summaries and indexing finish:
@@ -77,15 +77,15 @@ Add `-w` or `--wait` when the command must return only after tool summaries and 
 ```bash
 ov mcps add --wait "$(jq -cn \
   --arg token "$MCP_TOKEN" \
-  '{mcpServers:{demo:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
+  '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
 Inspect the registry and definitions:
 
 ```bash
 ov mcps list
-ov mcps show demo
-ov mcps status demo
+ov mcps show weather
+ov mcps status weather
 ```
 
 The management commands are:
@@ -104,15 +104,15 @@ The management commands are:
 The Tool Catalog supports semantic discovery:
 
 ```bash
-ov mcps find "add two numbers" --limit 5
+ov mcps find "weather in Beijing" --limit 5
 ```
 
 Use the returned URI and schema to invoke it:
 
 ```bash
 ov mcps invoke \
-  viking://agent/tools/demo/get-sum.json \
-  --args '{"a":2.718281828,"b":3.141592654}'
+  viking://agent/tools/weather/current.json \
+  --args '{"city":"Beijing"}'
 ```
 
 The server resolves the MCP address and headers. It preserves the upstream tool's native `content`, `structuredContent`, and `isError`.
@@ -123,11 +123,11 @@ Bind preset arguments to a Markdown URI:
 
 ```bash
 ov mcps mount \
-  viking://agent/tools/demo/get-sum.json \
-  viking://resources/arrange/e-plus-pi.md \
-  --title "e + pi" \
-  --description "Calculate the sum of e and pi." \
-  --args '{"a":2.718281828,"b":3.141592654}' \
+  viking://agent/tools/weather/current.json \
+  viking://resources/arrange/beijing-weather.md \
+  --title "Beijing Weather" \
+  --description "Current weather for the Beijing region." \
+  --args '{"city":"Beijing"}' \
   --timeout-seconds 60 \
   --wait
 ```
@@ -135,15 +135,15 @@ ov mcps mount \
 Reading the node executes the upstream tool:
 
 ```bash
-ov read viking://resources/arrange/e-plus-pi.md
+ov read viking://resources/arrange/beijing-weather.md
 ```
 
 List and remove mounts:
 
 ```bash
-ov mcps mounts --mcp demo
-ov mcps mounts --mcp demo --tool get-sum
-ov mcps unmount viking://resources/arrange/e-plus-pi.md --wait
+ov mcps mounts --mcp weather
+ov mcps mounts --mcp weather --tool current
+ov mcps unmount viking://resources/arrange/beijing-weather.md --wait
 ```
 
 `mount` converges on `node_uri`: repeating it updates the tool, arguments, title, and description while retaining the initial `created_at`. Remove a node with `ov mcps unmount` so the descriptor and mount record are deleted together.
@@ -153,13 +153,13 @@ ov mcps unmount viking://resources/arrange/e-plus-pi.md --wait
 After an upstream definition changes, run:
 
 ```bash
-ov mcps sync demo
+ov mcps sync weather
 ```
 
 Summaries and indexing continue in the background by default. Wait for all Tool Catalog creates, updates, removals, and index refreshes with:
 
 ```bash
-ov mcps sync demo --wait
+ov mcps sync weather --wait
 ```
 
 The result classifies tools as `added`, `changed`, `unchanged`, or `removed`, and reports affected mounts:
@@ -181,16 +181,15 @@ A mount creates a Markdown descriptor with YAML frontmatter. This example shows 
 ```markdown
 ---
 type: OpenViking Live Context
-title: e + pi
-description: Calculate the sum of e and pi.
+title: Beijing Weather
+description: Current weather for the Beijing region.
 x-openviking:
   schema_version: v1
   type: mcp
-  definition: viking://agent/tools/demo/get-sum.json
+  definition: viking://agent/tools/weather/current.json
   revision: <tool-revision>
   args:
-    a: 2.718281828
-    b: 3.141592654
+    city: Beijing
   timeout_seconds: 60
   retry:
     max_attempts: 3
@@ -264,11 +263,11 @@ client = SyncHTTPClient(
 client.initialize()
 
 client.mount_mcp_tool(
-    tool_uri="viking://agent/tools/demo/get-sum.json",
-    node_uri="viking://resources/arrange/e-plus-pi.md",
-    title="e + pi",
-    arguments={"a": 2.718281828, "b": 3.141592654},
-    tags=["project=math"],
+    tool_uri="viking://agent/tools/weather/current.json",
+    node_uri="viking://resources/arrange/beijing-weather.md",
+    title="Beijing Weather",
+    arguments={"city": "Beijing"},
+    tags=["project=weather"],
     wait=True,
 )
 ```
@@ -278,7 +277,6 @@ Use `batch_mount_mcp_tools` and `batch_unmount_mcp_tools` for batches. Batch mou
 ### Context as Code
 
 ```python
-import math
 import os
 
 from openviking_sdk import ContextArranger, SyncHTTPClient
@@ -291,16 +289,16 @@ client.initialize()
 
 arranger = ContextArranger(
     client,
-    name="math-live-context",
+    name="weather-live-context",
     root_uri="viking://resources/arrange",
 )
 
 arranger.live_context(
-    "e-plus-pi.md",
-    tool_uri="viking://agent/tools/demo/get-sum.json",
-    title="e + pi",
-    arguments={"a": math.e, "b": math.pi},
-    tags=["domain=math"],
+    "beijing-weather.md",
+    tool_uri="viking://agent/tools/weather/current.json",
+    title="Beijing Weather",
+    arguments={"city": "Beijing"},
+    tags=["domain=weather"],
 )
 
 raise SystemExit(arranger.main())

@@ -178,7 +178,6 @@ export const sections: DocSection[] = [
       ]),
       g('Manage context', '组织与维护上下文', [
         p('guides/23-data-organize'),
-        p('guides/23-live-context-arrangement'),
         p('guides/18-openviking-assets'),
         p('guides/09-ovpack'),
         p('guides/15-snapshot'),
@@ -191,6 +190,9 @@ export const sections: DocSection[] = [
         p('context-compilation/04-daily-report'),
         p('context-compilation/05-knowledge-distillation'),
         p('context-compilation/06-memory-consolidation')
+      ]),
+      g('Live context integration and arrangement', '实时上下文接入和编排', [
+        p('guides/24-live-context-arrangement')
       ])
     ]
   },
