@@ -1,35 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Stable contract for the commercial directory-TTL integration layer.
-
-The open-source kernel only *calls* this interface; it never ships a concrete
-implementation that touches Redis or performs recycling. A commercial
-deployment supplies a class via ``server.ttl_adapter.class_path`` (see
-:mod:`openviking.ttl.loader`). When no adapter is configured TTL stays
-unsupported: the write hook is never installed and explicit TTL configuration
-is rejected with 501 / ``UNIMPLEMENTED``.
-
-The method set mirrors the three responsibilities the technical design assigns
-to the commercial OV integration layer:
-
-* ``on_post_write`` — interpret the kernel's post-write notification and ZADD
-  the owning directory into the right Redis index (incremental registration).
-* ``register_initial_backfill`` — the Server's internal trigger to register and
-  resume the single fixed ``initial`` historical scan for one scope.
-* ``recycle_due`` — the Server's hourly internal trigger to recycle the due
-  candidates for one scope under the directory lock.
-* ``resolve_expires_at`` — the read-path echo-back: given a page of URIs it
-  returns each directory's computed ``expires_at`` (or ``None``) so the kernel
-  can attach it to ``stat`` / ``ls`` / ``tree`` entries. The value is computed
-  from the current effective policy (reusing :mod:`openviking.config.ttl`) and
-  never persisted.
-
-Registration, backfill and recycling are all driven by the commercial adapter;
-the kernel never calls Redis itself. The bodies for ``register_initial_backfill``
-and ``recycle_due`` are filled in by the commercial adapter task; this module
-only pins the shared shapes so the loader, the write hook and the Server-facing
-internal routes can be wired independently.
-"""
+"""Optional commercial TTL contract. OSS provides wiring, never Redis/product behavior."""
 
 from __future__ import annotations
 
@@ -51,21 +22,11 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class TTLBackfillRequest:
-    """Server-internal request to register/resume the fixed initial scan.
+    """Fixed initial scan: reset=False resumes the saved scope/checkpoint.
 
-    ``roots`` is the set of canonical directory URIs the Server has decided the
-    scope must cover (all TTL-governed Events and Session trees). The adapter
-    initializes only missing HASH entries and resumes the stored checkpoint
-    when ``reset=False``. A completed task with unchanged roots is a no-op;
-    changed roots without reset must fail with CONFLICT.
-
-    With ``reset=True``, serialize by scope, stop the old scan and wait for
-    in-flight I/O, clear done, replace checkpoint and roots, then add initial
-    to pending. Keep directory indexes and incremental registration intact;
-    pause physical recycling until this round writes done=1 again. Return
-    only after registration is confirmed. A timeout leaves the result unknown:
-    inspect Redis and request-id logs before retrying, using reset=False once
-    registration is confirmed. Pod recovery never resets an existing task.
+    reset=True stops the scan, clears done, replaces roots/checkpoint and
+    registers pending; indexes survive. After a lost response, inspect state
+    and request-id logs before retrying. Confirmed resets resume with False.
     """
 
     resource_id: str
@@ -157,20 +118,10 @@ class TTLAdapter(Protocol):
         uris: Sequence[str],
         ctx: Optional["RequestContext"],
     ) -> Mapping[str, Optional[str]]:
-        """Compute the read-only ``expires_at`` echo-back for a page of URIs.
+        """Batch-compute UTC expiry or None; never persist it or stat for display.
 
-        Returns a mapping from each input URI to a UTC ISO-8601 string (e.g.
-        ``"2030-01-31T00:00:00Z"``) or ``None``. ``None`` means "no available
-        expiry this time" — TTL disabled for the directory, a URI outside the
-        governed subtrees, a config root / navigation directory, or a missing /
-        failed Redis registration lookup. It does **not** imply TTL is off.
-
-        The value is computed from the current effective policy and (for
-        Sessions) the already-registered Redis base time; it is never stored to
-        object metadata or Redis. The adapter batches Redis reads per page under
-        a short timeout and must not add AGFS ``ls``/``stat`` I/O or fall back to
-        it on failure — a failed lookup yields ``None`` for that URI without
-        disturbing the surrounding listing/stat result.
+        Missing scores/Redis failure yield None without failing the read.
+        None alone does not imply TTL disabled or permanent retention.
         """
 
     async def start(self) -> None:

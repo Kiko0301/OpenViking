@@ -172,8 +172,7 @@ async def _initialize_ttl_adapter(
     adapter: the post-write hook stays uninstalled and the admin routes keep
     rejecting explicit TTL configuration with 501.
     """
-    from openviking.ttl.loader import build_ttl_adapter
-    from openviking.ttl.wiring import install_ttl_hook, set_ttl_adapter
+    from openviking.ttl.wiring import build_ttl_adapter, install_ttl_hook, set_ttl_adapter
 
     adapter = build_ttl_adapter(config.ttl_adapter)
     set_ttl_adapter(adapter)

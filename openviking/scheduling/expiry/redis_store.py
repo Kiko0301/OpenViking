@@ -46,6 +46,52 @@ from .models import (
 RetryPolicy = Literal["read", "idempotent", "resolve_by_caller"]
 
 
+def create_redis_client(config: ExpiryRedisConfig, *, retry=None):
+    """Build without connecting; callers retain their own startup/retry lifecycle."""
+    import redis.asyncio as redis_async
+
+    endpoint = config.endpoints[0]
+    if "://" not in endpoint:
+        endpoint = ("rediss" if config.tls else "redis") + "://" + endpoint
+    password = config.resolve_password()
+    kwargs: dict[str, Any] = {
+        "username": config.username or None,
+        "password": password,
+        "decode_responses": True,
+        "socket_connect_timeout": config.connect_timeout_seconds,
+        "socket_timeout": config.socket_timeout_seconds,
+        "max_connections": config.max_connections,
+    }
+    if retry is not None:
+        kwargs["retry"] = retry
+    if config.mode == "standalone":
+        return redis_async.Redis.from_url(endpoint, **kwargs)
+    else:
+        from redis.asyncio.cluster import ClusterNode, RedisCluster
+        from redis.backoff import NoBackoff
+        from redis.retry import Retry
+
+        nodes = []
+        use_tls = config.tls
+        for raw in config.endpoints:
+            normalized = (
+                raw if "://" in raw else (("rediss" if config.tls else "redis") + f"://{raw}")
+            )
+            parsed = urlsplit(normalized)
+            use_tls = use_tls or parsed.scheme == "rediss"
+            nodes.append(ClusterNode(parsed.hostname or "", parsed.port or 6379))
+        # Store retry policies must be the only authority for replaying
+        # commands: a lost CAS/SET NX response cannot safely be replayed.
+        # These instance-local flags leave MOVED/ASK routing intact.
+        kwargs.setdefault("retry", Retry(NoBackoff(), 0))
+        return RedisCluster(
+            startup_nodes=nodes,
+            ssl=use_tls,
+            cluster_error_retry_attempts=0,
+            **kwargs,
+        )
+
+
 class RedisExpiryStore:
     def __init__(
         self,
@@ -598,52 +644,13 @@ class RedisExpiryStore:
 
     async def _open_on_loop(self) -> None:
         try:
-            import redis.asyncio as redis_async
+            import redis.asyncio  # noqa: F401 - validate the optional dependency
         except ImportError as exc:
             raise StoreOperationError(
                 "dependency_missing",
                 "Redis expiry scheduling requires the 'expiry' optional dependency",
             ) from exc
-        endpoint = self._config.endpoints[0]
-        if "://" not in endpoint:
-            endpoint = ("rediss" if self._config.tls else "redis") + "://" + endpoint
-        password = self._config.resolve_password()
-        kwargs: dict[str, Any] = {
-            "username": self._config.username or None,
-            "password": password,
-            "decode_responses": True,
-            "socket_connect_timeout": self._config.connect_timeout_seconds,
-            "socket_timeout": self._config.socket_timeout_seconds,
-            "max_connections": self._config.max_connections,
-        }
-        if self._config.mode == "standalone":
-            self._client = redis_async.Redis.from_url(endpoint, **kwargs)
-        else:
-            from redis.asyncio.cluster import ClusterNode, RedisCluster
-            from redis.backoff import NoBackoff
-            from redis.retry import Retry
-
-            nodes = []
-            use_tls = self._config.tls
-            for raw in self._config.endpoints:
-                normalized = (
-                    raw
-                    if "://" in raw
-                    else (("rediss" if self._config.tls else "redis") + f"://{raw}")
-                )
-                parsed = urlsplit(normalized)
-                use_tls = parsed.scheme == "rediss"
-                nodes.append(ClusterNode(parsed.hostname or "", parsed.port or 6379))
-            # Store retry policies must be the only authority for replaying
-            # commands: a lost CAS/SET NX response cannot safely be replayed.
-            # These instance-local flags leave MOVED/ASK routing intact.
-            self._client = RedisCluster(
-                startup_nodes=nodes,
-                ssl=use_tls,
-                cluster_error_retry_attempts=0,
-                retry=Retry(NoBackoff(), 0),
-                **kwargs,
-            )
+        self._client = create_redis_client(self._config)
         try:
             await self._client.ping()
         except Exception as exc:

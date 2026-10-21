@@ -26,6 +26,19 @@ logger = get_logger(__name__)
 _adapter: Optional["TTLAdapter"] = None
 
 
+def build_ttl_adapter(config):
+    """Import the configured commercial class only when explicitly enabled."""
+    if config is None or not config.class_path:
+        return None
+    import importlib
+
+    module, name = config.class_path.rsplit(".", 1)
+    cls = getattr(importlib.import_module(module), name)
+    if not isinstance(cls, type):
+        raise TypeError(f"{config.class_path} does not resolve to a class")
+    return cls(**config.config)
+
+
 def set_ttl_adapter(adapter: Optional["TTLAdapter"]) -> None:
     """Register (or clear) the process-wide TTL adapter."""
     global _adapter

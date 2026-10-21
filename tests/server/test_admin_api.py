@@ -4012,7 +4012,7 @@ async def test_ttl_internal_bridge_auth_reset_and_configuration(
 
     monkeypatch.setattr(wiring, "_adapter", None)
     adapter = Mock(start=AsyncMock(), register_initial_backfill=AsyncMock())
-    monkeypatch.setattr("openviking.ttl.loader.build_ttl_adapter", lambda _: adapter)
+    monkeypatch.setattr("openviking.ttl.wiring.build_ttl_adapter", lambda _: adapter)
     service = lightweight_admin_app.state.fake_service
     monkeypatch.setattr(service.viking_fs, "set_post_write_hook", Mock(), raising=False)
     await _initialize_ttl_adapter(lightweight_admin_app, service, ServerConfig())
@@ -4064,7 +4064,7 @@ async def test_ttl_internal_preserves_error_contract(
     error = getattr(exceptions, error_type)("fixture failure")
     error.details["scope"] = "test"
     adapter = Mock(start=AsyncMock(), register_initial_backfill=AsyncMock(side_effect=error))
-    monkeypatch.setattr("openviking.ttl.loader.build_ttl_adapter", lambda _: adapter)
+    monkeypatch.setattr("openviking.ttl.wiring.build_ttl_adapter", lambda _: adapter)
     service = lightweight_admin_app.state.fake_service
     monkeypatch.setattr(service.viking_fs, "set_post_write_hook", Mock(), raising=False)
     await _initialize_ttl_adapter(lightweight_admin_app, service, ServerConfig())
@@ -4093,7 +4093,7 @@ async def test_ttl_directory_enumeration_binds_account_and_does_not_truncate(
 
     monkeypatch.setattr(wiring, "_adapter", None)
     adapter = Mock(start=AsyncMock())
-    monkeypatch.setattr("openviking.ttl.loader.build_ttl_adapter", lambda _: adapter)
+    monkeypatch.setattr("openviking.ttl.wiring.build_ttl_adapter", lambda _: adapter)
     service = lightweight_admin_app.state.fake_service
     monkeypatch.setattr(service.viking_fs, "set_post_write_hook", Mock(), raising=False)
     listing = AsyncMock(

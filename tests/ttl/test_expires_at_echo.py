@@ -45,12 +45,6 @@ async def test_attach_noop_without_adapter_leaves_entries_untouched():
     assert "expires_at" not in entries[0]
 
 
-async def test_attach_stat_noop_without_adapter():
-    result = {"uri": "viking://user/u/sessions/s1"}
-    await wiring.attach_expires_at([result], None)
-    assert "expires_at" not in result
-
-
 async def test_attach_attaches_value_and_null_only_for_covered_uris():
     calls = []
     wiring.set_ttl_adapter(
@@ -83,20 +77,6 @@ async def test_attach_attaches_value_and_null_only_for_covered_uris():
             "viking://user/u/resources/r1",
         ]
     ]
-
-
-async def test_attach_stat_attaches_value():
-    wiring.set_ttl_adapter(_Adapter({"viking://user/u/sessions/s1": "2030-01-31T00:00:00Z"}))
-    result = {"uri": "viking://user/u/sessions/s1", "isDir": True}
-    await wiring.attach_expires_at([result], None)
-    assert result["expires_at"] == "2030-01-31T00:00:00Z"
-
-
-async def test_attach_stat_null_for_covered_uri():
-    wiring.set_ttl_adapter(_Adapter({"viking://user/u/sessions/s1": None}))
-    result = {"uri": "viking://user/u/sessions/s1"}
-    await wiring.attach_expires_at([result], None)
-    assert result["expires_at"] is None
 
 
 async def test_attach_dedupes_and_drops_blank_uris():
