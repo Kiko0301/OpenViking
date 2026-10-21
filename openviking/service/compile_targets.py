@@ -1027,7 +1027,7 @@ class CompileLifecycle:
                 wait_busy=False,
                 lease_ref=lease,
             )
-            await self.versions.record_external(task.account_id, record, run["target_base"])
+            await self.versions.record_external(task.account_id, record, run["target_base"], ctx)
             run.update(
                 await self._plan(
                     {} if mode == "full" else progress, request["from"], run["target_base"], ctx
@@ -1146,7 +1146,7 @@ class CompileLifecycle:
                                 run["result"][_RESULT_KEYS[change["change_type"]]] += 1
                             record = await self._store.get(account_id, target_id)
                             await self.versions.record_compile(
-                                account_id, record, run, head, changes
+                                account_id, record, run, head, changes, ctx
                             )
                             if (
                                 any(is_versioned(change["uri"]) for change in changes)
@@ -1349,6 +1349,7 @@ class CompileLifecycle:
                         for uri, change in changes.items()
                         if change != "deleted"
                     ],
+                    ctx,
                 )
                 indexes = {
                     index["uri"]: index
@@ -2008,6 +2009,7 @@ class CompileVersions:
         run: Dict[str, Any],
         head: str,
         changes: List[Dict[str, str]],
+        ctx: RequestContext,
     ) -> None:
         """Register final Compile versions under the caller's output tree lease.
 
@@ -2056,7 +2058,7 @@ class CompileVersions:
                         continue
                     if change_type != "deleted":
                         try:
-                            if not await self._changed(account_id, record["id"], uri, head):
+                            if not await self._changed(ctx, record["id"], uri, head):
                                 continue
                         except (AGFSNotFoundError, NotFoundError):
                             change_type = "deleted"
@@ -2126,14 +2128,15 @@ class CompileVersions:
         return None
 
     async def record_external(
-        self, account_id: str, record: Dict[str, Any], target_base: Optional[str]
+        self,
+        account_id: str,
+        record: Dict[str, Any],
+        target_base: Optional[str],
+        ctx: RequestContext,
     ) -> None:
-        """At Compile start, version output changes made outside Compile and content/write.
+        """Version external changes since ``versions_head`` under the task owner's identity.
 
-        Compares the snapshot the indexes were last synced to (``versions_head``)
-        with this run's start snapshot; on first registration every existing
-        file becomes ``v1``. Files whose content already matches their latest
-        version (e.g. edits recorded by content/write) are skipped.
+        Existing files start at ``v1``; files matching their latest version are skipped.
         """
         if not target_base:
             return
@@ -2141,7 +2144,7 @@ class CompileVersions:
             dirs=[record["to"]],
             base=record.get("versions_head"),
             head=target_base,
-            ctx=task_ctx(account_id, "_system"),
+            ctx=ctx,
         )
         changed = False
         for change in changes:
@@ -2151,7 +2154,7 @@ class CompileVersions:
             if change["change_type"] == "deleted":
                 changed = changed or await self.load(account_id, record["id"], uri) is not None
                 await self._store.delete_version_index(account_id, record["id"], uri)
-            elif await self._changed(account_id, record["id"], uri, target_base):
+            elif await self._changed(ctx, record["id"], uri, target_base):
                 changed = True
                 await self.append(
                     account_id,
@@ -2367,22 +2370,20 @@ class CompileVersions:
         finally:
             await self.record_effects(effects, ctx, metadata_lease=metadata_lease)
 
-    async def _changed(self, account_id: str, target_id: str, uri: str, snapshot: str) -> bool:
-        """Whether ``uri`` in ``snapshot`` differs from its latest version's content.
+    async def _changed(self, ctx: RequestContext, target_id: str, uri: str, snapshot: str) -> bool:
+        """Compare blob IDs at their recorded paths using the caller's identity.
 
-        Compares blob ids at each version's own path, so moved files (whose
-        latest version still points at the old ``snapshot_path``) are handled.
+        Missing history counts as changed; other read errors propagate.
         """
-        index = await self.load(account_id, target_id, uri)
+        index = await self.load(ctx.account_id, target_id, uri)
         if index is None or not index["versions"]:
             return True
         latest = index["versions"][-1]
-        ctx = task_ctx(account_id, "_system")
         try:
             before = await self._fs.show_blob_raw(
                 latest["snapshot_id"], path=latest["snapshot_path"], ctx=ctx
             )
-        except Exception:
+        except (AGFSNotFoundError, NotFoundError):
             return True
         after = await self._fs.show_blob_raw(snapshot, path=uri, ctx=ctx)
         return before["oid"] != after["oid"]
@@ -2574,7 +2575,7 @@ class CompileVersions:
                 snapshot = await self._commit(
                     uris, f"restore {uri} to {restore_version}", ctx, lease_ref=lease_ref
                 )
-            if not snapshot or not await self._changed(ctx.account_id, target_id, uri, snapshot):
+            if not snapshot or not await self._changed(ctx, target_id, uri, snapshot):
                 result.update(
                     uri=uri, version_id=current, meta=dict(_VERSION_META_DEFAULTS), result="noop"
                 )

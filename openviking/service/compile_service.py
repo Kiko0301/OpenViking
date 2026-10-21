@@ -24,6 +24,7 @@ from openviking.service.external_task_service import (
 from openviking.service.fs_service import FSService
 from openviking.service.memory_compile import MemoryCompileRunner
 from openviking.service.task_tracker import SENSITIVE_TASK_KEYS, TaskRecord
+from openviking.session.memory.utils.memory_fields import strip_memory_fields_trailer
 from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
@@ -734,7 +735,7 @@ class CompileService:
     async def restore_file_version(
         self, uri: str, restore_version: str, current_version: str, ctx: RequestContext
     ) -> dict[str, Any]:
-        """Restore ``uri`` from ``restore_version`` if ``current_version`` matches.
+        """Restore a file version, retaining current metadata for memory files.
 
         Return version metadata after refresh; mismatches or active Compile raise ConflictError.
         """
@@ -745,6 +746,8 @@ class CompileService:
                 body: str | bytes = content.decode("utf-8")
             except UnicodeDecodeError:
                 body = content
+            if isinstance(body, str) and classify_uri(uri).is_memory:
+                body = strip_memory_fields_trailer(body)
             await self._fs.write(
                 uri,
                 body,

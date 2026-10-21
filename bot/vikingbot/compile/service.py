@@ -1534,7 +1534,7 @@ class BotCompileService:
         """
         files: set[str] = set()
         for scope in changes.get("scopes") or []:
-            if scope.get("change_type") == "deleted":
+            if scope.get("change_type") == "deleted" or scope.get("change_types") == ["deleted"]:
                 continue
             if scope.get("recursive"):
                 files.update(await self._list_source_files(client, [scope["uri"]]))
