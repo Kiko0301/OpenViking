@@ -454,7 +454,7 @@ class Pipeline:
         }
 
     async def seed(self, batches) -> list[Record]:
-        """Seed source ranges and explicit deletion notices with stable, traceable input IDs."""
+        """Seed current ranges and reconciliation notices with stable, traceable input IDs."""
         result = []
         pending = []
         seen = set(self.records)
@@ -507,22 +507,29 @@ class Pipeline:
                     await flush()
         if pending:
             await flush()
-        deleted = {
-            scope["uri"]
+        notices = {
+            scope["uri"]: scope
             for scope in (self.changes or {}).get("scopes") or []
-            if scope.get("change_type") == "deleted" and not scope.get("recursive")
+            if scope.get("change_type") in {"deleted", "rescan"}
         }
-        if deleted:
+        if notices:
             manifest = await self.files.get("inputs") or {}
-            for uri in sorted(deleted):
+            for uri, scope in sorted(notices.items()):
                 text = (
-                    "Source deletion notice: this source was deleted. Remove or revise only "
+                    "Source rescan notice: reconcile outputs derived from this directory "
+                    "against the supplied current files under it. Sources absent from that "
+                    "inventory no longer support output content; the directory may still "
+                    "contain unchanged files. Preserve other sources and manual edits. "
+                    "This notice is not a source body or evidence for new facts."
+                    if scope["change_type"] == "rescan"
+                    else "Source deletion notice: this source was deleted. Remove or revise only "
                     "content derived from it; preserve other sources and manual edits. "
                     "This notice is not the deleted source body or evidence for new facts."
                 )
                 metadata = {
                     "uri": uri,
-                    "change_type": "deleted",
+                    "change_type": scope["change_type"],
+                    "recursive": bool(scope.get("recursive")),
                     "hash": content_hash(text),
                     "start_char": 0,
                     "end_char": len(text),

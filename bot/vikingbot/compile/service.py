@@ -1473,15 +1473,22 @@ class BotCompileService:
         *,
         cutoff: datetime | None = None,
         allow_empty: bool = False,
+        allow_missing: bool = False,
     ) -> list[str]:
         """List unique sources, excluding files strictly older than the UTC cutoff.
 
         Unknown file times are retained; directory times never prune descendants.
-        Listing failures propagate. Full reprocessing allows empty roots to reconcile removed inputs.
+        Full reprocessing allows empty roots; rescans also allow removed roots.
+        Other listing failures propagate.
         """
 
         async def inventory(root: str) -> list[dict[str, Any]]:
-            entry = await client.stat(root)
+            try:
+                entry = await client.stat(root)
+            except OpenVikingError as exc:
+                if allow_missing and exc.code == "NOT_FOUND":
+                    return []
+                raise
             if not entry.get("isDir", entry.get("is_dir", False)):
                 return [{**entry, "uri": root}]
             entries = []
@@ -1529,15 +1536,20 @@ class BotCompileService:
     async def _list_changed_files(self, client: VikingClient, changes: dict[str, Any]) -> list[str]:
         """Expand the kernel's change scopes into existing source files to read.
 
-        Deleted files are gone from the source tree; the prompt reports them so
-        the Agent can reconcile candidate outputs instead.
+        Rescans retain surviving files and tolerate empty or removed directories.
+        Pipeline notices carry deletions and rescan boundaries to output reconciliation.
         """
         files: set[str] = set()
         for scope in changes.get("scopes") or []:
-            if scope.get("change_type") == "deleted" or scope.get("change_types") == ["deleted"]:
+            if scope.get("change_type") == "deleted":
                 continue
             if scope.get("recursive"):
-                files.update(await self._list_source_files(client, [scope["uri"]]))
+                rescan = scope.get("change_type") == "rescan"
+                files.update(
+                    await self._list_source_files(
+                        client, [scope["uri"]], allow_empty=rescan, allow_missing=rescan
+                    )
+                )
             else:
                 files.add(scope["uri"])
         return sorted(files)
