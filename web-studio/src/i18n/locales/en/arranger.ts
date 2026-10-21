@@ -12,7 +12,7 @@ const arranger = {
       'Choose an MCP tool and preset known arguments so agents can fetch current data when reading the node.',
     liveTitle: 'Live context',
     pathHint:
-      'For example, viking://resources/arrange. The path is preserved in the URL.',
+      'For example, viking://resources/arranger. The path is preserved in the URL.',
     pathTitle: 'Choose a directory to arrange',
     staticDescription:
       'Organize directories, Markdown, and existing resources, then save changes to OpenViking manually.',

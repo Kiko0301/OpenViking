@@ -11,7 +11,7 @@ const arranger = {
     liveDescription:
       '选择 MCP 工具并预置确定参数，Agent 读取节点时按需获取最新数据。',
     liveTitle: '实时上下文',
-    pathHint: '例如 viking://resources/arrange，路径会保留在 URL 中。',
+    pathHint: '例如 viking://resources/arranger，路径会保留在 URL 中。',
     pathTitle: '选择要编排的目录',
     staticDescription:
       '直接组织目录、Markdown 和已有资源，确认后手动保存到 OpenViking。',

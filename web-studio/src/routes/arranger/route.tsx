@@ -164,7 +164,7 @@ function ArrangerWorkbench() {
   const search = Route.useSearch()
   const queryClient = useQueryClient()
   const [pathDraft, setPathDraft] = useState(
-    search.uri || 'viking://resources/arrange',
+    search.uri || 'viking://resources/arranger',
   )
   const rootUri = useMemo(() => {
     try {
