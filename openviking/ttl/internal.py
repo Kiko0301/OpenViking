@@ -82,7 +82,8 @@ async def initial(
         raise InvalidArgumentError("resource_id and account_id are required")
     await _check_account_exists(request, body.account_id)
     # Adapter verifies target, current policy, roots and persisted state before
-    # accepting. No retry here: replaying reset after a lost response is unsafe.
+    # accepting. Token deduplication belongs to the adapter; an untagged manual
+    # reset still requires confirmation before retry after a lost response.
     await request.app.state.ttl_adapter.register_initial_backfill(body)
     logger.info(
         "TTL initial registered request_id=%s scope=%s/%s event=%s",

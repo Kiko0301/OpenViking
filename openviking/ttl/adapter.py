@@ -25,8 +25,8 @@ class TTLBackfillRequest:
     """Fixed initial scan: reset=False resumes the saved scope/checkpoint.
 
     reset=True stops the scan, clears done, replaces roots/checkpoint and
-    registers pending; indexes survive. After a lost response, inspect state
-    and request-id logs before retrying. Confirmed resets resume with False.
+    registers pending; indexes survive. Untagged resets require state/log
+    confirmation after a lost response. Tagged resets are adapter-deduplicated.
     """
 
     resource_id: str
@@ -35,6 +35,9 @@ class TTLBackfillRequest:
     #: True for explicit internal repair, (re)opening or widening scope; the adapter
     #: must clear ``done`` / reset the checkpoint before re-running initial.
     reset: bool = False
+    #: Optional commercial reset intents (scope -> token). The adapter consumes
+    #: matching tokens atomically with reset; replay must not reset twice.
+    reset_intents: Optional[dict[str, str]] = None
 
 
 @dataclass(frozen=True)

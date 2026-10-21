@@ -4032,14 +4032,21 @@ async def test_ttl_internal_bridge_auth_reset_and_configuration(
     denied = await lightweight_admin_client.post("/api/v1/admin/ttl/initial", json=body)
     assert denied.status_code == 401
     adapter.register_initial_backfill.assert_not_called()
-    for reset in (True, False):
+    for reset, intents in (
+        (True, None),
+        (False, None),
+        (True, {"viking://user/u/sessions": "saved-token"}),
+    ):
         body["reset"] = reset
+        body["reset_intents"] = intents
         response = await lightweight_admin_client.post(
             "/api/v1/admin/ttl/initial", json=body, headers=root_headers()
         )
         assert response.status_code == 200, response.text
         adapter.register_initial_backfill.assert_awaited_with(
-            TTLBackfillRequest("resource", account_id, ("viking://user/u/sessions",), reset)
+            TTLBackfillRequest(
+                "resource", account_id, ("viking://user/u/sessions",), reset, intents
+            )
         )
     response = await lightweight_admin_client.get(
         "/api/v1/admin/ttl/configuration", params={"account_id": account_id}, headers=root_headers()
