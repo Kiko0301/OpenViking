@@ -6,7 +6,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -338,7 +338,9 @@ async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
         async def apply_agent_evolution_config(self):
             pass
 
-    manager = object()
+    manager = SimpleNamespace(resolve_identity=Mock(), get_user_group_ids=Mock())
+    ttl_init = AsyncMock()
+    monkeypatch.setattr("openviking.server.app._initialize_ttl_adapter", ttl_init)
     setup = AsyncMock(return_value=None)
     monkeypatch.setattr("openviking.service.deletion.setup_deletion", setup)
 
@@ -349,6 +351,7 @@ async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
 
     app = SimpleNamespace(state=SimpleNamespace(api_key_manager=None))
     service = MockService()
+    service.compile_scheduler = SimpleNamespace(set_identity_resolver=Mock())
     config = ServerConfig(root_api_key="root-key-for-test")
 
     await _initialize_runtime_state(app, service, config)
@@ -356,3 +359,7 @@ async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
     assert service._initialized is True
     assert app.state.api_key_manager is manager
     assert setup.await_args.kwargs["manager"] is manager
+    ttl_init.assert_awaited_once_with(app, service, config)
+    service.compile_scheduler.set_identity_resolver.assert_called_once_with(
+        manager.resolve_identity, manager.get_user_group_ids
+    )
