@@ -20,6 +20,10 @@ from openviking.core.namespace import (
     relative_uri_path,
     uri_parts,
 )
+from openviking.core.namespace_policy import (
+    NamespaceProcessingMode,
+    namespace_policy_for_uri,
+)
 from openviking.privacy.sanitizer import PrivacySanitizer
 from openviking.resource.processing_mode import (
     DEFAULT_PROCESSING_MODE,
@@ -27,10 +31,11 @@ from openviking.resource.processing_mode import (
     normalize_processing_mode,
 )
 from openviking.resource.watch_storage import is_watch_task_control_uri
-from openviking.server.identity import RequestContext
+from openviking.server.identity import RequestContext, Role
 from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import get_enqueued_work_ids, get_task_context
+from openviking.session.memory.account_templates import normalize_account_memory_template_write
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.resource_refs import (
@@ -316,7 +321,20 @@ class ContentWriteCoordinator:
         )
         self._ensure_content_write_policy(normalized_uri)
         await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
+        namespace_policy = namespace_policy_for_uri(normalized_uri)
+        if (
+            namespace_policy.processing_mode is NamespaceProcessingMode.FILE_ONLY
+            and is_abstract_overview_uri(normalized_uri)
+        ):
+            raise InvalidArgumentError(
+                f"semantic sidecars are not supported for namespace: {normalized_uri}"
+            )
+        if tags is not None and not namespace_policy.supports_tags:
+            raise InvalidArgumentError(f"tags are not supported for namespace: {normalized_uri}")
+        if acl is not None and not namespace_policy.supports_acl:
+            raise InvalidArgumentError(f"ACL is not supported for namespace: {normalized_uri}")
         content = await self._sanitize_text(content, uri=normalized_uri, ctx=ctx)
+        content = normalize_account_memory_template_write(normalized_uri, content, mode)
         ingest_options = IngestOptions.from_search_tags(tags, mode=tag_mode)
         if acl is not None:
             ingest_options = replace(
@@ -333,6 +351,18 @@ class ContentWriteCoordinator:
             mode = "replace"
 
         context_type = context_type_for_uri(normalized_uri)
+        if namespace_policy.processing_mode is NamespaceProcessingMode.FILE_ONLY:
+            parent = VikingURI(normalized_uri).parent
+            root_uri = parent.uri if parent is not None else normalized_uri
+            return await self._write_file_only(
+                uri=normalized_uri,
+                root_uri=root_uri,
+                content=content,
+                mode=mode,
+                response_mode=response_mode,
+                context_type=context_type,
+                ctx=ctx,
+            )
         root_uri = await self._resolve_root_uri(
             normalized_uri,
             ctx=ctx,
@@ -442,6 +472,20 @@ class ContentWriteCoordinator:
             normalized_root, operations, ctx=ctx
         )
         await self._sanitize_batch_operations(normalized_operations, ctx=ctx)
+        for operation in normalized_operations:
+            operation["content"] = normalize_account_memory_template_write(
+                operation["uri"], operation["content"], operation["mode"]
+            )
+        root_policy = namespace_policy_for_uri(normalized_root)
+        if any(
+            namespace_policy_for_uri(operation["uri"]).processing_mode
+            is not root_policy.processing_mode
+            for operation in normalized_operations
+        ):
+            raise InvalidArgumentError(
+                "batch-write cannot mix FILE_ONLY and INDEXED namespace targets"
+            )
+        file_only = root_policy.processing_mode is NamespaceProcessingMode.FILE_ONLY
 
         target_paths = [
             self._viking_fs._uri_to_path(operation["uri"], ctx=ctx)
@@ -515,23 +559,24 @@ class ContentWriteCoordinator:
                     continue
                 pending.append((operation, exists, write_mode))
 
-            prepared_resources = await self._prepare_batch_resource_plans(
-                pending=pending,
-                ctx=ctx,
-                lease=lease,
-                processing_mode=processing_mode,
-            )
-            file_abstracts = await self._load_file_abstracts(
-                [
-                    operation["uri"]
-                    for operation, existed, _ in pending
-                    if existed
-                    and context_type_for_uri(operation["uri"]) in {"resource", "skill"}
-                    and not is_abstract_overview_uri(operation["uri"])
-                    and operation["uri"] not in prepared_resources
-                ],
-                ctx=ctx,
-            )
+            if not file_only:
+                prepared_resources = await self._prepare_batch_resource_plans(
+                    pending=pending,
+                    ctx=ctx,
+                    lease=lease,
+                    processing_mode=processing_mode,
+                )
+                file_abstracts = await self._load_file_abstracts(
+                    [
+                        operation["uri"]
+                        for operation, existed, _ in pending
+                        if existed
+                        and context_type_for_uri(operation["uri"]) in {"resource", "skill"}
+                        and not is_abstract_overview_uri(operation["uri"])
+                        and operation["uri"] not in prepared_resources
+                    ],
+                    ctx=ctx,
+                )
 
             for operation, existed, write_mode in pending:
                 uri = operation["uri"]
@@ -555,10 +600,11 @@ class ContentWriteCoordinator:
                             lease_ref=lease,
                             is_new_file=not existed,
                         )
-                    if context_type_for_uri(uri) in {
-                        "resource",
-                        "skill",
-                    } and not is_abstract_overview_uri(uri):
+                    if (
+                        not file_only
+                        and context_type_for_uri(uri) in {"resource", "skill"}
+                        and not is_abstract_overview_uri(uri)
+                    ):
                         file_md5s[uri] = content_md5(final_content)
                     options = operation["ingest_options"]
                     if options.acl_update:
@@ -578,11 +624,11 @@ class ContentWriteCoordinator:
                             # deterministic operation order matches sequential
                             # write semantics: the last operation's options win.
                             sidecar_directories[parent.uri] = options
-                    elif prepared is None:
+                    elif not file_only and prepared is None:
                         refresh_kinds[uri] = "modified"
                 else:
                     created.append(uri)
-                    if prepared is None:
+                    if not file_only and prepared is None:
                         refresh_kinds[uri] = "added"
         except BaseException:
             await self._viking_fs._async_agfs.pathlock_release(lease)
@@ -732,6 +778,9 @@ class ContentWriteCoordinator:
             semantic_status, vector_status = refresh_outcome.statuses(wait=wait and wait_for_queues)
             result["semantic_status"] = semantic_status
             result["vector_status"] = vector_status
+        elif file_only:
+            result["semantic_status"] = "skipped"
+            result["vector_status"] = "skipped"
         return result
 
     def _validate_uri_path(self, uri: str, *, field_name: str) -> str:
@@ -743,7 +792,15 @@ class ContentWriteCoordinator:
     async def _validate_batch_root(self, root_uri: str, *, ctx: RequestContext) -> None:
         classification = classify_uri(root_uri)
         parts = uri_parts(root_uri)
-        if classification.context_type not in {"resource", "memory"}:
+        is_root_system_skill_namespace = (
+            ctx.role == Role.ROOT
+            and classification.scope == "system"
+            and classification.is_skill_namespace
+        )
+        if (
+            classification.context_type not in {"resource", "memory"}
+            and not is_root_system_skill_namespace
+        ):
             raise InvalidArgumentError("batch-write root must be a resource or memory directory")
         if classification.context_type == "memory":
             if (
@@ -753,9 +810,12 @@ class ContentWriteCoordinator:
                 raise InvalidArgumentError(
                     "batch-write root must be inside a memory type directory"
                 )
-        elif parts == ["resources"] or (
-            classification.content_index is not None
-            and len(parts) <= classification.content_index + 1
+        elif classification.context_type == "resource" and (
+            parts == ["resources"]
+            or (
+                classification.content_index is not None
+                and len(parts) <= classification.content_index + 1
+            )
         ):
             raise InvalidArgumentError("batch-write root must be inside a resource directory")
         await self._viking_fs._ensure_access(root_uri, ctx, action=AclAction.WRITE)
@@ -793,6 +853,14 @@ class ContentWriteCoordinator:
                 )
             self._ensure_content_write_policy(uri)
             await self._viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
+            namespace_policy = namespace_policy_for_uri(uri)
+            if (
+                namespace_policy.processing_mode is NamespaceProcessingMode.FILE_ONLY
+                and is_abstract_overview_uri(uri)
+            ):
+                raise InvalidArgumentError(
+                    f"semantic sidecars are not supported for namespace: {uri}"
+                )
 
             has_content = "content" in raw
             has_content_base64 = "content_base64" in raw
@@ -845,10 +913,14 @@ class ContentWriteCoordinator:
                 not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags)
             ):
                 raise InvalidArgumentError(f"batch-write tags must be a string list: {uri}")
+            if tags is not None and not namespace_policy.supports_tags:
+                raise InvalidArgumentError(f"tags are not supported for namespace: {uri}")
             tag_mode = raw.get("tag_mode", "replace")
             self._validate_tag_mode(tag_mode)
             ingest_options = IngestOptions.from_search_tags(tags, mode=tag_mode)
             if (acl := raw.get("acl")) is not None:
+                if not namespace_policy.supports_acl:
+                    raise InvalidArgumentError(f"ACL is not supported for namespace: {uri}")
                 ingest_options = replace(
                     ingest_options,
                     acl_update=await self._viking_fs.prepare_acl_update(uri, acl, ctx),
@@ -1120,6 +1192,8 @@ class ContentWriteCoordinator:
         normalized_tags = (
             [] if requested_mode == "clear" else normalize_search_tags(tags, discard_invalid=True)
         )
+        if not namespace_policy_for_uri(normalized_uri).supports_tags:
+            raise InvalidArgumentError(f"tags are not supported for namespace: {normalized_uri}")
         await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
         stat = await self._safe_stat(normalized_uri, ctx=ctx)
         context_type = context_type_for_uri(normalized_uri)
@@ -1894,6 +1968,48 @@ class ContentWriteCoordinator:
             return isinstance(exc, AGFSNotFoundError)
         except ImportError:
             return False
+
+    async def _write_file_only(
+        self,
+        *,
+        uri: str,
+        root_uri: str,
+        content: str,
+        mode: str,
+        response_mode: str,
+        context_type: str,
+        ctx: RequestContext,
+    ) -> Dict[str, Any]:
+        lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
+        try:
+            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
+        except LockAcquisitionError as exc:
+            raise ResourceBusyError(
+                f"resource is busy and cannot be written now: {uri}",
+                uri=uri,
+            ) from exc
+        try:
+            target_state = await self._classify_locked_write_target(uri, ctx=ctx)
+            final_bytes = await self._write_in_place(
+                uri,
+                content,
+                mode=mode,
+                ctx=ctx,
+                lease_ref=lease,
+                is_new_file=target_state.is_new_file,
+            )
+            return self._build_write_result(
+                uri=uri,
+                root_uri=root_uri,
+                context_type=context_type,
+                mode=response_mode,
+                written_bytes=len(final_bytes),
+                queue_status=None,
+                semantic_status="skipped",
+                vector_status="skipped",
+            )
+        finally:
+            await self._viking_fs._async_agfs.pathlock_release(lease)
 
     async def _safe_stat(
         self, uri: str, *, ctx: RequestContext, allow_not_found: bool = False
