@@ -2,14 +2,14 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import fakeredis.aioredis
 import pytest
 import pytest_asyncio
 
 from openviking.ttl.adapter import TTLBackfillRequest, TTLRecycleRequest
-from openviking.ttl.runtime import DirectoryTTL
+from openviking.ttl.runtime import DirectoryTTL, next_check_ms
 from openviking_cli.utils.config.ttl_config import TTLConfig
 
 
@@ -40,8 +40,15 @@ def engine(monkeypatch, caplog):
     return e
 
 
+@pytest.fixture
+def scheduler(engine):
+    scheduler = SimpleNamespace(register_handler=Mock(), report=AsyncMock())
+    engine.install_expiry(scheduler)
+    return scheduler
+
+
 @pytest.mark.asyncio
-async def test_config_reset_intent_precedes_save_and_disable_skips_redis(engine):
+async def test_config_reset_intent_precedes_save_and_disable_skips_redis(engine, scheduler):
     e = engine
     e.pair = (TTLConfig(sessions="disabled"), None)
     e.manager = SimpleNamespace(patch_account=AsyncMock())
@@ -49,14 +56,20 @@ async def test_config_reset_intent_precedes_save_and_disable_skips_redis(engine)
     async def save(*args):
         state = await e.read_initial("a")
         assert state["reset_required"]["viking://user/_ttl_/sessions"]
+        scheduler.report.assert_awaited_once()
 
     e.manager.patch_account.side_effect = save
+    from openviking_cli.exceptions import UnavailableError
+
+    scheduler.report.side_effect = ConnectionError("scheduler unavailable")
+    with pytest.raises(UnavailableError):
+        await e.patch_configuration({"ttl": {"sessions": 7}}, "a")
+    e.manager.patch_account.assert_not_called()
+    scheduler.report.reset_mock(side_effect=True)
     await e.patch_configuration({"ttl": {"sessions": 7}}, "a")
     redis = e.redis
     e.client = AsyncMock(side_effect=ConnectionError("Redis unavailable"))
     e.manager.patch_account.reset_mock()
-    from openviking_cli.exceptions import UnavailableError
-
     with pytest.raises(UnavailableError):
         await e.patch_configuration({"ttl": {"sessions": 7}}, "a")
     e.manager.patch_account.assert_not_called()
@@ -64,6 +77,90 @@ async def test_config_reset_intent_precedes_save_and_disable_skips_redis(engine)
     await e.patch_configuration({"ttl": {"sessions": "disabled"}}, "a")
     e.manager.patch_account.assert_awaited_once()
     assert await redis.hlen(e.prefix("a") + "backfill:reset_required") > 0
+    scheduler.report.assert_awaited_once()
+
+
+def test_hourly_window_is_stable_and_skips_missed_rounds():
+    now = int(datetime(2026, 10, 20, 12, 34, 56, tzinfo=timezone.utc).timestamp() * 1000)
+    first = next_check_ms("ov-one", now)
+    assert now < first <= now + 3_600_000
+    assert next_check_ms("ov-one", first) == first + 3_600_000
+    assert next_check_ms("ov-one", now) == first
+    assert next_check_ms("ov-two", now) != first
+
+
+@pytest.mark.asyncio
+async def test_incremental_keeps_buffer_until_schedule_is_durable(engine, scheduler):
+    e = engine
+    uri = "viking://user/u/sessions/s"
+    await e.on_post_write(uri + "/messages.jsonl", e.context("a"), 1000)
+    scheduler.report.side_effect = ConnectionError("scheduler unavailable")
+    with pytest.raises(ConnectionError):
+        await e._retry_writes()
+    assert e._retry == {("a", "sessions", uri): 1000}
+    scheduler.report.side_effect = None
+    await e._retry_writes()
+    await e.on_post_write(uri + "/messages.jsonl", e.context("a"), 2000)
+    await e._retry_writes()
+    assert not e._retry and scheduler.report.await_count == 2
+    assert await e.redis.zscore(e.prefix("a") + "sessions", uri) == 2000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("done", [False, True])
+async def test_expiry_restart_resumes_checkpoint_without_full_scan(
+    engine, scheduler, monkeypatch, done
+):
+    from openviking.scheduling.expiry.api import CallbackRequest, CallbackStatus
+
+    e = engine
+    root = "viking://user/u/sessions"
+    prefix = e.prefix("a") + "backfill:"
+    # Persisted state from a previous writer. Its in-memory queues are gone.
+    checkpoint = {"root": 0, "stack": [{"uri": root, "last": root + "/old"}]}
+    await e.redis.hset(
+        prefix + "initial",
+        mapping={
+            "roots": json.dumps([root]),
+            "checkpoint": json.dumps(checkpoint),
+        },
+    )
+    if done:
+        await e.redis.set(prefix + "initial:done", "1")
+    else:
+        await e.redis.sadd(prefix + "pending", "initial")
+    e.fs.ls.return_value = [{"uri": root + "/old", "isDir": True}]
+    await e.start()
+    request = CallbackRequest(e._identity("a"))
+    try:
+        scheduler.report.side_effect = ConnectionError("Redis down")
+        with pytest.raises(ConnectionError):
+            await e.handle(request)
+        assert not e._recycle and e._task is None
+        scheduler.report.side_effect = None
+        # An overdue task at restart only persists the next staggered wake-up.
+        result = await e.handle(request)
+        assert result.status is CallbackStatus.COMPLETED and e._task is None
+        e.fs.ls.assert_not_called()
+        e.account_manager.list_accounts.assert_not_called()
+        monkeypatch.setattr(
+            "openviking.ttl.runtime.time.time_ns", lambda: e._recycle_after_ms * 1_000_000
+        )
+        await e.handle(request)
+        async with asyncio.timeout(2):
+            await e._task
+        assert (await e.read_initial("a"))["done"]
+        assert e.fs.ls.await_count == (0 if done else 1)
+        if not done:
+            assert e.fs.ls.call_args.args == (root,)
+        e.fs.stat.assert_not_called()  # The checkpoint excludes the old child.
+        # Disable keeps a cheap durable wake-up, but creates no work or filesystem I/O.
+        e.pair = (None, None)
+        previous = e._task
+        await e.handle(request)
+        assert e._task is previous and not e._recycle
+    finally:
+        await e.aclose()
 
 
 @pytest.mark.asyncio

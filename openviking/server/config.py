@@ -273,6 +273,10 @@ class TTLAdapterConfig(BaseModel):
     enabled: bool = False
     config: Dict[str, object] = Field(default_factory=dict)
 
+    @property
+    def writer_enabled(self) -> bool:
+        return self.enabled and bool(self.config.get("writer", True))
+
 
 class TraceDumpBodyConfig(BaseModel):
     """HTTP body dump configuration.

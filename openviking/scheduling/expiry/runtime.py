@@ -413,8 +413,10 @@ class ExpiryRuntime:
         for task in done:
             await task
 
-    async def stop_roles(self) -> None:
-        self._state.accepting_calls = False
+    async def stop_roles(self, *, keep_reporting: bool = False) -> None:
+        # A producer drain may still need durable reports after callbacks stop.
+        if not keep_reporting:
+            self._state.accepting_calls = False
         self._stop.set()
         tasks = set(self._tasks.values())
         if tasks:

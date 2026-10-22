@@ -179,10 +179,10 @@ async def _initialize_ttl_adapter(
     if adapter is None:
         return
     adapter.bind_runtime(service, app.state.api_key_manager)
+    service.configure_ttl(adapter)
     viking_fs = service.viking_fs
     if viking_fs is not None:
         install_ttl_hook(viking_fs, adapter)
-    await adapter.start()
     if not getattr(app.state, "ttl_routes_registered", False):
         from openviking.ttl.internal import router as ttl_internal_router
 

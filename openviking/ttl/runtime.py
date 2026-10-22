@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Redis-backed directory TTL for the OV writer. No policy or expiry is stored in Redis."""
+"""Redis directory indexes and expiry-driven maintenance for the OV writer."""
 
 from __future__ import annotations
 
@@ -20,6 +20,16 @@ from zoneinfo import ZoneInfo
 
 from openviking.config.ttl import TTLIndexType, classify_ttl_uri, resolve_effective_ttl
 from openviking.core.namespace import uri_parts
+from openviking.scheduling.expiry.api import (
+    TTL_ITEM_TYPE,
+    CallbackRequest,
+    CallbackResult,
+    CallbackStatus,
+    ExpiryRegistration,
+    ExpiryScheduler,
+    HandlerOptions,
+    ItemIdentity,
+)
 from openviking.scheduling.expiry.config import ExpiryRedisConfig
 from openviking.scheduling.expiry.redis_store import create_redis_client
 from openviking.server.error_mapping import is_not_found_error
@@ -114,6 +124,16 @@ def directory(uri: str) -> TTLDirectory | None:
     return kind, root, root + "/" + "/".join(date_parts), date_parts
 
 
+def next_check_ms(resource_id: str, now_ms: int) -> int:
+    """Preserve the Server's FNV-1a32 hourly offset; skip missed windows."""
+    value = 2166136261
+    for byte in resource_id.encode():
+        value = ((value ^ byte) * 16777619) & 0xFFFFFFFF
+    hour = 3_600_000
+    due = now_ms // hour * hour + value % 3600 * 1000
+    return due if due > now_ms else due + hour
+
+
 class DirectoryTTL:
     def __init__(
         self,
@@ -141,6 +161,7 @@ class DirectoryTTL:
         self.retry_limit = retry_limit
         self.redis = None
         self._task = None
+        self._started = False
         self._closed = False
         self._wake = asyncio.Event()
         self._pending = set()
@@ -150,6 +171,11 @@ class DirectoryTTL:
         self._retry = {}
         self.registration_dropped_total = 0
         self._recycle_lock = asyncio.Lock()
+        self._scheduler: ExpiryScheduler | None = None
+        self._scheduled: set[str] = set()
+        self._initial_requests: set[str] = set()
+        self._recycle: set[str] = set()
+        self._recycle_after_ms = 0
 
     def bind_runtime(self, service: OpenVikingService, account_manager: APIKeyManager) -> None:
         self.fs = service.viking_fs
@@ -158,6 +184,50 @@ class DirectoryTTL:
 
     def supports_config(self) -> bool:
         return self.writer
+
+    def install_expiry(self, scheduler: ExpiryScheduler) -> None:
+        self._scheduler = scheduler
+        scheduler.register_handler(
+            TTL_ITEM_TYPE,
+            self,
+            options=HandlerOptions(concurrency=1, max_attempts=None, metadata_enabled=False),
+        )
+
+    @staticmethod
+    def _identity(account: str) -> ItemIdentity:
+        return ItemIdentity(TTL_ITEM_TYPE, account, "_system", "maintenance")
+
+    async def _schedule(self, account: str, *, force: bool = False) -> None:
+        if self._scheduler is None or (account in self._scheduled and not force):
+            return
+        await self._scheduler.report(
+            ExpiryRegistration(
+                self._identity(account),
+                due_at_ms=next_check_ms(self.resource_id, time.time_ns() // 1_000_000),
+                timeout_seconds=3600,
+            )
+        )
+        self._scheduled.add(account)
+
+    async def handle(self, request: CallbackRequest) -> CallbackResult:
+        if self._closed:
+            return CallbackResult(CallbackStatus.RETRY, "stopping")
+        account = request.identity.account_id
+        # Confirm the next durable wake-up before acknowledging this one.
+        # Long-running filesystem work stays outside the short expiry callback.
+        await self._schedule(account, force=True)
+        if time.time_ns() // 1_000_000 >= self._recycle_after_ms and self.enabled(
+            await self.policies(account)
+        ):
+            self._recycle.add(account)
+            self._wake_worker()
+        return CallbackResult(CallbackStatus.COMPLETED, "maintenance_scheduled")
+
+    def _wake_worker(self) -> None:
+        self._wake.set()
+        if self.writer and self._started and not self._closed:
+            if self._task is None or self._task.done():
+                self._task = asyncio.create_task(self._run(), name="ttl-maintenance")
 
     async def patch_configuration(self, settings: dict, account_id: str | None = None) -> None:
         patch = settings["ttl"]
@@ -169,6 +239,7 @@ class DirectoryTTL:
                 return any(may_enable(node) for node in value.values())
             return value != "disabled"
 
+        accounts = []
         if may_enable(patch):
             accounts = (
                 [{"account_id": account_id}]
@@ -182,21 +253,26 @@ class DirectoryTTL:
                 if isinstance(patch, dict):
                     roots.update(patch.get("roots") or {})
                 scopes = [root for root in roots if not resolve_effective_ttl(*pair, root).enabled]
-                if not scopes:
-                    continue
                 try:
-                    redis = await self.client()
-                    pipe = redis.pipeline(transaction=False)
-                    token = uuid4().hex
-                    for scope in scopes:
-                        pipe.hsetnx(self.prefix(account) + "backfill:reset_required", scope, token)
-                    await pipe.execute()
+                    if scopes:
+                        redis = await self.client()
+                        pipe = redis.pipeline(transaction=False)
+                        token = uuid4().hex
+                        for scope in scopes:
+                            pipe.hsetnx(
+                                self.prefix(account) + "backfill:reset_required", scope, token
+                            )
+                        await pipe.execute()
+                    await self._schedule(account)
                 except Exception as exc:
                     raise UnavailableError("TTL reset intent registration unavailable") from exc
         if account_id is None:
             await self.manager.patch_cluster(settings)
         else:
             await self.manager.patch_account(account_id, settings)
+        self._initial_requests.update(account["account_id"] for account in accounts)
+        if accounts:
+            self._wake_worker()
 
     async def read_initial(self, account_id: str) -> dict:
         prefix = self.prefix(account_id) + "backfill:"
@@ -256,11 +332,11 @@ class DirectoryTTL:
             account_id, lambda v: (v.cluster.ttl, v.account.ttl)
         )
         if self.writer and account_id not in self._recovered and self.enabled(pair):
-            # Reuse a hot account's config snapshot. Cold accounts are resumed
-            # by the Server's hourly trigger; startup never enumerates AGFS.
+            # Hot scopes can request initial registration; cold scopes recover
+            # through expiry's durable tasks without startup enumeration.
             self._recovered.add(account_id)
-            self._pending.add(account_id)
-            self._wake.set()
+            self._initial_requests.add(account_id)
+            self._wake_worker()
         return pair
 
     @staticmethod
@@ -300,12 +376,15 @@ class DirectoryTTL:
         return self.redis
 
     async def start(self) -> None:
-        if self.writer and self._task is None:
-            self._closed = False
-            self._task = asyncio.create_task(self._run(), name="ttl-initial")
+        self._closed = False
+        self._started = True
+        self._recycle_after_ms = next_check_ms(self.resource_id, time.time_ns() // 1_000_000)
+        if self._retry or self._initial_requests or self._pending:
+            self._wake_worker()
 
     async def aclose(self) -> None:
         self._closed = True
+        self._started = False
         self._wake.set()
         if self._task:
             await self._task  # Finish in-flight I/O; never cancel a Redis checkpoint write.
@@ -405,7 +484,7 @@ class DirectoryTTL:
         self._retry[key] = max(base, old) if old is not None else base
         # Updates to a failed batch must not defeat the worker's retry backoff.
         if was_empty:
-            self._wake.set()
+            self._wake_worker()
 
     async def _register(self, key, base):
         account, kind, uri = key
@@ -438,6 +517,7 @@ class DirectoryTTL:
                         active,
                         **({"gt": True} if kind == "sessions" else {"nx": True}),
                     )
+                    await self._schedule(account)
                 # Also discard disabled entries; do not remove a concurrent update.
                 for uri, base in entries.items():
                     key = (account, kind, uri)
@@ -462,6 +542,7 @@ class DirectoryTTL:
         pair = await self.policies(account)
         if not self.enabled(pair):
             raise FailedPreconditionError("TTL is disabled")
+        await self._schedule(account)
         state = await self.read_initial(account)
         intents = request.reset_intents or {
             root: token
@@ -539,7 +620,7 @@ class DirectoryTTL:
             account,
             "reset" if reset else "resume",
         )
-        self._wake.set()
+        self._wake_worker()
 
     async def _run(self):
         delay = 1
@@ -547,6 +628,20 @@ class DirectoryTTL:
             self._wake.clear()
             try:
                 await self._retry_writes()
+                for account in self._initial_requests | self._recycle:
+                    if self._closed:
+                        break
+                    if not self.enabled(await self.policies(account)):
+                        # Keep the durable wake-up across disable/re-enable races.
+                        self._recovered.discard(account)
+                        self._initial_requests.discard(account)
+                        self._pending.discard(account)
+                        self._recycle.discard(account)
+                        continue
+                    await self.register_initial_backfill(
+                        TTLBackfillRequest(self.resource_id, account)
+                    )
+                    self._initial_requests.discard(account)
                 for account in list(self._pending):
                     if self._closed:
                         break
@@ -555,12 +650,25 @@ class DirectoryTTL:
                         continue
                     async with self._locks.setdefault(account, asyncio.Lock()):
                         await self._scan(account)
+                for account in list(self._recycle):
+                    if self._closed:
+                        break
+                    result = await self.recycle_due(TTLRecycleRequest(self.resource_id, account))
+                    logger.info(
+                        "TTL recycle resource=%s account=%s result=%s",
+                        self.resource_id,
+                        account,
+                        result,
+                    )
+                    self._recycle.discard(account)
                 delay = 1
             except Exception:
                 logger.exception("TTL worker retry delay=%s", delay)
                 delay = min(delay * 2, 60)
             else:
-                if self._retry:
+                if not (self._retry or self._initial_requests or self._pending or self._recycle):
+                    return
+                if self._retry or self._initial_requests:
                     await asyncio.sleep(0)
                     continue
             try:
@@ -609,7 +717,7 @@ class DirectoryTTL:
                 if not self.enabled(pair):
                     return
                 # A disabled root does not block other enabled roots in the account.
-                # Reopening this root requires Server's initial reset.
+                # Reopening this root requires the persisted initial reset.
                 checkpoint["root"] += 1
                 checkpoint["stack"] = []
                 listings.clear()
@@ -793,6 +901,9 @@ class DirectoryTTL:
                             logger.exception("TTL recycle failed scope=%s uri=%s", account, uri)
                         await asyncio.sleep(self.delete_interval)
                     offset += len(candidates) - removed
+                    # Recycling shares the serial worker with registrations.
+                    # Flush between pages so a large backlog cannot fill the buffer.
+                    await self._retry_writes()
         return TTLRecycleResult(**counts)
 
     async def _delete(self, account, uri, score, ctx):

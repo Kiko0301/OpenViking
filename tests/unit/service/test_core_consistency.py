@@ -148,7 +148,15 @@ async def test_close_stops_queue_manager_before_ragfs_binding(monkeypatch, ttl_s
     service._resource_service = ResourceService()
     service._config = SimpleNamespace(vlm=VLMConfig())
     service._compile_scheduler = None
-    service._expiry_runtime = None
+    service._ttl_adapter = adapter
+    service._expiry_runtime = (
+        SimpleNamespace(
+            stop_roles=AsyncMock(side_effect=lambda **_: events.append("expiry_roles")),
+            close=AsyncMock(side_effect=lambda: events.append("expiry_storage")),
+        )
+        if adapter
+        else None
+    )
     service._session_service = SimpleNamespace(set_session_expiry_adapter=lambda _: None)
     service._runtime_config_manager = None
     service._watch_scheduler = None
@@ -173,7 +181,7 @@ async def test_close_stops_queue_manager_before_ragfs_binding(monkeypatch, ttl_s
         with pytest.raises(RuntimeError, match="TTL consumer did not stop"):
             await service.close()
         assert wiring.get_ttl_adapter() is adapter
-        assert events == ["resource_tasks", "queue_manager", "ttl"]
+        assert events == ["resource_tasks", "expiry_roles", "queue_manager", "ttl"]
         return
 
     await service.close()
@@ -182,4 +190,6 @@ async def test_close_stops_queue_manager_before_ragfs_binding(monkeypatch, ttl_s
     assert wiring.get_ttl_adapter() is None
     if ttl_shutdown == "success":
         assert events.index("queue_manager") < events.index("ttl") < events.index("ragfs_binding")
+        assert events.index("expiry_roles") < events.index("queue_manager")
+        assert events.index("ttl") < events.index("expiry_storage") < events.index("ragfs_binding")
     assert events[-1] == "data_dir_lock"

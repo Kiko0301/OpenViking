@@ -17,6 +17,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from openviking.scheduling.expiry.api import ExpiryScheduler
     from openviking.server.identity import RequestContext
 
 
@@ -42,7 +43,7 @@ class TTLBackfillRequest:
 
 @dataclass(frozen=True)
 class TTLRecycleRequest:
-    """Server-internal hourly request to recycle one scope's due directories.
+    """Writer's hourly request to recycle one scope's due directories.
 
     Normal triggers supply identity only. The writer resolves the conservative
     candidate cutoff, initial state and per-directory policy. An explicit cutoff
@@ -58,7 +59,7 @@ class TTLRecycleRequest:
 
 @dataclass(frozen=True)
 class TTLRecycleResult:
-    """Outcome of a single recycle sweep, for Server-side logging/metrics."""
+    """Outcome of a single recycle sweep, for writer-side logging/metrics."""
 
     scanned: int = 0
     deleted: int = 0
@@ -72,6 +73,9 @@ class TTLAdapter(Protocol):
 
     def bind_runtime(self, service: Any, account_manager: Any) -> None:
         """Reuse the service's storage and published configuration lifecycle."""
+
+    def install_expiry(self, scheduler: "ExpiryScheduler") -> None:
+        """Register maintenance on the existing Redis scheduler before roles start."""
 
     def write_guard(
         self, uri: str, ctx: Any, lease_ref: Any = None, *, require_exists: bool = False

@@ -141,6 +141,9 @@ class _FakeService:
         self.sessions = self
         self.runtime_config_manager = manager_over_source(MemoryConfigSource())
 
+    def configure_ttl(self, adapter):
+        self.ttl_adapter = adapter
+
     async def get_agent_evolution_enabled(self, account_id):
         del account_id
         return True

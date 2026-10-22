@@ -451,6 +451,7 @@ async def test_http_configuration_initial_and_lifecycle(tmp_path, monkeypatch):
     await _initialize_ttl_adapter(app, service, config)
     e = app.state.ttl_adapter
     assert e.redis is None  # Start does no Redis or account enumeration.
+    await e.start()  # The real service starts TTL after its expiry runtime is ready.
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
@@ -509,6 +510,117 @@ async def test_http_configuration_initial_and_lifecycle(tmp_path, monkeypatch):
         )
     await e.aclose()
     assert e._task is None and e.redis is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_env", ["TTL_TEST_REDIS", "TTL_TEST_CLUSTER"])
+async def test_real_expiry_resumes_initial_and_recycles_without_server(tmp_path, endpoint_env):
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock
+    from uuid import uuid4
+
+    from openviking.scheduling.expiry.config import ExpiryConfig
+    from openviking.scheduling.expiry.keys import (
+        ExpiryKeys,
+        encode_component,
+        encode_item_id,
+        shard_for,
+    )
+    from openviking.scheduling.expiry.runtime import ExpiryRuntime, ExpiryRuntimeRoles
+    from openviking_cli.exceptions import NotFoundError
+
+    endpoint = os.environ.get(endpoint_env)
+    if not endpoint:
+        pytest.skip("requires an isolated local Redis")
+    rid = "ttl-expiry-" + uuid4().hex
+    config = ExpiryConfig(
+        service_name=rid,
+        shard_count=2,
+        callback_poll_seconds=0.01,
+        processing_timeout_seconds=1,
+        publisher_separate_process=False,
+        redis={
+            "mode": "cluster" if endpoint_env.endswith("CLUSTER") else "standalone",
+            "endpoints": [endpoint],
+        },
+    )
+    fs = VikingFS(
+        agfs=create_agfs_client(
+            RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path), backend="local"))
+        )
+    )
+    root = "viking://user/u/memories/events"
+    unit = root + "/2020/01/01"
+    runtimes, engines = [], []
+
+    async def replacement(*, consume):
+        e = DirectoryTTL(resource_id=rid, redis=config.redis.model_dump(), delete_interval=0)
+        e.fs = fs
+        e.policies = AsyncMock(return_value=(TTLConfig(user_events=1), None))
+        runtime = ExpiryRuntime(
+            config, roles=ExpiryRuntimeRoles(report=True, publish=consume, consume=consume)
+        )
+        engines.append(e)
+        runtimes.append(runtime)
+        e.install_expiry(runtime.scheduler)
+        await runtime.start_storage()
+        await runtime.start_roles()
+        return e
+
+    try:
+        first = await replacement(consume=False)
+        await fs.write_file(unit + "/history.md", "event", ctx=first.context("a"))
+        await first.register_initial_backfill(TTLBackfillRequest(rid, "a", (root,)))
+        assert (await first.read_initial("a"))["pending"]
+        raw = await first.client()
+        identity = encode_item_id(first._identity("a"))
+        keys = ExpiryKeys(encode_component(rid))
+        source = keys.source(shard_for(identity, config.shard_count))
+        assert await raw.zscore(source, identity) is not None
+        # Make the persisted task overdue; the publisher/registry/consumer remain real.
+        await raw.zadd(source, {identity: time.time_ns() // 1_000_000 - 60000})
+        await first.aclose()
+        await runtimes[0].close()
+
+        resumed = await replacement(consume=True)
+        report = resumed._scheduler.report
+        attempts = 0
+
+        async def flaky_report(task):
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 4:
+                raise ConnectionError("renewal unavailable")
+            return await report(task)
+
+        resumed._scheduler.report = flaky_report
+        await resumed.start()
+        resumed._recycle_after_ms = 0  # Stable hourly gating is covered by the unit test.
+        raw = await resumed.client()
+        async with asyncio.timeout(10):
+            while not (await resumed.read_initial("a"))["done"]:
+                await asyncio.sleep(0.01)
+            while not resumed._task.done():
+                await asyncio.sleep(0.01)
+        with pytest.raises(NotFoundError):
+            await fs.stat(unit, ctx=resumed.context("a"))
+        assert await raw.zcard(resumed.prefix("a") + "user_events") == 0
+        assert attempts >= 5  # Recurrence survives more than the default three failures.
+        await runtimes[-1].stop_roles(keep_reporting=True)
+        await resumed._schedule("a", force=True)  # Draining writers can still register.
+        assert await raw.zscore(source, identity) > time.time_ns() // 1_000_000
+    finally:
+        for e in engines:
+            await e.aclose()
+        for runtime in runtimes:
+            await runtime.close()
+        if engines:
+            raw = await engines[-1].client()
+            for pattern in (f"expiry:*{encode_component(rid)}*", engines[-1].prefix("a") + "*"):
+                async for key in raw.scan_iter(match=pattern):
+                    await raw.delete(key)
+            await engines[-1].aclose()
 
 
 @pytest.mark.asyncio
