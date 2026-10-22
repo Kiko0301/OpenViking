@@ -292,9 +292,9 @@ class CompileStateStore:
     async def list_summaries(
         self, account_id: str, inherited_lease: Any = None
     ) -> List[Dict[str, Any]]:
-        """Summarize target states individually; the list is not a point-in-time snapshot.
+        """Summarize states without locks, relying on atomic whole-file publication.
 
-        Reuse a covering restore lease when supplied. Missing states are skipped;
+        The list is not a point-in-time snapshot. Missing states are skipped;
         other I/O and JSON errors propagate instead of hiding registered targets.
         """
         directory = f"{self.root(account_id)}/target_folders"
@@ -311,9 +311,7 @@ class CompileStateStore:
             ):
                 continue
             path = self._record_path(account_id, target_id)
-            # AGFS writes may truncate in place, so read under the same file lock.
-            async with self.locked(path, inherited_lease):
-                record = await self.read_json(path)
+            record = await self.read_json(path)
             if record is not None:
                 summaries.append(summarize(_normalize_schedule(record)))
         self._target_ids_by_to[account_id] = {
@@ -359,12 +357,9 @@ class CompileStateStore:
             await self.write_json(path, _normalize_schedule(record), lease)
 
     async def register(self, account_id: str, to: str) -> str:
-        """Serialize path lookup and creation/reactivation across instances.
-
-        The coordination path is only a lock key; ordinary state updates take
-        only their state.json lock. Deleted targets retain their identity.
-        """
-        async with self.locked(f"{self.root(account_id)}/register.lock"):
+        """Return the target ID, serializing creation/reactivation per account and target URI."""
+        key = hashlib.sha256(to.encode("utf-8")).hexdigest()
+        async with self.locked(f"{self.root(account_id)}/register-{key}.lock"):
             existing = await self.find_id(account_id, to, include_deleted=True)
             if existing is None:
                 target_id = f"target_{uuid4().hex[:16]}"

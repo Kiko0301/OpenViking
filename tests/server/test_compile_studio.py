@@ -1,6 +1,7 @@
 """Studio task pagination and submission retry contracts."""
 
 import asyncio
+import hashlib
 import json
 import time
 from types import SimpleNamespace
@@ -633,8 +634,17 @@ async def test_disabled_schedule_clears_legacy_state_and_lifecycle_changes(servi
     account = service.user.account_id
     ctx = RequestContext(user=service.user, role=Role.USER)
     target = "viking://resources/scheduled"
+    acquire = AsyncMock(wraps=store._agfs.pathlock_acquire_exact)
+    monkeypatch.setattr(store._agfs, "pathlock_acquire_exact", acquire)
     target_id = await store.register(account, target)
+    key = hashlib.sha256(target.encode("utf-8")).hexdigest()
+    assert acquire.await_args_list[0].args[0] == f"{store.root(account)}/register-{key}.lock"
     path = store._record_path(account, target_id)
+    async with store.edit(account, target_id):
+        with monkeypatch.context() as patch:
+            patch.setattr(acquire, "side_effect", AssertionError("Config reads must not lock"))
+            page = await service.compile.list_configs(ctx, limit=1, cursor=None)
+            assert page["targets"][0]["target_id"] == target_id
     schedule = {"frequency": "daily", "hour": 0, "minute": 0}
     legacy = await store.get(account, target_id)
     legacy["update_schedule"] = schedule
