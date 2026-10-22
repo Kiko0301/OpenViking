@@ -113,8 +113,9 @@ async def test_publish_catalog_forwards_wait_to_batch_write(monkeypatch):
 async def test_url_and_tool_filename_validation(monkeypatch):
     service = MCPService(SimpleNamespace())
 
-    with pytest.raises(InvalidArgumentError):
-        service._validate_url("http://mcp.example.com/api")
+    assert service._validate_url("http://mcp.example.com/api") == "http://mcp.example.com/api"
+    with pytest.raises(InvalidArgumentError, match="HTTP or HTTPS"):
+        service._validate_url("ftp://mcp.example.com/api")
 
     monkeypatch.setattr(
         service,

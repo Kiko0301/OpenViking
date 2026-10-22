@@ -12,7 +12,7 @@ This module registers Streamable HTTP MCP servers, synchronizes and searches the
 
 ## Prerequisites and constraints
 
-- MCP servers must use Streamable HTTP. Remote URLs must use HTTPS; HTTP is allowed only for `localhost`, `127.0.0.1`, and `::1`.
+- MCP servers must use Streamable HTTP, and URLs may use HTTP or HTTPS. HTTP does not encrypt transport; users are responsible for assessing exposure risks for credentials and tool data.
 - Server names may contain only letters, numbers, `_`, and `-`, up to 64 characters. Tool names must be valid OpenViking filenames.
 - HTTP headers submitted at registration are stored within the account scope. APIs return only sorted `header_names`, never header values.
 - Tool definitions live at `viking://agent/tools/<server>/<tool>.json`. Invocation and mount arguments are validated against the tool's `inputSchema`.

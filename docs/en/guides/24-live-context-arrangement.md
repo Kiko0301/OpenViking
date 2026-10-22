@@ -43,7 +43,7 @@ Pre-mount frequent scenarios whose parameters are stable. For infrequent request
 ## Requirements and security boundaries
 
 - Only Streamable HTTP MCP servers are supported.
-- Remote URLs must use HTTPS. HTTP is accepted only for `localhost`, `127.0.0.1`, and `::1`.
+- URLs may use HTTP or HTTPS. HTTP does not encrypt transport; users are responsible for assessing exposure risks for credentials and tool data.
 - An MCP server name may contain only letters, numbers, `_`, and `-`, up to 64 characters.
 - Tool names must be valid OpenViking filenames.
 - Registration connects to the upstream and performs tool discovery. A connection failure or invalid definition does not write registry state.
@@ -375,7 +375,7 @@ Requests use the current OpenViking user's account context. Server registrations
 
 | Symptom | Common cause | Action |
 | --- | --- | --- |
-| Registration or validation fails | Remote HTTP URL, network failure, wrong headers, or a non-Streamable HTTP server | Use HTTPS, verify headers, and retry `ov mcps validate` |
+| Registration or validation fails | Invalid URL, network failure, wrong headers, or a non-Streamable HTTP server | Verify the URL and headers, then retry `ov mcps validate` |
 | `find` returns no result | Catalog not published, indexing incomplete, or query mismatch | Confirm with `ov mcps show`, run `sync`, and wait for indexing if needed |
 | Mount rejects arguments | Arguments do not satisfy the current `inputSchema` | Rebuild them from `show` or `find` output |
 | `read` returns the descriptor | The read is paginated or uses `raw=true` | Use the default complete read |

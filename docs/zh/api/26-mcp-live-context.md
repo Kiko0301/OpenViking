@@ -11,7 +11,7 @@
 
 ## 使用前提与约束
 
-- MCP Server 只支持 Streamable HTTP。远程地址必须使用 HTTPS；只有 `localhost`、`127.0.0.1` 和 `::1` 可以使用 HTTP。
+- MCP Server 只支持 Streamable HTTP，地址可以使用 HTTP 或 HTTPS。HTTP 不提供传输加密，使用方需自行评估凭证和工具数据的暴露风险。
 - Server 名称只能包含字母、数字、`_` 和 `-`，最长 64 个字符。工具名必须能作为 OpenViking 文件名使用。
 - 注册时提交的 HTTP Header 按账号保存，但 API 只返回按字母排序的 `header_names`，不会返回 Header 值。
 - 工具目录位于 `viking://agent/tools/<server>/<tool>.json`。调用和挂载参数会按工具的 `inputSchema` 校验。

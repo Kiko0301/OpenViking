@@ -43,7 +43,7 @@ OpenViking resolves credentials -> calls upstream Tool -> returns native Tool re
 ## 前提和安全边界
 
 - 仅支持 Streamable HTTP MCP Server。
-- 远程地址必须使用 HTTPS；只有 `localhost`、`127.0.0.1` 和 `::1` 可以使用 HTTP。
+- 地址可以使用 HTTP 或 HTTPS。HTTP 不提供传输加密，使用方需自行评估凭证和工具数据的暴露风险。
 - MCP Server 名称只能包含字母、数字、`_` 和 `-`，最长 64 个字符。
 - Tool 名称必须能作为 OpenViking 文件名。
 - 注册时会连接上游并执行 Tool discovery；无法连接或 Tool 定义不合法时不会写入注册信息。
@@ -375,7 +375,7 @@ SDK 和 Studio 使用以下接口：
 
 | 现象 | 常见原因 | 处理 |
 | --- | --- | --- |
-| 注册或验证失败 | 远程 URL 使用 HTTP、网络不可达、Header 错误、不是 Streamable HTTP | 改用 HTTPS，检查 Header，并用 `ov mcps validate` 重试 |
+| 注册或验证失败 | URL 无效、网络不可达、Header 错误、不是 Streamable HTTP | 检查 URL 和 Header，并用 `ov mcps validate` 重试 |
 | `find` 没有结果 | Tool Catalog 未发布、索引尚未完成、查询不匹配 | `ov mcps show` 确认 Tool，执行 `sync`，必要时等待索引完成 |
 | 挂载提示参数不合法 | 参数不符合当前 `inputSchema` | 从 `show` 或 `find` 结果重新生成参数 |
 | `read` 返回描述文件 | 使用了分页读取或 `raw=true` | 使用默认完整读取 |

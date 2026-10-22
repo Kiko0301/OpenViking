@@ -208,14 +208,11 @@ class MCPService:
     @staticmethod
     def _validate_url(url: str) -> str:
         parsed = urlsplit(url)
-        host = (parsed.hostname or "").lower()
         if parsed.username or parsed.password or parsed.fragment:
             raise InvalidArgumentError("MCP URL must not contain credentials or a fragment")
-        if parsed.scheme == "https" and host:
+        if parsed.scheme in {"http", "https"} and parsed.hostname:
             return url
-        if parsed.scheme == "http" and host in {"localhost", "127.0.0.1", "::1"}:
-            return url
-        raise InvalidArgumentError("MCP URL must use HTTPS; HTTP is allowed only for localhost")
+        raise InvalidArgumentError("MCP URL must use HTTP or HTTPS and include a host")
 
     @staticmethod
     def _validate_headers(headers: dict[str, str]) -> dict[str, str]:
