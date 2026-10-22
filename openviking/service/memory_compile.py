@@ -176,7 +176,7 @@ class MemoryCompileRunner:
         ).rstrip("/")
         memory_type = _memory_type_from_target(uri)
         await self._fs.ensure_write_access(uri, ctx)
-        stat = await self._fs.stat(uri, ctx)
+        stat = await self._fs.stat(uri, ctx, skip_count=True)
         if not stat.get("isDir"):
             raise InvalidArgumentError("Memory-mode Compile target must be a directory")
         canonical = str(stat.get("uri") or uri).rstrip("/")

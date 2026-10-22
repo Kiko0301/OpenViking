@@ -958,14 +958,6 @@ class CompileLifecycle:
         record["schedule_configured"] = True
         record["update_schedule"] = schedule
 
-    async def record_created(self, task: Any) -> None:
-        """Claim the first Compile identity and earliest creation time under the target lock."""
-        meta = task.meta["request"].get("compile")
-        if meta is None:
-            return
-        async with self._store.edit(task.account_id, meta["target_id"]) as record:
-            self._record_identity(task, record)
-
     @staticmethod
     def _record_identity(task: Any, record: Dict[str, Any]) -> None:
         """Retain the target's first task identity and earliest known creation time."""
@@ -993,8 +985,8 @@ class CompileLifecycle:
             task.account_id, meta["target_id"], task.task_id, "create"
         ):
             run = await self._store.get_operation(task.account_id, meta["target_id"], task.task_id)
+            self._record_identity(task, locked_record)
             if run is None:
-                self._record_identity(task, locked_record)
                 await self._store.merge_outputs(
                     task.account_id, meta["target_id"], task.task_id, []
                 )
@@ -1484,7 +1476,7 @@ class CompileLifecycle:
                     if any(
                         uri_matches_prefix(path, uri) for path in ordinary_files | protected_dirs
                     ):
-                        stat = await self._fs.stat(uri, ctx=ctx)
+                        stat = await self._fs.stat(uri, ctx=ctx, skip_count=True)
                         if stat.get("isDir"):
                             pending.extend(
                                 entry["uri"]
@@ -1502,7 +1494,7 @@ class CompileLifecycle:
                     changed = changed or is_versioned(uri)
                 for uri in sorted(protected_dirs, key=lambda value: (value.count("/"), value)):
                     if await self._fs.exists(uri, ctx=ctx) and not (
-                        await self._fs.stat(uri, ctx=ctx)
+                        await self._fs.stat(uri, ctx=ctx, skip_count=True)
                     ).get("isDir"):
                         await self._fs.rm(uri, recursive=True, ctx=ctx, lease_ref=lease)
                         deleted.append(self._fs._uri_to_tree_path(uri, ctx=ctx))
@@ -1518,7 +1510,7 @@ class CompileLifecycle:
                         version["snapshot_id"], path=version["snapshot_path"], ctx=ctx
                     )
                     if await self._fs.exists(uri, ctx=ctx):
-                        if (await self._fs.stat(uri, ctx=ctx)).get("isDir"):
+                        if (await self._fs.stat(uri, ctx=ctx, skip_count=True)).get("isDir"):
                             await self._fs.rm(uri, recursive=True, ctx=ctx, lease_ref=lease)
                             deleted.append(self._fs._uri_to_tree_path(uri, ctx=ctx))
                         elif await self._fs.read_file_bytes(uri, ctx=ctx) == content:

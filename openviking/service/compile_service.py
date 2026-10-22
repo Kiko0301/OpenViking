@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -33,6 +34,9 @@ from openviking_cli.exceptions import (
     UnavailableError,
 )
 from openviking_cli.utils.config.open_viking_config import CompileApiConfig
+from openviking_cli.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 _ACTIVE_STATUSES = frozenset({"accepted", "pending", "running", "committing"})
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -319,6 +323,8 @@ class CompileService:
         self._local_endpoint: _CompileEndpoint | None = None
         self._memory_runner: MemoryCompileRunner | None = None
         self._lifecycle: CompileLifecycle | None = None
+        # Keep submission history tasks alive until their storage operations finish.
+        self._history_tasks: set[asyncio.Task[None]] = set()
 
     def configure_lifecycle(self, lifecycle: CompileLifecycle) -> None:
         """Enable target registry, incremental planning and scheduled updates."""
@@ -402,8 +408,7 @@ class CompileService:
                 self.task_type, payload, private_payload, ctx, idempotency_key
             )
             if existing is not None:
-                if self._lifecycle is not None:
-                    await self._lifecycle.record_created(existing)
+                self._schedule_history(existing)
                 return existing
         endpoint = self._endpoint()
         if not endpoint.local and not str(connection.get("api_key") or "").strip():
@@ -415,12 +420,9 @@ class CompileService:
             payload = await self._lifecycle.prepare(
                 submitted, ctx, instruction_set=request._instruction_sent
             )
-        task = await self._create_task(
+        return await self._create_task(
             payload, submitted, private_payload, normalized, connection, ctx, idempotency_key
         )
-        if self._lifecycle is not None:
-            await self._lifecycle.record_created(task)
-        return task
 
     async def create_scheduled(
         self,
@@ -454,7 +456,6 @@ class CompileService:
             connection,
             ctx,
             idempotency_key,
-            locked_record=record,
         )
 
     async def _create_task(
@@ -466,9 +467,8 @@ class CompileService:
         connection: Mapping[str, Any],
         ctx: RequestContext,
         idempotency_key: str | None,
-        *,
-        locked_record: dict[str, Any] | None = None,
     ) -> TaskRecord:
+        """Persist and enqueue the task, then write submission history in the background."""
         task = await self._tasks.create(
             self.task_type,
             resource_id=", ".join(normalized.from_),
@@ -482,9 +482,26 @@ class CompileService:
                 else {}
             ),
         )
-        if self._lifecycle is not None:
-            await self._lifecycle.record_queued(task, locked_record=locked_record)
+        self._schedule_history(task)
         return task
+
+    def _schedule_history(self, task: TaskRecord) -> None:
+        """Write queued history and first-task metadata asynchronously, logging storage failures."""
+        lifecycle = self._lifecycle
+        if lifecycle is None:
+            return
+
+        async def record_history() -> None:
+            try:
+                await lifecycle.record_queued(task)
+            except Exception:
+                logger.exception(
+                    "Failed to record Compile submission history task_id=%s", task.task_id
+                )
+
+        background = asyncio.create_task(record_history())
+        self._history_tasks.add(background)
+        background.add_done_callback(self._history_tasks.discard)
 
     async def on_start(self, task: TaskRecord) -> Any:
         if self._lifecycle is None:
@@ -834,18 +851,18 @@ class CompileService:
     ) -> CompileRequest:
         request = self._normalize_request_uris(request, ctx)
         for uri in request.from_:
-            stat = await self._fs.stat(uri, ctx)
+            stat = await self._fs.stat(uri, ctx, skip_count=True)
             if not stat.get("isDir"):
                 raise InvalidArgumentError(f"Compile source must be a directory: {uri}")
-        skill_stat = await self._fs.stat(request.skill, ctx)
+        skill_stat = await self._fs.stat(request.skill, ctx, skip_count=True)
         if not skill_stat.get("isDir"):
             raise InvalidArgumentError("skill must resolve to a Skill directory or SKILL.md")
-        skill_file = await self._fs.stat(f"{request.skill}/SKILL.md", ctx)
+        skill_file = await self._fs.stat(f"{request.skill}/SKILL.md", ctx, skip_count=True)
         if skill_file.get("isDir"):
             raise InvalidArgumentError("Skill directory must contain a SKILL.md file")
         await self._fs.ensure_write_access(request.to, ctx)
         try:
-            target_stat = await self._fs.stat(request.to, ctx)
+            target_stat = await self._fs.stat(request.to, ctx, skip_count=True)
         except NotFoundError:
             pass
         else:
