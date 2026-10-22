@@ -635,7 +635,8 @@ async def test_disabled_schedule_clears_legacy_state_and_lifecycle_changes(servi
     target = "viking://resources/scheduled"
     acquire = AsyncMock(wraps=store._agfs.pathlock_acquire_exact)
     monkeypatch.setattr(store._agfs, "pathlock_acquire_exact", acquire)
-    target_id = await store.register(account, target)
+    async with store.edit(account, target, create=True) as record:
+        target_id = record["id"]
     path = store._record_path(account, target)
     async with store.edit(account, target):
         with monkeypatch.context() as patch:
@@ -646,7 +647,7 @@ async def test_disabled_schedule_clears_legacy_state_and_lifecycle_changes(servi
             patch.setattr(
                 cold, "list_summaries", AsyncMock(side_effect=AssertionError("Target scan"))
             )
-            assert await cold.register(account, target + "/") == target_id
+            assert (await cold.get_by_to(account, target + "/"))["id"] == target_id
     schedule = {"frequency": "daily", "hour": 0, "minute": 0}
     legacy = await store.get(account, target)
     legacy["update_schedule"] = schedule
@@ -685,7 +686,8 @@ async def test_disabled_schedule_clears_legacy_state_and_lifecycle_changes(servi
     await service.compile.lifecycle.versions.after_remove(target, ctx)
     deleted = await store.get(account, target)
     assert deleted["status"] == "deleted" and deleted["update_schedule"] is None
-    assert await store.register(account, target) == target_id
+    async with store.edit(account, target, create=True) as record:
+        assert record["id"] == target_id
     reused = await store.get(account, target)
     assert reused["status"] == "active" and reused["auto_update"] is False
     assert reused["update_schedule"] is None
@@ -773,7 +775,8 @@ async def test_cursor_cleanup_rechecks_task_updated_after_scan():
 async def test_compile_history_retention_and_retry(service, monkeypatch, failed_dir):
     store = service.compile.lifecycle.store
     account = service.user.account_id
-    target = await store.register(account, "viking://resources/history")
+    async with store.edit(account, "viking://resources/history", create=True) as record:
+        target = record["id"]
     now = time.time()
     for operation_id, status, finished_at in (
         ("expired", "completed", now - 604801),

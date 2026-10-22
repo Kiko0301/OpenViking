@@ -321,7 +321,8 @@ async def test_batch_coalesces_compile_target_updates(service, monkeypatch):
     root = "viking://resources/batch-metadata"
     store = service.compile.lifecycle.store
     await service.viking_fs.write_file(f"{root}/seed.md", "seed", ctx=ctx)
-    await store.register(ctx.account_id, root)
+    async with store.edit(ctx.account_id, root, create=True):
+        pass
     update_time = AsyncMock(wraps=store.mark_content_updated)
     monkeypatch.setattr(store, "mark_content_updated", update_time)
     ops = [{"uri": f"{root}/{i}.md", "content": "changed"} for i in range(100)]

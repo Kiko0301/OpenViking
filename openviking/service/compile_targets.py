@@ -155,7 +155,6 @@ class CompileStore(Protocol):
     scopes; lock tokens are opaque and belong to the selected implementation.
     """
 
-    async def register(self, account_id: str, to: str) -> str: ...
     async def find_id(
         self, account_id: str, to: str, *, include_deleted: bool = False
     ) -> Optional[str]: ...
@@ -163,7 +162,9 @@ class CompileStore(Protocol):
     async def get_by_to(
         self, account_id: str, to: str, *, include_deleted: bool = False
     ) -> Optional[Dict[str, Any]]: ...
-    def edit(self, account_id: str, to: str) -> AsyncContextManager[Dict[str, Any]]: ...
+    def edit(
+        self, account_id: str, to: str, *, create: bool = False
+    ) -> AsyncContextManager[Dict[str, Any]]: ...
     def move_state(
         self, account_id: str, to: str, destination: str
     ) -> AsyncContextManager[Dict[str, Any]]: ...
@@ -282,7 +283,6 @@ class CompileStateStore:
         if inherited_lease is not None:
             yield inherited_lease
             return
-        await self._ensure_parent(path)
         lease = await self._agfs.pathlock_acquire_exact(path, timeout_secs=LOCK_TIMEOUT_SECONDS)
         try:
             yield lease
@@ -336,30 +336,23 @@ class CompileStateStore:
         return record
 
     @asynccontextmanager
-    async def edit(self, account_id: str, to: str) -> AsyncIterator[Dict[str, Any]]:
-        """Yield the record under its own PathLock and save it on clean exit."""
-        path = self._record_path(account_id, to)
-        async with self.locked(path) as lease:
-            record = await self.get(account_id, to)
-            if record is None:
-                raise LookupError(f"Compile target not found: {to}")
-            yield record
-            await self.write_json(path, _normalize_schedule(record), lease)
+    async def edit(
+        self, account_id: str, to: str, *, create: bool = False
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Edit under the target lock and save on clean exit.
 
-    async def register(self, account_id: str, to: str) -> str:
-        """Read active states directly; serialize creation and revival only for this URI."""
+        Missing states raise LookupError unless ``create`` also creates or revives them.
+        Revival preserves the stable identity and deletion boundary.
+        """
         to = to.rstrip("/")
-        current = await self.get_by_to(account_id, to)
-        if current is not None:
-            return current["id"]
         path = self._record_path(account_id, to)
         async with self.locked(path) as lease:
             record = await self.get(account_id, to)
-            if record is not None and record["status"] == "active":
-                return record["id"]
             if record is None:
+                if not create:
+                    raise LookupError(f"Compile target not found: {to}")
                 record = new_record(f"target_{uuid4().hex[:16]}", to)
-            else:
+            elif create and record["status"] != "active":
                 defaults = new_record(record["id"], to)
                 for key in (
                     "status",
@@ -379,8 +372,8 @@ class CompileStateStore:
                 ):
                     record[key] = defaults[key]
                 record["execution_context"]["credential"] = None
-            await self.write_json(path, record, lease)
-            return record["id"]
+            yield _normalize_schedule(record)
+            await self.write_json(path, _normalize_schedule(record), lease)
 
     @asynccontextmanager
     async def move_state(
@@ -896,12 +889,7 @@ class CompileLifecycle:
         """Save submission settings and return their state, including the deletion boundary."""
         to, sources = payload["to"], payload["from"]
         self.validate_layout(to, sources)
-        target_id = await self._store.register(ctx.account_id, to)
-        async with self._store.edit(ctx.account_id, to) as record:
-            if record["id"] != target_id or record["status"] != "active":
-                raise ConflictError(
-                    "Compile target changed during submission", resource="COMPILE_TARGET"
-                )
+        async with self._store.edit(ctx.account_id, to, create=True) as record:
             configures_schedule = "auto_update" in control or "update_schedule" in control
             # Legacy targets can hold disabled schedule settings without a configuration marker.
             has_schedule = (
