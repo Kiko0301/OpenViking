@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Directory TTL (time-to-live) recycling configuration.
 
-TTL is a commercial, public-cloud-only product policy. The kernel only carries
-the declarative, default-off configuration surface so the same runtime config
-manager can publish it at the cluster (库/实例) and account (数据空间) scopes;
-the recycling behavior itself lives in an optional commercial adapter.
+TTL execution is provided by the optional, default-off Redis implementation in
+``openviking.ttl``. The runtime configuration manager publishes policies at the
+cluster (库/实例) and account (数据空间) scopes. No Redis-free backend is provided.
 
 A policy value is either a positive integer number of days or the literal
 ``"disabled"``. An absent node means "inherit"; ``"disabled"`` stops the

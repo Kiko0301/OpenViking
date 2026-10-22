@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Optional commercial TTL contract. OSS provides wiring, never Redis/product behavior."""
+"""Directory TTL contract shared by the runtime, hooks and internal transport."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ class TTLBackfillRequest:
     #: True for explicit internal repair, (re)opening or widening scope; the adapter
     #: must clear ``done`` / reset the checkpoint before re-running initial.
     reset: bool = False
-    #: Optional commercial reset intents (scope -> token). The adapter consumes
+    #: Optional Server reset intents (scope -> token). The adapter consumes
     #: matching tokens atomically with reset; replay must not reset twice.
     reset_intents: Optional[dict[str, str]] = None
 
@@ -69,7 +69,7 @@ class TTLRecycleResult:
 
 @runtime_checkable
 class TTLAdapter(Protocol):
-    """Commercial directory-TTL integration contract (default absent)."""
+    """Directory-TTL integration contract (default absent)."""
 
     def bind_runtime(self, service: Any, account_manager: Any) -> None:
         """Reuse the service's storage and published configuration lifecycle."""
@@ -94,7 +94,7 @@ class TTLAdapter(Protocol):
         """Return True when explicit TTL configuration writes are allowed.
 
         The admin configuration routes keep returning 501 until a loaded
-        adapter reports support, so the open-source edition stays locked.
+        adapter reports support; support depends on configuration, not edition.
         """
 
     async def on_post_write(
@@ -107,8 +107,8 @@ class TTLAdapter(Protocol):
 
         Runs after the storage write is committed and must never turn a
         successful write into a failure; the kernel already swallows and logs
-        exceptions raised here. Commercial implementations only merge into a
-        bounded local buffer here; Redis registration belongs to their worker.
+        exceptions raised here. The implementation only merges into a
+        bounded local buffer here; Redis registration belongs to its worker.
         """
 
     async def register_initial_backfill(self, request: TTLBackfillRequest) -> None:

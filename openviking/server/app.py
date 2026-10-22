@@ -166,11 +166,10 @@ async def _initialize_ttl_adapter(
     service: OpenVikingService,
     config: ServerConfig,
 ) -> None:
-    """Load and wire the commercial directory-TTL adapter when configured.
+    """Wire built-in Redis TTL when explicitly enabled.
 
-    Open-source leaves ``server.ttl_adapter`` unset, so this registers no
-    adapter: the post-write hook stays uninstalled and the admin routes keep
-    rejecting explicit TTL configuration with 501.
+    The default configuration installs no hook, starts no TTL worker and leaves
+    the internal TTL routes unregistered.
     """
     from openviking.ttl.wiring import build_ttl_adapter, install_ttl_hook, set_ttl_adapter
 
@@ -179,9 +178,7 @@ async def _initialize_ttl_adapter(
     app.state.ttl_adapter = adapter
     if adapter is None:
         return
-    bind_runtime = getattr(adapter, "bind_runtime", None)
-    if bind_runtime is not None:
-        bind_runtime(service, app.state.api_key_manager)
+    adapter.bind_runtime(service, app.state.api_key_manager)
     viking_fs = service.viking_fs
     if viking_fs is not None:
         install_ttl_hook(viking_fs, adapter)
@@ -200,7 +197,7 @@ async def _initialize_runtime_state(
     config: ServerConfig,
 ) -> None:
     """Initialize service and auth dependencies before traffic is accepted."""
-    if config.ttl_adapter is not None and config.ttl_adapter.class_path:
+    if config.ttl_adapter is not None and config.ttl_adapter.enabled:
 
         async def install_write_guards():
             await _initialize_auth_plugin(app, service, config)

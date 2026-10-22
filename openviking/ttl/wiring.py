@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Process-wide registry and service wiring for the TTL adapter.
 
-The adapter is a singleton per server process. ``app.py`` builds it from
-``server.ttl_adapter`` config, registers it here, and installs its post-write
-hook on the VikingFS instance. The admin configuration routes consult
+The adapter is a singleton per server process. ``app.py`` creates the built-in
+implementation from ``server.ttl_adapter``, registers it here and installs its
+post-write hook on the VikingFS instance. The admin configuration routes consult
 :func:`ttl_config_supported` to decide whether an explicit TTL section is
 allowed or must be rejected with 501. When no adapter is registered
-(open-source default) every TTL entry point is inert.
+(default configuration) every TTL entry point is inert.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 from openviking_cli.utils.logger import get_logger
 
 if TYPE_CHECKING:
+    from openviking.server.config import TTLAdapterConfig
     from openviking.server.identity import RequestContext
     from openviking.storage.viking_fs import VikingFS
     from openviking.ttl.adapter import TTLAdapter
@@ -26,17 +27,13 @@ logger = get_logger(__name__)
 _adapter: Optional["TTLAdapter"] = None
 
 
-def build_ttl_adapter(config):
-    """Import the configured commercial class only when explicitly enabled."""
-    if config is None or not config.class_path:
+def build_ttl_adapter(config: Optional["TTLAdapterConfig"]) -> Optional["TTLAdapter"]:
+    """Create the built-in Redis TTL implementation only when enabled."""
+    if config is None or not config.enabled:
         return None
-    import importlib
+    from openviking.ttl.runtime import DirectoryTTL
 
-    module, name = config.class_path.rsplit(".", 1)
-    cls = getattr(importlib.import_module(module), name)
-    if not isinstance(cls, type):
-        raise TypeError(f"{config.class_path} does not resolve to a class")
-    return cls(**config.config)
+    return DirectoryTTL(**config.config)
 
 
 def set_ttl_adapter(adapter: Optional["TTLAdapter"]) -> None:
@@ -53,17 +50,10 @@ def get_ttl_adapter() -> Optional["TTLAdapter"]:
 def ttl_config_supported() -> bool:
     """Return True when explicit TTL configuration writes are allowed.
 
-    False in the open-source edition (no adapter) so the admin routes keep
-    returning 501 / ``UNIMPLEMENTED`` for an explicit TTL section.
+    False when the Redis TTL implementation is not enabled, so admin routes
+    return 501 / ``UNIMPLEMENTED`` for an explicit TTL section.
     """
-    adapter = _adapter
-    if adapter is None:
-        return False
-    try:
-        return bool(adapter.supports_config())
-    except Exception:  # noqa: BLE001 - a misbehaving adapter must not open the gate
-        logger.exception("TTL adapter supports_config() failed; treating TTL as unsupported")
-        return False
+    return _adapter is not None and _adapter.supports_config()
 
 
 def install_ttl_hook(viking_fs: "VikingFS", adapter: Optional["TTLAdapter"]) -> None:
@@ -71,12 +61,12 @@ def install_ttl_hook(viking_fs: "VikingFS", adapter: Optional["TTLAdapter"]) -> 
 
     Called once after the VikingFS instance exists. When no adapter is present
     the hook stays unset, so a committed write never reads the clock or does any
-    TTL I/O (open-source default-off behavior).
+    TTL I/O (default-off behavior).
     """
     if adapter is None:
         return
     viking_fs.set_post_write_hook(adapter.on_post_write)
-    viking_fs._write_guard = getattr(adapter, "write_guard", None)
+    viking_fs._write_guard = adapter.write_guard
     logger.info("Installed TTL post-write hook")
 
 
@@ -95,8 +85,8 @@ async def attach_expires_at(
 
     Attaches ``expires_at`` in place to each dict entry that carries a ``uri``;
     a single ``stat`` result is just a one-element sequence. No-op in the
-    open-source edition (no adapter), so the read path does zero TTL I/O. When a
-    commercial adapter is registered it computes the value from the current
+    default configuration (no adapter), so the read path does zero TTL I/O. When a
+    Redis TTL implementation is enabled it computes the value from the current
     effective policy; the field is only written for URIs the adapter actually
     covers (value string or ``None``), so the kernel never fabricates a field
     the product layer did not compute. Any adapter failure degrades to "no echo

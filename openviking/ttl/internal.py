@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Internal transport, registered only when a commercial adapter is loaded.
+"""Internal transport, registered only when Redis TTL is enabled.
 
 No product logic or Redis access belongs here. The Server owns scope selection;
 the adapter owns registration, reset serialization and lock-protected recycling.

@@ -361,7 +361,7 @@ async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch, ttl_e
     service.compile_scheduler = SimpleNamespace(set_identity_resolver=Mock())
     config = ServerConfig(
         root_api_key="root-key-for-test",
-        ttl_adapter={"class_path": "example.Adapter"} if ttl_enabled else None,
+        ttl_adapter={"enabled": True} if ttl_enabled else None,
     )
 
     await _initialize_runtime_state(app, service, config)

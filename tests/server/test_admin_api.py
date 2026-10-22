@@ -418,10 +418,10 @@ async def test_studio_file_configuration_permissions_revision_and_overrides(
     assert settings["vlm"]["model"] == "override-model"
 
 
-async def test_open_source_configuration_rejects_explicit_ttl_after_auth(
+async def test_unconfigured_redis_ttl_rejects_explicit_policy_after_auth(
     lightweight_admin_client: httpx.AsyncClient,
 ):
-    message = "TTL is not supported in the open-source edition."
+    message = "Redis-backed TTL is not enabled in this deployment."
     cluster_url = "/api/v1/admin/configuration"
     denied = await lightweight_admin_client.patch(cluster_url, json={"settings": {"ttl": {}}})
     assert denied.status_code == 401
@@ -455,7 +455,7 @@ async def test_open_source_configuration_rejects_explicit_ttl_after_auth(
     assert account.json()["error"]["message"] == message
 
 
-async def test_open_source_file_configuration_rejects_ttl_before_save(
+async def test_unconfigured_redis_ttl_rejects_file_policy_before_save(
     lightweight_admin_client,
     tmp_path,
     monkeypatch,
@@ -484,7 +484,7 @@ async def test_open_source_file_configuration_rejects_ttl_before_save(
 async def test_loaded_ttl_adapter_allows_ttl_configuration(
     lightweight_admin_client,
 ):
-    """A registered commercial adapter lifts the 501 gate for TTL config."""
+    """An enabled Redis TTL implementation permits TTL config."""
     from openviking.ttl import wiring
 
     class _FakeTTLAdapter:

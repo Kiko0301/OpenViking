@@ -64,7 +64,7 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
 
-_TTL_UNSUPPORTED_MESSAGE = "TTL is not supported in the open-source edition."
+_TTL_UNSUPPORTED_MESSAGE = "Redis-backed TTL is not enabled in this deployment."
 
 
 class CreateAccountRequest(BaseModel):

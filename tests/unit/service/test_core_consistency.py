@@ -147,6 +147,7 @@ async def test_close_stops_queue_manager_before_ragfs_binding(monkeypatch, ttl_s
     service = OpenVikingService.__new__(OpenVikingService)
     service._resource_service = ResourceService()
     service._config = SimpleNamespace(vlm=VLMConfig())
+    service._compile_scheduler = None
     service._expiry_runtime = None
     service._session_service = SimpleNamespace(set_session_expiry_adapter=lambda _: None)
     service._runtime_config_manager = None

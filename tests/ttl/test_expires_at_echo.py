@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Unit tests for the default-off ``expires_at`` echo-back hook.
 
-The open-source kernel only carries the read-path extension point; it must do
-zero TTL work when no commercial adapter is registered, and must attach exactly
+The read-path extension point must do
+zero TTL work when no TTL implementation is enabled, and must attach exactly
 what a registered adapter computes (string or ``None``) without fabricating a
 field for URIs the adapter does not cover. A misbehaving adapter must never
 break ``stat`` / ``ls`` / ``tree``.
