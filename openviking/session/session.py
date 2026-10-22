@@ -729,13 +729,22 @@ class Session:
             if await self.exists():
                 return
             await self._viking_fs.mkdir(self._session_uri, exist_ok=True, ctx=self.ctx)
-            await self._viking_fs.write_file(
-                f"{self._session_uri}/messages.jsonl",
-                "",
-                ctx=self.ctx,
-                lease_ref=lease,
+            # The Session mutex does not cover its child files.
+            file_lease = await self._viking_fs._async_agfs.pathlock_acquire_exact_batch(
+                [f"{session_path}/messages.jsonl", f"{session_path}/.meta.json"],
+                timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
+                owner_lease_ref=lease,
             )
-            await self._save_meta(lease_ref=lease)
+            try:
+                await self._viking_fs.write_file(
+                    f"{self._session_uri}/messages.jsonl",
+                    "",
+                    ctx=self.ctx,
+                    lease_ref=file_lease,
+                )
+                await self._save_meta(lease_ref=file_lease)
+            finally:
+                await self._viking_fs._async_agfs.pathlock_release(file_lease)
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
 
@@ -3057,11 +3066,7 @@ class Session:
         record_auto_commit_success: bool = False,
     ) -> Optional[SessionMeta]:
         """Return saved metadata, or None when its read fails and statistics are skipped."""
-        session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
-        try:
+        async with self._state_lock(".meta.json") as lease:
             try:
                 latest_meta = await self._read_commit_meta()
             except Exception as exc:
@@ -3115,8 +3120,6 @@ class Session:
                     )
                 await self._save_meta(lease_ref=lease)
             return latest_meta
-        finally:
-            await self._viking_fs._async_agfs.pathlock_release(lease)
 
     async def _read_live_messages_strict(self) -> List[Message]:
         """Read the authoritative root JSONL without silently dropping corrupt rows."""
