@@ -2,54 +2,24 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Internal transport, registered only when Redis TTL is enabled.
 
-No product logic or Redis access belongs here. The Server owns scope selection;
-the adapter owns registration, reset serialization and lock-protected recycling.
+No product logic or Redis access belongs here. The Server supplies identity;
+the adapter owns scope discovery, registration, recovery and recycling.
 """
 
 from dataclasses import asdict
 
 from fastapi import APIRouter, Depends, Request
 
-from openviking.core.namespace import uri_parts
 from openviking.server.auth import get_request_context, require_auth_root
-from openviking.server.dependencies import get_service
-from openviking.server.identity import RequestContext, Role
+from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking.server.routers.admin import _check_account_exists, _get_runtime_config_manager
 from openviking.ttl.adapter import TTLBackfillRequest, TTLRecycleRequest
 from openviking_cli.exceptions import InvalidArgumentError
-from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/v1/admin/ttl", include_in_schema=False)
-
-
-@router.get("/directories")
-@require_auth_root
-async def directories(
-    request: Request,
-    account_id: str,
-    uri: str,
-    ctx: RequestContext = Depends(get_request_context),
-):
-    """Enumerate only users/peers for Server scope selection, including history.
-
-    ROOT cannot call tenant data APIs in api_key mode. This narrow admin call
-    binds the checked account explicitly and reads no content or abstracts.
-    """
-    try:
-        parts = uri_parts(uri)
-    except ValueError as exc:
-        raise InvalidArgumentError(str(exc)) from exc
-    if parts != ["user"] and not (len(parts) == 3 and parts[0] == "user" and parts[2] == "peers"):
-        raise InvalidArgumentError("Only user and peer containers can be enumerated")
-    await _check_account_exists(request, account_id)
-    account_ctx = RequestContext(user=UserIdentifier(account_id, "ttl-internal"), role=Role.ROOT)
-    entries = await get_service().viking_fs.ls(
-        uri, ctx=account_ctx, node_limit=None, show_all_hidden=True, include_abstract=False
-    )
-    return Response(status="ok", result=[entry["uri"] for entry in entries if entry.get("isDir")])
 
 
 @router.get("/configuration")
@@ -68,7 +38,24 @@ async def configuration(
             for name, config in (("cluster", view.cluster), ("account", view.account))
         },
     )
-    return Response(status="ok", result=policies)
+    cluster = {
+        "global": "disabled",
+        **{name: value for name, value in policies["cluster"].items() if value is not None},
+    }
+    return Response(status="ok", result={**policies, "settings": {"ttl": cluster}})
+
+
+@router.get("/initial")
+@require_auth_root
+async def initial_state(
+    request: Request,
+    account_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """Internal diagnostics use the writer; callers do not connect to Redis."""
+    await _check_account_exists(request, account_id)
+    state = await request.app.state.ttl_adapter.read_initial(account_id)
+    return Response(status="ok", result=state)
 
 
 @router.post("/initial")

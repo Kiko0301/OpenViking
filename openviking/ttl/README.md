@@ -43,8 +43,12 @@ The hidden ROOT-authenticated `/api/v1/admin/ttl/initial` endpoint registers or
 resets a fixed `initial` scan. Redis keeps its pending marker, checkpoint and done
 marker across OV restarts; startup does not discover objects by scanning AGFS.
 `/api/v1/admin/ttl/recycle` performs a recycle sweep on explicit request. Deployment
-orchestration supplies roots and hourly staggered calls; the kernel does not add
-another timer or callback queue. The commercial Server provides that orchestration.
+orchestration supplies identity and hourly staggered calls. OV discovers initial
+roots, reuses saved checkpoints and checks due candidates itself. The hidden
+GET `/api/v1/admin/ttl/initial` reads internal recovery state; no caller needs a
+Redis connection. TTL policy PATCHes persist reset intent before saving, so the
+next internal trigger can recover an interrupted handoff. The kernel does not
+add another timer or callback queue.
 
 Tests live in `tests/ttl/`. `TTL_TEST_REDIS` and `TTL_TEST_CLUSTER` opt into isolated
 real Redis tests; ordinary tests use fakeredis with Lua support. The separate

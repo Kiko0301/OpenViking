@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -37,6 +38,75 @@ def engine(monkeypatch, caplog):
     )
     e.account_manager = SimpleNamespace(list_accounts=AsyncMock(return_value=[]))
     return e
+
+
+@pytest.mark.asyncio
+async def test_config_reset_intent_precedes_save_and_disable_skips_redis(engine):
+    e = engine
+    e.pair = (TTLConfig(sessions="disabled"), None)
+    e.manager = SimpleNamespace(patch_account=AsyncMock())
+
+    async def save(*args):
+        state = await e.read_initial("a")
+        assert state["reset_required"]["viking://user/_ttl_/sessions"]
+
+    e.manager.patch_account.side_effect = save
+    await e.patch_configuration({"ttl": {"sessions": 7}}, "a")
+    redis = e.redis
+    e.client = AsyncMock(side_effect=ConnectionError("Redis unavailable"))
+    e.manager.patch_account.reset_mock()
+    from openviking_cli.exceptions import UnavailableError
+
+    with pytest.raises(UnavailableError):
+        await e.patch_configuration({"ttl": {"sessions": 7}}, "a")
+    e.manager.patch_account.assert_not_called()
+    e.manager.patch_account.side_effect = None
+    await e.patch_configuration({"ttl": {"sessions": "disabled"}}, "a")
+    e.manager.patch_account.assert_awaited_once()
+    assert await redis.hlen(e.prefix("a") + "backfill:reset_required") > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer_days", [None, "disabled", 7])
+async def test_initial_discovers_roots_then_resumes_without_listing(engine, peer_days):
+    e = engine
+    explicit = "viking://user/other/peers/special/memories/events"
+    e.pair = (TTLConfig(sessions=7, peer_events=peer_days, roots={explicit: 7}), None)
+    tree = {
+        "viking://user": ["viking://user/u"],
+        "viking://user/u/peers": ["viking://user/u/peers/p"],
+    }
+    e.fs.ls.side_effect = lambda uri, **kw: [{"uri": u, "isDir": True} for u in tree.get(uri, [])]
+    await e.register_initial_backfill(TTLBackfillRequest("r", "a"))
+    state = await e.read_initial("a")
+    roots = json.loads(state["roots"])
+    assert explicit in roots and "viking://user/u/sessions" in roots
+    assert ("viking://user/u/peers/p/memories/events" in roots) == (peer_days == 7)
+    assert e.fs.ls.await_count == (2 if peer_days == 7 else 1)
+    assert all(call.kwargs["node_limit"] is None for call in e.fs.ls.call_args_list)
+    e.fs.ls.reset_mock()
+    await e.register_initial_backfill(TTLBackfillRequest("r", "a"))
+    e.fs.ls.assert_not_called()
+    await e.redis.set(e.prefix("a") + "backfill:initial:done", "1")
+    await e.recycle_due(TTLRecycleRequest("r", "a"))
+    e.fs.ls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hourly_trigger_recovers_intent_with_old_done(engine):
+    e = engine
+    root = "viking://user/u/sessions"
+    e.pair = (TTLConfig(sessions=7), None)
+    await e.register_initial_backfill(TTLBackfillRequest("r", "a", (root,)))
+    prefix = e.prefix("a") + "backfill:"
+    await e.redis.set(prefix + "initial:done", "1")
+    await e.redis.hset(prefix + "reset_required", root, "saved-token")
+    await e.recycle_due(TTLRecycleRequest("r", "a"))
+    state = await e.read_initial("a")
+    assert not state["done"] and state["pending"] and not state["reset_required"]
+    e.fs.ls.reset_mock()
+    await e.register_initial_backfill(TTLBackfillRequest("r", "a"))
+    e.fs.ls.assert_not_called()
 
 
 @pytest.mark.asyncio

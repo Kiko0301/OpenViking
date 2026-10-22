@@ -150,13 +150,8 @@ def _reject_unsupported_ttl_config(
     settings: Mapping[str, object] | None = None,
     content: str | None = None,
 ) -> None:
-    """Reject an explicit TTL section unless a commercial TTL adapter is loaded.
+    """Reject explicit TTL settings unless the built-in Redis runtime is enabled."""
 
-    The open-source edition registers no adapter, so TTL configuration stays
-    unsupported and returns 501. A commercial deployment that loads an adapter
-    reporting ``supports_config()`` lets TTL writes through to normal config
-    validation.
-    """
     from openviking.ttl.wiring import ttl_config_supported
 
     if ttl_config_supported():
@@ -844,7 +839,12 @@ async def patch_account_configuration(
     _authorize_account_config_patch(ctx, body.settings)
     _reject_unsupported_ttl_config(body.settings)
     try:
-        await _get_runtime_config_manager().patch_account(account_id, body.settings)
+        if "ttl" in body.settings:
+            from openviking.ttl.wiring import get_ttl_adapter
+
+            await get_ttl_adapter().patch_configuration(body.settings, account_id)
+        else:
+            await _get_runtime_config_manager().patch_account(account_id, body.settings)
     except (ConfigPatchError, ValueError) as exc:
         raise InvalidArgumentError(str(exc)) from exc
     settings = await _get_runtime_config_manager().get_settings(
@@ -1008,7 +1008,12 @@ async def patch_cluster_configuration(
         raise InvalidArgumentError("Full file content requires source=file")
     runtime_config = _get_runtime_config_manager()
     try:
-        await runtime_config.patch_cluster(body.settings)
+        if "ttl" in body.settings:
+            from openviking.ttl.wiring import get_ttl_adapter
+
+            await get_ttl_adapter().patch_configuration(body.settings)
+        else:
+            await runtime_config.patch_cluster(body.settings)
     except (ConfigPatchError, ValueError) as exc:
         raise InvalidArgumentError(str(exc)) from exc
     settings = await runtime_config.get_settings(ConfigScope.cluster())

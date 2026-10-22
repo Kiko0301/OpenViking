@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import TYPE_CHECKING, Any, Sequence
 from urllib.parse import quote
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from openviking.config.ttl import TTLIndexType, classify_ttl_uri, resolve_effective_ttl
@@ -74,6 +75,17 @@ if score and tonumber(score) == tonumber(ARGV[2]) then
   return redis.call('ZREM', KEYS[1], ARGV[1])
 end
 return 0
+"""
+READ_INITIAL = """
+local intents = {}
+local fields = redis.call('HGETALL', KEYS[4])
+for i = 1, #fields, 2 do intents[fields[i]] = fields[i + 1] end
+local encoded = '{}'
+if #fields > 0 then encoded = cjson.encode(intents) end
+return {redis.call('HGET', KEYS[1], 'roots') or '',
+        redis.call('HGET', KEYS[1], 'checkpoint') or '',
+        redis.call('GET', KEYS[2]) or '',
+        tostring(redis.call('SISMEMBER', KEYS[3], 'initial')), encoded}
 """
 
 
@@ -147,6 +159,91 @@ class DirectoryTTL:
     def supports_config(self) -> bool:
         return self.writer
 
+    async def patch_configuration(self, settings: dict, account_id: str | None = None) -> None:
+        patch = settings["ttl"]
+
+        def may_enable(value):
+            if value is None:
+                return True
+            if isinstance(value, dict):
+                return any(may_enable(node) for node in value.values())
+            return value != "disabled"
+
+        if may_enable(patch):
+            accounts = (
+                [{"account_id": account_id}]
+                if account_id is not None
+                else await self.account_manager.list_accounts()
+            )
+            for account in accounts:
+                account = account["account_id"]
+                pair = await self.policies(account)
+                roots = set(self.policy_roots(pair))
+                if isinstance(patch, dict):
+                    roots.update(patch.get("roots") or {})
+                scopes = [root for root in roots if not resolve_effective_ttl(*pair, root).enabled]
+                if not scopes:
+                    continue
+                try:
+                    redis = await self.client()
+                    pipe = redis.pipeline(transaction=False)
+                    token = uuid4().hex
+                    for scope in scopes:
+                        pipe.hsetnx(self.prefix(account) + "backfill:reset_required", scope, token)
+                    await pipe.execute()
+                except Exception as exc:
+                    raise UnavailableError("TTL reset intent registration unavailable") from exc
+        if account_id is None:
+            await self.manager.patch_cluster(settings)
+        else:
+            await self.manager.patch_account(account_id, settings)
+
+    async def read_initial(self, account_id: str) -> dict:
+        prefix = self.prefix(account_id) + "backfill:"
+        try:
+            redis = await self.client()
+            values = await redis.eval(
+                READ_INITIAL,
+                4,
+                prefix + "initial",
+                prefix + "initial:done",
+                prefix + "pending",
+                prefix + "reset_required",
+            )
+            return {
+                "roots": values[0],
+                "checkpoint": values[1],
+                "done": values[2] == "1",
+                "pending": values[3] == "1",
+                "reset_required": json.loads(values[4]),
+            }
+        except Exception as exc:
+            raise UnavailableError("TTL initial state query unavailable") from exc
+
+    async def _initial_roots(self, account: str, pair) -> list[str]:
+        ctx = self.context(account)
+        roots = set()
+        peer_enabled = resolve_effective_ttl(
+            *pair, "viking://user/_ttl_/peers/_ttl_/memories/events"
+        ).enabled
+        for user in await self._children("viking://user", ctx):
+            for root in (user + "/memories/events", user + "/sessions"):
+                if resolve_effective_ttl(*pair, root).enabled:
+                    roots.add(root)
+            if peer_enabled:
+                for peer in await self._children(user + "/peers", ctx):
+                    root = peer + "/memories/events"
+                    if resolve_effective_ttl(*pair, root).enabled:
+                        roots.add(root)
+        for config in pair:
+            if config is not None:
+                roots.update(
+                    root
+                    for root in config.roots or {}
+                    if resolve_effective_ttl(*pair, root).enabled
+                )
+        return sorted(roots)
+
     def prefix(self, account_id: str) -> str:
         scope = quote(self.resource_id, safe=PATH_SAFE) + "|" + quote(account_id, safe=PATH_SAFE)
         return "ttl:{" + scope + "}:"
@@ -167,7 +264,7 @@ class DirectoryTTL:
         return pair
 
     @staticmethod
-    def enabled(pair: tuple[TTLConfig | None, TTLConfig | None]) -> bool:
+    def policy_roots(pair: tuple[TTLConfig | None, TTLConfig | None]) -> list[str]:
         probes = [
             "viking://user/_ttl_/sessions",
             "viking://user/_ttl_/memories/events",
@@ -176,7 +273,11 @@ class DirectoryTTL:
         for config in pair:
             if config is not None:
                 probes.extend(config.roots or {})
-        return any(resolve_effective_ttl(*pair, uri).enabled for uri in probes)
+        return probes
+
+    @classmethod
+    def enabled(cls, pair: tuple[TTLConfig | None, TTLConfig | None]) -> bool:
+        return any(resolve_effective_ttl(*pair, uri).enabled for uri in cls.policy_roots(pair))
 
     def expiry(self, item: TTLDirectory, base: float, days: int) -> float:
         if item[0] == "sessions":
@@ -357,21 +458,40 @@ class DirectoryTTL:
     async def register_initial_backfill(self, request: TTLBackfillRequest) -> None:
         if not self.writer or request.resource_id != self.resource_id:
             raise FailedPreconditionError("TTL request must target this writer")
-        roots = sorted(set(request.roots))
+        account = request.account_id
+        pair = await self.policies(account)
+        if not self.enabled(pair):
+            raise FailedPreconditionError("TTL is disabled")
+        state = await self.read_initial(account)
+        intents = request.reset_intents or {
+            root: token
+            for root, token in state["reset_required"].items()
+            if resolve_effective_ttl(*pair, root).enabled
+        }
+        reset = request.reset or bool(intents)
+        roots = request.roots
+        if roots is None:
+            if not reset and state["roots"]:
+                try:
+                    roots = json.loads(state["roots"])
+                except ValueError as exc:
+                    raise FailedPreconditionError("invalid saved initial roots") from exc
+                if not isinstance(roots, list):
+                    raise FailedPreconditionError("invalid saved initial roots")
+            elif not reset and (state["pending"] or state["done"]):
+                raise FailedPreconditionError("initial state is missing roots")
+            else:
+                roots = await self._initial_roots(account, pair)
+        roots = sorted(set(roots))
         try:
             TTLConfig(roots=dict.fromkeys(roots, "disabled"))
         except ValueError as exc:
             raise InvalidArgumentError(
                 "initial roots must be canonical Events or Sessions roots"
             ) from exc
-        pair = await self.policies(request.account_id)
-        if not self.enabled(pair):
-            raise FailedPreconditionError("TTL is disabled")
-        account = request.account_id
-        intents = request.reset_intents or {}
-        if intents and not request.reset:
+        if request.reset_intents and not request.reset:
             raise InvalidArgumentError("reset intents require reset")
-        # Configuration may have been disabled after Server read it. Leave
+        # Configuration can change while discovery yields. Leave
         # these intents pending rather than acknowledge a scan of closed roots.
         active_intents = {
             root: token
@@ -380,17 +500,19 @@ class DirectoryTTL:
         }
         if intents and not active_intents:
             return
-        if request.reset:
+        if not reset and state["done"]:
+            return
+        if reset:
             self._stop_scan.add(account)
         try:
             async with self._locks.setdefault(account, asyncio.Lock()):
-                async with self._recycle_lock if request.reset else nullcontext():
+                async with self._recycle_lock if reset else nullcontext():
                     prefix = self.prefix(account) + "backfill:"
                     redis = await self.client()
                     checkpoint = json.dumps({"root": 0, "stack": []}, separators=(",", ":"))
                     try:
                         result = await redis.eval(
-                            RESET if request.reset else INITIAL,
+                            RESET if reset else INITIAL,
                             4,
                             prefix + "initial",
                             prefix + "initial:done",
@@ -411,6 +533,12 @@ class DirectoryTTL:
                     self._pending.add(account)
         finally:
             self._stop_scan.discard(account)
+        logger.info(
+            "TTL initial registered scope=%s/%s event=%s",
+            self.resource_id,
+            account,
+            "reset" if reset else "resume",
+        )
         self._wake.set()
 
     async def _run(self):
@@ -611,6 +739,17 @@ class DirectoryTTL:
         pair = await self.policies(request.account_id)
         if not self.enabled(pair):
             return TTLRecycleResult()
+        if request.max_base_time_ms is None:
+            # Hourly orchestration supplies only identity. Redis and policy
+            # interpretation stay in the writer; explicit test cutoffs remain supported.
+            await self.register_initial_backfill(
+                TTLBackfillRequest(self.resource_id, request.account_id)
+            )
+            policies = [resolve_effective_ttl(*pair, root) for root in self.policy_roots(pair)]
+            days = min(policy.days for policy in policies if policy.enabled)
+            cutoff = time.time_ns() // 1_000_000 - (days - 1) * DAY_MS
+        else:
+            cutoff = request.max_base_time_ms
         if self._recycle_lock.locked():
             raise ConflictError("TTL recycle round is already running")
         counts = {"scanned": 0, "deleted": 0, "skipped": 0, "failed": 0}
@@ -627,7 +766,7 @@ class DirectoryTTL:
                     candidates = await redis.zrangebyscore(
                         prefix + kind,
                         "-inf",
-                        request.max_base_time_ms,
+                        cutoff,
                         start=offset,
                         num=min(request.limit, self.batch_size),
                         withscores=True,

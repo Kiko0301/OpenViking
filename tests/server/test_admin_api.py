@@ -492,6 +492,15 @@ async def test_loaded_ttl_adapter_allows_ttl_configuration(
         def supports_config(self) -> bool:
             return True
 
+        async def patch_configuration(self, settings, account_id=None):
+            from openviking.server.dependencies import get_service
+
+            manager = get_service().runtime_config_manager
+            if account_id is None:
+                await manager.patch_cluster(settings)
+            else:
+                await manager.patch_account(account_id, settings)
+
         async def on_post_write(self, uri, ctx, written_at_ms):  # noqa: ANN001
             return None
 
@@ -4192,7 +4201,11 @@ async def test_ttl_internal_bridge_auth_reset_and_configuration(
     from openviking.ttl.adapter import TTLBackfillRequest
 
     monkeypatch.setattr(wiring, "_adapter", None)
-    adapter = Mock(start=AsyncMock(), register_initial_backfill=AsyncMock())
+    adapter = Mock(
+        start=AsyncMock(),
+        register_initial_backfill=AsyncMock(),
+        read_initial=AsyncMock(return_value={"done": True, "pending": False}),
+    )
     monkeypatch.setattr("openviking.ttl.wiring.build_ttl_adapter", lambda _: adapter)
     service = lightweight_admin_app.state.fake_service
     monkeypatch.setattr(service.viking_fs, "set_post_write_hook", Mock(), raising=False)
@@ -4234,6 +4247,15 @@ async def test_ttl_internal_bridge_auth_reset_and_configuration(
     )
     assert response.status_code == 200, response.text
     assert response.json()["result"]["account"]["sessions"] == 30
+    state = await lightweight_admin_client.get(
+        "/api/v1/admin/ttl/initial", params={"account_id": account_id}, headers=root_headers()
+    )
+    assert state.status_code == 200 and state.json()["result"]["done"]
+    adapter.read_initial.assert_awaited_once_with(account_id)
+    denied = await lightweight_admin_client.get(
+        "/api/v1/admin/ttl/initial", params={"account_id": account_id}
+    )
+    assert denied.status_code == 401
     assert "/api/v1/admin/ttl/initial" not in lightweight_admin_app.openapi()["paths"]
 
 
@@ -4271,46 +4293,3 @@ async def test_ttl_internal_preserves_error_contract(
     assert response.status_code == status, response.text
     assert response.json()["error"]["details"]["scope"] == "test"
     assert adapter.register_initial_backfill.await_count == 1
-
-
-async def test_ttl_directory_enumeration_binds_account_and_does_not_truncate(
-    lightweight_admin_app, lightweight_admin_client, monkeypatch
-):
-    from openviking.server.app import _initialize_ttl_adapter
-    from openviking.ttl import wiring
-
-    monkeypatch.setattr(wiring, "_adapter", None)
-    adapter = Mock(start=AsyncMock())
-    monkeypatch.setattr("openviking.ttl.wiring.build_ttl_adapter", lambda _: adapter)
-    service = lightweight_admin_app.state.fake_service
-    monkeypatch.setattr(service.viking_fs, "set_post_write_hook", Mock(), raising=False)
-    listing = AsyncMock(
-        return_value=[{"uri": f"viking://user/u{i}", "isDir": True} for i in range(1001)]
-    )
-    monkeypatch.setattr(service.viking_fs, "ls", listing, raising=False)
-    await _initialize_ttl_adapter(lightweight_admin_app, service, ServerConfig())
-    account_id = _uid()
-    created = await lightweight_admin_client.post(
-        "/api/v1/admin/accounts",
-        json={"account_id": account_id, "admin_user_id": "admin"},
-        headers=root_headers(),
-    )
-    admin_key = created.json()["result"]["user_key"]
-    url = "/api/v1/admin/ttl/directories"
-    params = {"account_id": account_id, "uri": "viking://user"}
-    denied = await lightweight_admin_client.get(
-        url, params=params, headers={"X-API-Key": admin_key}
-    )
-    assert denied.status_code == 403
-    listing.assert_not_called()
-    response = await lightweight_admin_client.get(url, params=params, headers=root_headers())
-    assert response.status_code == 200, response.text
-    assert len(response.json()["result"]) == 1001
-    assert listing.call_args.kwargs["ctx"].account_id == account_id
-    assert listing.call_args.kwargs["node_limit"] is None
-    assert listing.call_args.kwargs["include_abstract"] is False
-    forbidden = await lightweight_admin_client.get(
-        url, params={**params, "uri": "viking://user/u/sessions"}, headers=root_headers()
-    )
-    assert forbidden.status_code == 400
-    assert listing.await_count == 1

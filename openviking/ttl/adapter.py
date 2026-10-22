@@ -31,11 +31,11 @@ class TTLBackfillRequest:
 
     resource_id: str
     account_id: str
-    roots: tuple[str, ...]
+    roots: Optional[tuple[str, ...]] = None
     #: True for explicit internal repair, (re)opening or widening scope; the adapter
     #: must clear ``done`` / reset the checkpoint before re-running initial.
     reset: bool = False
-    #: Optional Server reset intents (scope -> token). The adapter consumes
+    #: Optional explicit reset intents (scope -> token). The adapter consumes
     #: matching tokens atomically with reset; replay must not reset twice.
     reset_intents: Optional[dict[str, str]] = None
 
@@ -44,16 +44,15 @@ class TTLBackfillRequest:
 class TTLRecycleRequest:
     """Server-internal hourly request to recycle one scope's due directories.
 
-    The Server passes the most conservative (shortest) effective TTL per index
-    type so the adapter can query candidates cheaply; the adapter re-resolves
-    the per-directory effective policy before deleting and skips ``disabled``
-    directories and any not yet due.
+    Normal triggers supply identity only. The writer resolves the conservative
+    candidate cutoff, initial state and per-directory policy. An explicit cutoff
+    remains available for isolated validation.
     """
 
     resource_id: str
     account_id: str
     #: Upper bound on the base-time score to scan, in epoch milliseconds.
-    max_base_time_ms: int
+    max_base_time_ms: Optional[int] = None
     limit: int = 256
 
 
@@ -96,6 +95,12 @@ class TTLAdapter(Protocol):
         The admin configuration routes keep returning 501 until a loaded
         adapter reports support; support depends on configuration, not edition.
         """
+
+    async def patch_configuration(self, settings: dict, account_id: Optional[str] = None) -> None:
+        """Persist reset intent before publishing a TTL configuration change."""
+
+    async def read_initial(self, account_id: str) -> dict:
+        """Read the fixed initial state for internal diagnostics."""
 
     async def on_post_write(
         self,
