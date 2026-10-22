@@ -451,9 +451,8 @@ class CompileStateStore:
     async def get_outputs(
         self, account_id: str, target_id: str, operation_id: str
     ) -> Optional[dict]:
-        path = self._outputs_path(account_id, target_id, operation_id)
-        async with self.locked(path):
-            return await self.read_json(path)
+        """Read atomically published outputs without locking; return None when absent."""
+        return await self.read_json(self._outputs_path(account_id, target_id, operation_id))
 
     async def merge_outputs(
         self,

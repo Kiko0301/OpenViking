@@ -783,6 +783,11 @@ async def test_compile_history_retention_and_retry(service, monkeypatch, failed_
         operation["finished_at"] = finished_at
         await store.merge_outputs(account, target, operation_id, [])
         await store.put_operation(account, target, operation)
+    async with store.locked(store._outputs_path(account, target, "running")):
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "locked", Mock(side_effect=AssertionError("Output read lock")))
+            manifest = await store.get_outputs(account, target, "running")
+            assert manifest == {"outputs": []}
     async with store.edit(account, target) as record:
         record["active_task_id"] = "running-task"
     assert await store.delete_expired(now=now, limit=256) == 0
