@@ -185,22 +185,41 @@ class CompileScheduler:
                     if item.get("auto_update") and is_due(
                         item, current_slot(item["update_schedule"], now)
                     ):
-                        await self.trigger_if_due(account_id, item["id"], now)
+                        await self.trigger_if_due(account_id, item["id"], item["to"], now)
                     elif item.get("auto_update"):
                         await self.reschedule(account_id, item)
                 except Exception:
                     logger.exception("Compile schedule check failed for %s", item.get("id"))
 
     async def reschedule(
-        self, account_id: str, record: Dict[str, Any], *, raise_on_error: bool = False
+        self,
+        account_id: str,
+        record: Dict[str, Any],
+        *,
+        previous_to: Optional[str] = None,
+        raise_on_error: bool = False,
     ) -> None:
-        """Mirror a schedule; raise_on_error lets expiry callbacks retry Redis failures."""
+        """Mirror a schedule, removing a moved locator; optionally propagate Redis errors."""
         if self._expiry is None:
             return
         from openviking.scheduling.expiry import ExpiryMode, ExpiryRegistration, ItemIdentity
 
-        identity = ItemIdentity(COMPILE_TARGET_ITEM_TYPE, account_id, "_system", record["id"])
+        identity = ItemIdentity(
+            COMPILE_TARGET_ITEM_TYPE,
+            account_id,
+            "_system",
+            json.dumps([record["id"], record["to"]], separators=(",", ":")),
+        )
         try:
+            if previous_to is not None and previous_to != record["to"]:
+                await self._expiry.unregister(
+                    ItemIdentity(
+                        COMPILE_TARGET_ITEM_TYPE,
+                        account_id,
+                        "_system",
+                        json.dumps([record["id"], previous_to], separators=(",", ":")),
+                    )
+                )
             if (
                 record.get("status") == "active"
                 and record.get("initialized")
@@ -227,11 +246,13 @@ class CompileScheduler:
     # ---------- decision and submission ----------
 
     async def trigger_if_due(
-        self, account_id: str, target_id: str, now: Optional[datetime] = None
+        self, account_id: str, target_id: str, to: str, now: Optional[datetime] = None
     ) -> str:
-        """Submit the target's scheduled task for the current slot at most once."""
+        """Submit a slot once, rejecting locators whose stable target identity no longer matches."""
         now = now or datetime.now(TZ)
-        async with self._store.edit(account_id, target_id) as record:
+        async with self._store.edit(account_id, to) as record:
+            if record["id"] != target_id or record["to"] != to:
+                raise LookupError(f"Compile target not found: {target_id}")
             slot = current_slot(record["update_schedule"], now) if record["auto_update"] else None
             if slot is None or not is_due(record, slot):
                 await self.reschedule(account_id, record, raise_on_error=True)
@@ -323,7 +344,18 @@ class _ExpiryHandler:
 
         identity = request.identity
         try:
-            outcome = await self._scheduler.trigger_if_due(identity.account_id, identity.local_id)
+            locator = json.loads(identity.local_id)
+            if (
+                not isinstance(locator, list)
+                or len(locator) != 2
+                or any(not isinstance(value, str) or not value for value in locator)
+            ):
+                return CallbackResult(CallbackStatus.COMPLETED, "not_found")
+        except (TypeError, ValueError):
+            return CallbackResult(CallbackStatus.COMPLETED, "not_found")
+        try:
+            target_id, to = locator
+            outcome = await self._scheduler.trigger_if_due(identity.account_id, target_id, to)
         except LookupError:
             return CallbackResult(CallbackStatus.COMPLETED, "not_found")
         except Exception:

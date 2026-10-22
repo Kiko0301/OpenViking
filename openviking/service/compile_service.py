@@ -27,6 +27,7 @@ from openviking.service.memory_compile import MemoryCompileRunner
 from openviking.service.task_tracker import SENSITIVE_TASK_KEYS, TaskRecord
 from openviking.session.memory.utils.memory_fields import strip_memory_fields_trailer
 from openviking_cli.exceptions import (
+    ConflictError,
     InvalidArgumentError,
     NotFoundError,
     PermissionDeniedError,
@@ -446,7 +447,7 @@ class CompileService:
         normalized = await self._normalize_request(self._normalize_request_uris(request, ctx), ctx)
         submitted, private_payload = self._split_payload(normalized)
         payload = await self._lifecycle.prepare(
-            submitted, ctx, instruction_set=False, scheduled_target_id=record["id"]
+            submitted, ctx, instruction_set=False, scheduled_record=record
         )
         return await self._create_task(
             payload,
@@ -456,6 +457,7 @@ class CompileService:
             connection,
             ctx,
             idempotency_key,
+            locked_record=record,
         )
 
     async def _create_task(
@@ -467,8 +469,10 @@ class CompileService:
         connection: Mapping[str, Any],
         ctx: RequestContext,
         idempotency_key: str | None,
+        *,
+        locked_record: dict[str, Any] | None = None,
     ) -> TaskRecord:
-        """Persist and enqueue the task, then write submission history in the background."""
+        """Enqueue work, recording scheduled history before releasing its caller-owned state lock."""
         task = await self._tasks.create(
             self.task_type,
             resource_id=", ".join(normalized.from_),
@@ -482,7 +486,10 @@ class CompileService:
                 else {}
             ),
         )
-        self._schedule_history(task)
+        if locked_record is not None:
+            await self._lifecycle.record_queued(task, locked_record=locked_record)
+        else:
+            self._schedule_history(task)
         return task
 
     def _schedule_history(self, task: TaskRecord) -> None:
@@ -621,6 +628,7 @@ class CompileService:
     async def update_config(self, body: "CompileConfigUpdate", ctx: RequestContext) -> dict:
         lifecycle = self._require_lifecycle()
         record = await self._target(body.to, ctx)
+        identity = (record["id"], record["deleted_at"])
         request = await self._normalize_request(
             self._normalize_request_uris(
                 CompileRequest.model_validate(
@@ -630,8 +638,12 @@ class CompileService:
             ),
             ctx,
         )
-        await lifecycle.validate_layout(ctx.account_id, record["to"], request.from_)
-        async with lifecycle.store.edit(ctx.account_id, record["id"]) as record:
+        lifecycle.validate_layout(record["to"], request.from_)
+        async with lifecycle.store.edit(ctx.account_id, record["to"]) as record:
+            if record["status"] != "active" or (record["id"], record["deleted_at"]) != identity:
+                raise ConflictError(
+                    "Compile target changed during configuration", resource="COMPILE_TARGET"
+                )
             lifecycle.apply_sources(record, request.from_, request.skill)
             if body.instruction_sent:
                 record["instruction"] = (body.instruction or "").strip() or None

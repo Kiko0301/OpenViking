@@ -1,7 +1,6 @@
 """Studio task pagination and submission retry contracts."""
 
 import asyncio
-import hashlib
 import json
 import time
 from types import SimpleNamespace
@@ -10,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from openviking.server.identity import RequestContext, Role
-from openviking.service.compile_targets import CompileLifecycle, new_operation
+from openviking.service.compile_targets import CompileLifecycle, CompileStateStore, new_operation
 from openviking.service.external_task_service import ExternalTaskService
 from openviking.service.task_domain import TaskPatch
 from openviking.service.task_pagination import decode_cursor, encode_cursor, page_scope
@@ -516,7 +515,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     indexes = await store.list_version_indexes(ctx.account_id, target_id)
     assert tracker.compile_history_cleanup == store.delete_expired
     assert await store.delete_expired(now=time.time() + 604801, limit=256) > 0
-    assert await store.get(ctx.account_id, target_id) == state
+    assert await store.get(ctx.account_id, target) == state
     assert await store.list_version_indexes(ctx.account_id, target_id) == indexes
     assert await tracker.get(first, **owner) is not None
     versions = (await client.get("/api/v1/snapshot/versions", params={"uri": picture})).json()[
@@ -562,7 +561,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     target_id = configured.json()["result"]["target_id"]
     now = datetime.now(TZ) + timedelta(days=1)
     runtime_status = "completed"
-    assert await scheduler.trigger_if_due(ctx.account_id, target_id, now) == "submitted"
+    assert await scheduler.trigger_if_due(ctx.account_id, target_id, target, now) == "submitted"
     operations = await service.compile.list_operations(target, ctx, limit=20, cursor=None)
     scheduled = next(
         op["meta"]["task_id"]
@@ -571,7 +570,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     )
     await service.compile._tasks.execute(scheduled, **owner)
     assert (await tracker.get(scheduled, **owner)).status == "completed"
-    assert await scheduler.trigger_if_due(ctx.account_id, target_id, now) == "not_due"
+    assert await scheduler.trigger_if_due(ctx.account_id, target_id, target, now) == "not_due"
 
     # Disabling clears a supplied rule; null and omitted rules are valid only while disabled.
     for rule in ({"update_schedule": {"frequency": "daily"}}, {"update_schedule": None}, {}):
@@ -599,12 +598,12 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
         {**payload, "args": {"auto_update": False, "update_schedule": None}},
         "compile-disable-schedule-key",
     )
-    assert (await store.get(ctx.account_id, target_id))["update_schedule"] is None
+    assert (await store.get(ctx.account_id, target))["update_schedule"] is None
     configured = await client.post("/api/v1/compile/config/update", json=settings)
     assert configured.status_code == 200, configured.text
     groups.return_value = ()
     with pytest.raises(PermissionDeniedError):
-        await scheduler.trigger_if_due(ctx.account_id, target_id, now + timedelta(days=1))
+        await scheduler.trigger_if_due(ctx.account_id, target_id, target, now + timedelta(days=1))
 
     # Submission recovery remains available after inputs disappear or the backend is disabled.
     with monkeypatch.context() as patch:
@@ -637,22 +636,25 @@ async def test_disabled_schedule_clears_legacy_state_and_lifecycle_changes(servi
     acquire = AsyncMock(wraps=store._agfs.pathlock_acquire_exact)
     monkeypatch.setattr(store._agfs, "pathlock_acquire_exact", acquire)
     target_id = await store.register(account, target)
-    key = hashlib.sha256(target.encode("utf-8")).hexdigest()
-    assert acquire.await_args_list[0].args[0] == f"{store.root(account)}/register-{key}.lock"
-    path = store._record_path(account, target_id)
-    async with store.edit(account, target_id):
+    path = store._record_path(account, target)
+    async with store.edit(account, target):
         with monkeypatch.context() as patch:
             patch.setattr(acquire, "side_effect", AssertionError("Config reads must not lock"))
             page = await service.compile.list_configs(ctx, limit=1, cursor=None)
             assert page["targets"][0]["target_id"] == target_id
+            cold = CompileStateStore(store._agfs)
+            patch.setattr(
+                cold, "list_summaries", AsyncMock(side_effect=AssertionError("Target scan"))
+            )
+            assert await cold.register(account, target + "/") == target_id
     schedule = {"frequency": "daily", "hour": 0, "minute": 0}
-    legacy = await store.get(account, target_id)
+    legacy = await store.get(account, target)
     legacy["update_schedule"] = schedule
     await store.write_json(path, legacy)
-    assert (await store.get(account, target_id))["update_schedule"] is None
+    assert (await store.get(account, target))["update_schedule"] is None
     assert (await store.list_summaries(account))[0]["update_schedule"] is None
     assert (await store.read_json(path))["update_schedule"] == schedule
-    async with store.edit(account, target_id):
+    async with store.edit(account, target):
         pass
     assert (await store.read_json(path))["update_schedule"] is None
     assert (await store.list_summaries(account))[0]["update_schedule"] is None
@@ -663,28 +665,28 @@ async def test_disabled_schedule_clears_legacy_state_and_lifecycle_changes(servi
         slot = Mock(wraps=scheduling.current_slot)
         patch.setattr(scheduling, "current_slot", slot)
         await scheduler.scan_once(now)
-        assert await scheduler.trigger_if_due(account, target_id, now) == "not_due"
+        assert await scheduler.trigger_if_due(account, target_id, target, now) == "not_due"
         slot.assert_not_called()
 
-    async with store.edit(account, target_id) as record:
+    async with store.edit(account, target) as record:
         record.update(
             initialized=True,
             auto_update=True,
             update_schedule=schedule,
             auto_update_enabled_at="2026-10-20T00:00:00+08:00",
         )
-    assert await scheduler.trigger_if_due(account, target_id, now) == "disabled"
-    invalid = await store.get(account, target_id)
+    assert await scheduler.trigger_if_due(account, target_id, target, now) == "disabled"
+    invalid = await store.get(account, target)
     assert invalid["auto_update"] is False and invalid["update_schedule"] is None
     assert (await store.list_summaries(account))[0]["update_schedule"] is None
 
-    async with store.edit(account, target_id) as record:
+    async with store.edit(account, target) as record:
         record.update(auto_update=True, update_schedule=schedule)
     await service.compile.lifecycle.versions.after_remove(target, ctx)
-    deleted = await store.get(account, target_id)
+    deleted = await store.get(account, target)
     assert deleted["status"] == "deleted" and deleted["update_schedule"] is None
     assert await store.register(account, target) == target_id
-    reused = await store.get(account, target_id)
+    reused = await store.get(account, target)
     assert reused["status"] == "active" and reused["auto_update"] is False
     assert reused["update_schedule"] is None
 
@@ -788,10 +790,10 @@ async def test_compile_history_retention_and_retry(service, monkeypatch, failed_
             patch.setattr(store, "locked", Mock(side_effect=AssertionError("Output read lock")))
             manifest = await store.get_outputs(account, target, "running")
             assert manifest == {"outputs": []}
-    async with store.edit(account, target) as record:
+    async with store.edit(account, "viking://resources/history") as record:
         record["active_task_id"] = "running-task"
     assert await store.delete_expired(now=now, limit=256) == 0
-    async with store.edit(account, target) as record:
+    async with store.edit(account, "viking://resources/history") as record:
         record["active_task_id"] = None
     remove = store.remove
 
