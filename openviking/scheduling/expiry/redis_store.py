@@ -78,7 +78,7 @@ def create_redis_client(config: ExpiryRedisConfig, *, retry=None):
                 raw if "://" in raw else (("rediss" if config.tls else "redis") + f"://{raw}")
             )
             parsed = urlsplit(normalized)
-            use_tls = use_tls or parsed.scheme == "rediss"
+            use_tls = parsed.scheme == "rediss"
             nodes.append(ClusterNode(parsed.hostname or "", parsed.port or 6379))
         # Store retry policies must be the only authority for replaying
         # commands: a lost CAS/SET NX response cannot safely be replayed.
