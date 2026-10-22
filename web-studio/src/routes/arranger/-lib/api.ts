@@ -482,18 +482,22 @@ export async function moveLiveContext(
   mount: LiveContextMount,
   target: string,
 ): Promise<void> {
+  const sourceUri = normalizeVikingUri(mount.node_uri)
+  const targetUri = normalizeVikingUri(target)
+  if (sourceUri === targetUri) return
+
   const input: MountInput = {
     arguments: mount.arguments,
     description: mount.description,
-    node_uri: normalizeVikingUri(target),
+    node_uri: targetUri,
     tags: mount.tags,
     timeout_seconds: mount.timeout_seconds || 60,
-    title: mount.title || fileNameFromUri(mount.node_uri),
+    title: mount.title || fileNameFromUri(sourceUri),
     tool_uri: mount.tool_uri,
   }
   await mountLiveContext(input)
   try {
-    await unmountLiveContext(mount.node_uri)
+    await unmountLiveContext(sourceUri)
   } catch (error) {
     try {
       await unmountLiveContext(input.node_uri)

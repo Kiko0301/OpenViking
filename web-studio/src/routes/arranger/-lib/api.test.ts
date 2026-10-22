@@ -5,6 +5,7 @@ import type * as OvClientModule from '#/lib/ov-client'
 
 import {
   isLiveContextDocument,
+  moveLiveContext,
   parseLiveContextMetadata,
   parseMcpMounts,
   parseMcpServers,
@@ -68,6 +69,23 @@ describe('text saving', () => {
       saveText('viking://resources/arrange/note.md', 'content', '0'.repeat(64)),
     ).rejects.toBe(conflict)
     expect(post).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('live context moving', () => {
+  it('does nothing when the normalized target is the source', async () => {
+    await moveLiveContext(
+      {
+        arguments: {},
+        mcp: 'k8s',
+        node_uri: 'viking://resources/arranger/status.md',
+        tool: 'status',
+        tool_uri: 'viking://agent/tools/mcp/k8s/status.mcp',
+      },
+      'viking://resources/arranger/status.md/',
+    )
+
+    expect(post).not.toHaveBeenCalled()
   })
 })
 
