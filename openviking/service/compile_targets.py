@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Compile targets: registry, incremental lifecycle and per-file versions.
 
-State lives under ``/local/{account}/_system/compile/``: ``target_folders.json``
-(summary index), ``target_folders/{id}/state.json`` (source of truth),
+State lives under ``/local/{account}/_system/compile/``:
+``target_folders/{id}/state.json`` (source of truth, enumerated for summaries),
 ``target_folders/{id}/operations/{operation_id}.json`` (one record per directory operation),
 ``target_folders/{id}/operation_outputs/{operation_id}.json`` (immutable-path version references), and
 ``target_folders/{id}/file_versions/{sha256(uri)}.json`` (one version index per output
@@ -232,15 +232,14 @@ class CompileStateStore:
         self._agfs = agfs if isinstance(agfs, AsyncAGFSClient) else AsyncAGFSClient(agfs)
         self._cleanup_locks = KeyedAsyncLockPool()
         self._cleanup_scan: Optional[AsyncIterator[Optional[tuple[str, str, str]]]] = None
+        # shortcut: Locations refresh only on list; add invalidation when immediate freshness is required.
+        self._target_ids_by_to: Dict[str, Dict[str, str]] = {}
 
     # ---------- paths ----------
 
     @staticmethod
     def root(account_id: str) -> str:
         return f"/local/{account_id}/_system/compile"
-
-    def _targets_path(self, account_id: str) -> str:
-        return f"{self.root(account_id)}/target_folders.json"
 
     def _target_dir(self, account_id: str, target_id: str) -> str:
         return f"{self.root(account_id)}/target_folders/{target_id}"
@@ -288,26 +287,39 @@ class CompileStateStore:
         finally:
             await self._agfs.pathlock_release(lease)
 
-    # ---------- target_folders.json ----------
+    # ---------- target discovery ----------
 
     async def list_summaries(
         self, account_id: str, inherited_lease: Any = None
     ) -> List[Dict[str, Any]]:
-        path = self._targets_path(account_id)
-        async with self.locked(path, inherited_lease):
-            data = await self.read_json(path)
-            return [_normalize_schedule(item) for item in (data or {}).get("targets", [])]
+        """Summarize target states individually; the list is not a point-in-time snapshot.
 
-    async def _sync_summary(self, account_id: str, record: Dict[str, Any]) -> None:
-        """Update only this target's entry so concurrent writers never clobber each other."""
-        path = self._targets_path(account_id)
-        async with self.locked(path) as lease:
-            data = await self.read_json(path)
-            targets = [
-                item for item in (data or {}).get("targets", []) if item.get("id") != record["id"]
-            ]
-            targets.append(summarize(record))
-            await self.write_json(path, {"targets": targets}, lease)
+        Reuse a covering restore lease when supplied. Missing states are skipped;
+        other I/O and JSON errors propagate instead of hiding registered targets.
+        """
+        directory = f"{self.root(account_id)}/target_folders"
+        try:
+            entries = await self._agfs.ls(directory)
+        except (AGFSNotFoundError, FileNotFoundError):
+            self._target_ids_by_to.pop(account_id, None)
+            return []
+        summaries = []
+        for entry in entries:
+            target_id = str(entry.get("name") or "")
+            if not target_id.startswith("target_") or not entry.get(
+                "isDir", entry.get("is_dir", False)
+            ):
+                continue
+            path = self._record_path(account_id, target_id)
+            # AGFS writes may truncate in place, so read under the same file lock.
+            async with self.locked(path, inherited_lease):
+                record = await self.read_json(path)
+            if record is not None:
+                summaries.append(summarize(_normalize_schedule(record)))
+        self._target_ids_by_to[account_id] = {
+            item["to"]: item["id"] for item in reversed(summaries)
+        }
+        return summaries
 
     async def find_id(
         self, account_id: str, to: str, *, include_deleted: bool = False
@@ -326,12 +338,18 @@ class CompileStateStore:
     async def get_by_to(
         self, account_id: str, to: str, *, include_deleted: bool = False
     ) -> Optional[Dict[str, Any]]:
-        target_id = await self.find_id(account_id, to, include_deleted=include_deleted)
-        return await self.get(account_id, target_id) if target_id else None
+        """Read current state using list-cached locations, discovering uncached paths."""
+        target_id = self._target_ids_by_to.get(account_id, {}).get(to)
+        if target_id is None:
+            target_id = await self.find_id(account_id, to, include_deleted=include_deleted)
+        record = await self.get(account_id, target_id) if target_id else None
+        if record is not None and not include_deleted and record.get("status") != "active":
+            return None
+        return record
 
     @asynccontextmanager
     async def edit(self, account_id: str, target_id: str) -> AsyncIterator[Dict[str, Any]]:
-        """Yield the record under its lock; it is saved (and summarized) on clean exit."""
+        """Yield the record under its own PathLock and save it on clean exit."""
         path = self._record_path(account_id, target_id)
         async with self.locked(path) as lease:
             record = await self.get(account_id, target_id)
@@ -339,48 +357,47 @@ class CompileStateStore:
                 raise LookupError(f"Compile target not found: {target_id}")
             yield record
             await self.write_json(path, _normalize_schedule(record), lease)
-            await self._sync_summary(account_id, record)
 
     async def register(self, account_id: str, to: str) -> str:
-        """Activate the path's persistent identity, resetting deleted output state."""
-        path = self._targets_path(account_id)
-        async with self.locked(path) as lease:
-            data = await self.read_json(path)
-            targets = list((data or {}).get("targets", []))
-            existing = next((item["id"] for item in targets if item["to"] == to), None)
+        """Serialize path lookup and creation/reactivation across instances.
+
+        The coordination path is only a lock key; ordinary state updates take
+        only their state.json lock. Deleted targets retain their identity.
+        """
+        async with self.locked(f"{self.root(account_id)}/register.lock"):
+            existing = await self.find_id(account_id, to, include_deleted=True)
             if existing is None:
                 target_id = f"target_{uuid4().hex[:16]}"
                 record = new_record(target_id, to)
-                await self.write_json(self._record_path(account_id, target_id), record)
-                targets.append(summarize(record))
-                await self.write_json(path, {"targets": targets}, lease)
+                path = self._record_path(account_id, target_id)
+                async with self.locked(path) as lease:
+                    await self.write_json(path, record, lease)
                 return target_id
-        # State edits acquire the registry lock when saving, so release it first.
-        async with self.edit(account_id, existing) as record:
-            if record["status"] == "deleted":
-                defaults = new_record(existing, to)
-                for key in (
-                    "status",
-                    "initialized",
-                    "progress",
-                    "scheduled_progress",
-                    "schedule_configured",
-                    "versions_head",
-                    "active_task_id",
-                    "last_run",
-                    "content_updated_at",
-                    "conflicts_num",
-                    "last_error",
-                    "auto_update",
-                    "auto_update_enabled_at",
-                    "last_triggered_slot",
-                ):
-                    record[key] = defaults[key]
-                record["execution_context"]["credential"] = None
-        return existing
+            async with self.edit(account_id, existing) as record:
+                if record["status"] == "deleted":
+                    defaults = new_record(existing, to)
+                    for key in (
+                        "status",
+                        "initialized",
+                        "progress",
+                        "scheduled_progress",
+                        "schedule_configured",
+                        "versions_head",
+                        "active_task_id",
+                        "last_run",
+                        "content_updated_at",
+                        "conflicts_num",
+                        "last_error",
+                        "auto_update",
+                        "auto_update_enabled_at",
+                        "last_triggered_slot",
+                    ):
+                        record[key] = defaults[key]
+                    record["execution_context"]["credential"] = None
+            return existing
 
     async def mark_content_updated(self, account_id: str, target_id: str) -> None:
-        """Save the observed business-file change time and synchronize its summary."""
+        """Save the observed business-file change time in Unix seconds."""
         async with self.edit(account_id, target_id) as record:
             record["content_updated_at"] = time.time()
 

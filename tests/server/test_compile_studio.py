@@ -639,15 +639,13 @@ async def test_disabled_schedule_clears_legacy_state_and_lifecycle_changes(servi
     legacy = await store.get(account, target_id)
     legacy["update_schedule"] = schedule
     await store.write_json(path, legacy)
-    await store._sync_summary(account, legacy)
     assert (await store.get(account, target_id))["update_schedule"] is None
     assert (await store.list_summaries(account))[0]["update_schedule"] is None
     assert (await store.read_json(path))["update_schedule"] == schedule
     async with store.edit(account, target_id):
         pass
     assert (await store.read_json(path))["update_schedule"] is None
-    summaries = await store.read_json(store._targets_path(account))
-    assert summaries["targets"][0]["update_schedule"] is None
+    assert (await store.list_summaries(account))[0]["update_schedule"] is None
 
     scheduler = scheduling.CompileScheduler(service.compile, store, service.viking_fs)
     now = datetime(2026, 10, 22, 12, tzinfo=scheduling.TZ)
