@@ -680,7 +680,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             execute_started_at = time.perf_counter()
             if embedding_msg.queue_enqueued_at > 0:
                 queue_wait_ms = max((time.time() - embedding_msg.queue_enqueued_at) * 1000.0, 0.0)
-            inserted_data = embedding_msg.context_data
+            inserted_data = dict(embedding_msg.context_data)
             write_source = inserted_data.pop("_write_source", "")
             logger.debug(
                 "Processing embedding message: %s action=%s",

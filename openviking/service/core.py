@@ -9,7 +9,7 @@ Main service class that composes all sub-services and manages infrastructure lif
 import asyncio
 import inspect
 import os
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from openviking.core.directories import DirectoryInitializer
 from openviking.privacy.sanitizer import PrivacySanitizer
@@ -446,7 +446,9 @@ class OpenVikingService:
         """Get the Compile task service."""
         return self._compile_service
 
-    async def initialize(self) -> None:
+    async def initialize(
+        self, *, before_background_start: Optional[Callable[[], Awaitable[None]]] = None
+    ) -> None:
         """Initialize OpenViking storage and indexes."""
         if self._initialized:
             logger.debug("Already initialized")
@@ -596,6 +598,9 @@ class OpenVikingService:
             viking_fs=self._viking_fs,
             session_service=self._session_service,
         )
+        # Install optional server write guards before any producer or consumer starts.
+        if before_background_start is not None:
+            await before_background_start()
         try:
             session_auto_commit_config = get_openviking_config().memory.session_auto_commit
         except Exception:

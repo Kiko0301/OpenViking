@@ -323,8 +323,10 @@ async def test_slow_init_does_not_block_health(monkeypatch):
         assert elapsed < 0.5
 
 
-async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
+@pytest.mark.parametrize("ttl_enabled", [False, True])
+async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch, ttl_enabled):
     """The auth plugin must publish its manager before deletion setup."""
+    events = []
 
     class MockService:
         def __init__(self):
@@ -332,14 +334,19 @@ async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
             self.viking_fs = object()
             self._queue_manager = None
 
-        async def initialize(self):
+        async def initialize(self, **kwargs):
+            if ttl_enabled:
+                await kwargs["before_background_start"]()
+            else:
+                assert not kwargs
+            events.append("workers")
             self._initialized = True
 
         async def apply_agent_evolution_config(self):
             pass
 
     manager = SimpleNamespace(resolve_identity=Mock(), get_user_group_ids=Mock())
-    ttl_init = AsyncMock()
+    ttl_init = AsyncMock(side_effect=lambda *args: events.append("ttl"))
     monkeypatch.setattr("openviking.server.app._initialize_ttl_adapter", ttl_init)
     setup = AsyncMock(return_value=None)
     monkeypatch.setattr("openviking.service.deletion.setup_deletion", setup)
@@ -352,10 +359,14 @@ async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
     app = SimpleNamespace(state=SimpleNamespace(api_key_manager=None))
     service = MockService()
     service.compile_scheduler = SimpleNamespace(set_identity_resolver=Mock())
-    config = ServerConfig(root_api_key="root-key-for-test")
+    config = ServerConfig(
+        root_api_key="root-key-for-test",
+        ttl_adapter={"class_path": "example.Adapter"} if ttl_enabled else None,
+    )
 
     await _initialize_runtime_state(app, service, config)
 
+    assert events == (["ttl", "workers"] if ttl_enabled else ["workers", "ttl"])
     assert service._initialized is True
     assert app.state.api_key_manager is manager
     assert setup.await_args.kwargs["manager"] is manager

@@ -200,10 +200,19 @@ async def _initialize_runtime_state(
     config: ServerConfig,
 ) -> None:
     """Initialize service and auth dependencies before traffic is accepted."""
-    await service.initialize()
-    await service.apply_agent_evolution_config()
-    await _initialize_auth_plugin(app, service, config)
-    await _initialize_ttl_adapter(app, service, config)
+    if config.ttl_adapter is not None and config.ttl_adapter.class_path:
+
+        async def install_write_guards():
+            await _initialize_auth_plugin(app, service, config)
+            await _initialize_ttl_adapter(app, service, config)
+
+        await service.initialize(before_background_start=install_write_guards)
+        await service.apply_agent_evolution_config()
+    else:
+        await service.initialize()
+        await service.apply_agent_evolution_config()
+        await _initialize_auth_plugin(app, service, config)
+        await _initialize_ttl_adapter(app, service, config)
     manager = getattr(app.state, "api_key_manager", None)
     compile_scheduler = getattr(service, "compile_scheduler", None)
     if manager is not None and compile_scheduler is not None:
