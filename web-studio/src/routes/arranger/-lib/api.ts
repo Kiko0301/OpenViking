@@ -2,6 +2,7 @@ import { sha256 } from '@noble/hashes/sha2.js'
 import { bytesToHex } from '@noble/hashes/utils.js'
 import { parse as parseYaml } from 'yaml'
 
+import i18n from '#/i18n/core'
 import {
   getFsStat,
   getOvClient,
@@ -56,13 +57,21 @@ function apiBaseUrl(): string {
   return getOvClient().getOptions().baseUrl
 }
 
-function invalidApiResponse(resource: string, value: unknown): Error {
+type ApiResource =
+  | 'filesystemStat'
+  | 'mcpMountList'
+  | 'mcpServerList'
+  | 'mcpToolCatalog'
+
+function invalidApiResponse(resource: ApiResource, value: unknown): Error {
   if (typeof value === 'string' && /<!doctype\s+html|<html[\s>]/i.test(value)) {
-    return new Error(
-      'Received the Studio HTML page instead of OpenViking API data. Configure the OpenViking server URL in Connection Settings.',
-    )
+    return new Error(i18n.t('arranger:errors.studioHtmlResponse'))
   }
-  return new Error(`Invalid ${resource} response from OpenViking`)
+  return new Error(
+    i18n.t('arranger:errors.invalidApiResponse', {
+      resource: i18n.t(`arranger:apiResources.${resource}`),
+    }),
+  )
 }
 
 export function parseMcpServers(value: unknown): Array<{ name: string }> {
@@ -74,7 +83,7 @@ export function parseMcpServers(value: unknown): Array<{ name: string }> {
         Array.isArray(value.servers)
       ? value.servers
       : null
-  if (!servers) throw invalidApiResponse('MCP server list', value)
+  if (!servers) throw invalidApiResponse('mcpServerList', value)
   if (
     servers.some(
       (server) =>
@@ -85,7 +94,7 @@ export function parseMcpServers(value: unknown): Array<{ name: string }> {
         !server.name,
     )
   ) {
-    throw invalidApiResponse('MCP server list', value)
+    throw invalidApiResponse('mcpServerList', value)
   }
   return servers as Array<{ name: string }>
 }
@@ -99,7 +108,7 @@ export function parseMcpMounts(value: unknown): LiveContextMount[] {
         Array.isArray(value.mounts)
       ? value.mounts
       : null
-  if (!mounts) throw invalidApiResponse('MCP mount list', value)
+  if (!mounts) throw invalidApiResponse('mcpMountList', value)
   return mounts as LiveContextMount[]
 }
 
@@ -114,7 +123,7 @@ export function parseMcpTools(
     Array.isArray(value.tools)
       ? value.tools
       : null
-  if (!tools) throw invalidApiResponse('MCP tool catalog', value)
+  if (!tools) throw invalidApiResponse('mcpToolCatalog', value)
   return tools.map((document) => {
     if (
       !document ||
@@ -125,7 +134,7 @@ export function parseMcpTools(
       !('name' in document.tool) ||
       typeof document.tool.name !== 'string'
     ) {
-      throw invalidApiResponse('MCP tool catalog', value)
+      throw invalidApiResponse('mcpToolCatalog', value)
     }
     const tool = document.tool as Record<string, unknown>
     const name = tool.name as string
@@ -194,7 +203,7 @@ export async function statResource(uri: string): Promise<VikingFsEntry> {
     typeof result !== 'object' ||
     (!('isDir' in result) && !('is_dir' in result))
   ) {
-    throw invalidApiResponse('filesystem stat', result)
+    throw invalidApiResponse('filesystemStat', result)
   }
   return {
     abstract: String(result.abstract ?? ''),
@@ -552,7 +561,9 @@ async function assertOrdinaryFile(uri: string): Promise<void> {
   if (!uri.toLowerCase().endsWith('.md')) return
   const document = await readTextDocument(uri)
   if (isLiveContextDocument(document.content)) {
-    throw new Error(`Live context node requires mount/unmount: ${uri}`)
+    throw new Error(
+      i18n.t('arranger:errors.liveContextMutationRequired', { uri }),
+    )
   }
 }
 
@@ -566,13 +577,13 @@ export async function preflightOrdinaryMutation(options: {
   const { liveIndex, rootUri, source, target } = options
   assertMutationBoundary(source.uri, target, rootUri)
   if (!liveIndex.complete) {
-    throw new Error('Live context mounts are incomplete; mutation is blocked')
+    throw new Error(i18n.t('arranger:errors.mountInventoryIncomplete'))
   }
   if (liveIndex.mounts.has(normalizeVikingUri(source.uri))) {
-    throw new Error('Live context nodes require mount/unmount')
+    throw new Error(i18n.t('arranger:errors.liveContextMutationOnly'))
   }
   if (target && liveIndex.mounts.has(normalizeVikingUri(target))) {
-    throw new Error('The destination is a live context node')
+    throw new Error(i18n.t('arranger:errors.destinationLiveContext'))
   }
 
   if (!source.isDir) {
@@ -582,7 +593,7 @@ export async function preflightOrdinaryMutation(options: {
 
   const prefix = `${normalizeVikingUri(source.uri)}/`
   if ([...liveIndex.mounts.keys()].some((uri) => uri.startsWith(prefix))) {
-    throw new Error('This directory contains live context nodes')
+    throw new Error(i18n.t('arranger:errors.directoryContainsLiveContext'))
   }
 
   let offset = 0
@@ -597,12 +608,14 @@ export async function preflightOrdinaryMutation(options: {
       )
     } catch (error) {
       throw new Error(
-        `Unable to complete live context preflight: ${normalizeOvClientError(error).message}`,
+        i18n.t('arranger:errors.preflightFailedWithDetail', {
+          detail: normalizeOvClientError(error).message,
+        }),
       )
     }
     if (!page.hasMore) return
     if (page.nextOffset <= offset) {
-      throw new Error('Unable to complete live context preflight')
+      throw new Error(i18n.t('arranger:errors.preflightFailed'))
     }
     offset = page.nextOffset
   }

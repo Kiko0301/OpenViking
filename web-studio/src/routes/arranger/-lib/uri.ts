@@ -1,15 +1,17 @@
+import i18n from '#/i18n/core'
+
 const VIKING_URI = /^viking:\/\/([a-zA-Z0-9._-]+)(?:\/(.*))?$/
 
 export function normalizeVikingUri(value: string): string {
   const trimmed = value.trim().replace(/\/+$/, '')
   const match = VIKING_URI.exec(trimmed)
   if (!match || !match[1]) {
-    throw new Error('A valid viking:// URI is required')
+    throw new Error(i18n.t('arranger:validation.validVikingUri'))
   }
 
   const segments = (match[2] || '').split('/').filter(Boolean)
   if (segments.some((segment) => segment === '.' || segment === '..')) {
-    throw new Error('Relative path segments are not allowed')
+    throw new Error(i18n.t('arranger:validation.noRelativePathSegments'))
   }
   return `viking://${match[1]}${segments.length ? `/${segments.join('/')}` : ''}`
 }
@@ -43,7 +45,7 @@ export function joinVikingUri(parent: string, name: string): string {
     cleanName === '.' ||
     cleanName === '..'
   ) {
-    throw new Error('Name must be one path segment')
+    throw new Error(i18n.t('arranger:validation.singlePathSegment'))
   }
   return `${normalizeVikingUri(parent)}/${cleanName}`
 }
@@ -90,16 +92,16 @@ export function assertMutationBoundary(
 ): void {
   const root = normalizeVikingUri(rootUri)
   if (normalizeVikingUri(source) === root) {
-    throw new Error('The loaded root cannot be changed')
+    throw new Error(i18n.t('arranger:validation.rootImmutable'))
   }
   if (target && !isWithinRoot(target, root)) {
-    throw new Error('The destination must stay inside the loaded root')
+    throw new Error(i18n.t('arranger:validation.destinationOutsideRoot'))
   }
   if (
     target &&
     (normalizeVikingUri(target) === normalizeVikingUri(source) ||
       normalizeVikingUri(target).startsWith(`${normalizeVikingUri(source)}/`))
   ) {
-    throw new Error('A directory cannot be moved into itself')
+    throw new Error(i18n.t('arranger:validation.destinationInsideSource'))
   }
 }

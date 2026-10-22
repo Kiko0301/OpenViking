@@ -150,10 +150,29 @@ const arranger = {
       description: 'Choose the new URI inside the loaded root.',
     },
   },
+  apiResources: {
+    filesystemStat: 'filesystem stat',
+    mcpMountList: 'MCP mount list',
+    mcpServerList: 'MCP server list',
+    mcpToolCatalog: 'MCP tool catalog',
+  },
   errors: {
+    destinationLiveContext: 'The destination is a live context node',
+    directoryContainsLiveContext: 'This directory contains live context nodes',
+    invalidApiResponse: 'Invalid {{resource}} response from OpenViking',
+    liveContextMutationOnly: 'Live context nodes require mount/unmount',
+    liveContextMutationRequired:
+      'Live context node requires mount/unmount: {{uri}}',
     loadRoot: 'Could not load root',
+    mountInventoryIncomplete:
+      'Live context mounts are incomplete; mutation is blocked',
+    preflightFailed: 'Unable to complete live context preflight',
+    preflightFailedWithDetail:
+      'Unable to complete live context preflight: {{detail}}',
     read: 'Could not read this file',
     rootNotDirectory: 'The selected root is not a directory',
+    studioHtmlResponse:
+      'Received the Studio HTML page instead of OpenViking API data. Configure the OpenViking server URL in Connection Settings.',
   },
   messages: {
     deleted: 'Resource deleted',
@@ -162,8 +181,14 @@ const arranger = {
     invalidArguments: 'Check required tool arguments and their data formats.',
     invalidTimeout: 'Timeout must be a number greater than 0.',
     mountRequired: 'Name, tool, and title are required.',
+    destinationInsideSource: 'A directory cannot be moved into itself.',
+    destinationOutsideRoot: 'The destination must stay inside the loaded root.',
+    noRelativePathSegments: 'Relative path segments are not allowed.',
     required: 'This argument is required.',
+    rootImmutable: 'The loaded root cannot be changed.',
     selectTool: 'Select a valid MCP tool.',
+    singlePathSegment: 'Name must be one path segment.',
+    validVikingUri: 'A valid viking:// URI is required.',
   },
   values: {
     false: 'No',

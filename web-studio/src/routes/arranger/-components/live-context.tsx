@@ -15,6 +15,7 @@ import { useTranslation } from 'react-i18next'
 import { Badge } from '#/components/ui/badge'
 import { Button } from '#/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '#/components/ui/tabs'
+import { formatDateTime } from '#/i18n/format'
 import { cn } from '#/lib/utils'
 
 import { parseLiveContextMetadata, readLiveContext } from '../-lib/api'
@@ -65,9 +66,14 @@ export function LiveContextInspector({
               <p className="mt-0.5 text-xs text-muted-foreground">
                 {resultQuery.dataUpdatedAt
                   ? t('live.updatedAt', {
-                      value: new Date(
-                        resultQuery.dataUpdatedAt,
-                      ).toLocaleTimeString(),
+                      value: formatDateTime(
+                        new Date(resultQuery.dataUpdatedAt),
+                        {
+                          hour: 'numeric',
+                          minute: '2-digit',
+                          second: '2-digit',
+                        },
+                      ),
                     })
                   : t('live.resultDescription')}
               </p>

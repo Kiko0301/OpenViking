@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import i18n from '#/i18n/core'
 import { OvClientError } from '#/lib/ov-client'
 import type * as OvClientModule from '#/lib/ov-client'
 
@@ -113,10 +114,14 @@ describe('MCP response parsing', () => {
   })
 
   it('reports a connection error when Vite HTML is returned', () => {
-    expect(() => parseMcpServers('<!doctype html><html></html>')).toThrow(
-      /Studio HTML page/,
+    expect(() => parseMcpServers('<!doctype html><html></html>')).toThrowError(
+      i18n.t('arranger:errors.studioHtmlResponse'),
     )
-    expect(() => parseMcpServers(undefined)).toThrow(/Invalid MCP server list/)
+    expect(() => parseMcpServers(undefined)).toThrowError(
+      i18n.t('arranger:errors.invalidApiResponse', {
+        resource: i18n.t('arranger:apiResources.mcpServerList'),
+      }),
+    )
   })
 
   it('normalizes tool documents into selectable catalog entries', () => {
