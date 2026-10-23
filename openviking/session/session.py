@@ -761,7 +761,13 @@ class Session:
             session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
         )
         try:
-            from openviking.ttl.wiring import get_ttl_adapter
+            from openviking.ttl.wiring import bind_write_owner, get_ttl_adapter
+
+            if not filenames:
+                # Phase 1 writes different child files, each with its own lock.
+                with bind_write_owner(self._viking_fs, self._session_uri, self.ctx, session_lease):
+                    yield session_lease
+                return
 
             adapter = get_ttl_adapter()
             if adapter is not None and await adapter.requires_existing_session(
@@ -1266,11 +1272,7 @@ class Session:
         if await self._archives.file_exists(archive_uri, ".failed.json"):
             return False
 
-        session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
-        try:
+        async with self._state_lock():
             marker = await self._read_phase1_meta(archive_uri)
             if marker.get("status") == "ready":
                 return True
@@ -1365,8 +1367,6 @@ class Session:
             await self._write_phase1_ready_marker(archive_uri)
             logger.warning("Recovered interrupted Session Phase 1: %s", archive_uri)
             return True
-        finally:
-            await self._viking_fs._async_agfs.pathlock_release(lease)
 
     def commit(
         self,
@@ -1516,12 +1516,8 @@ class Session:
         # The exact lock on the Session directory is the mutex for root Session
         # state and archive-number allocation. Child files use their own exact
         # locks, so Phase 2 can keep writing an earlier archive concurrently.
-        session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
         publication_lease: Optional[Any] = None
-        try:
+        async with self._state_lock():
             self._messages = await self._read_live_messages_strict()
             await self._load_meta()
             if (
@@ -1806,8 +1802,6 @@ class Session:
                         )
                     publication_lease = None
                 raise
-        finally:
-            await self._viking_fs._async_agfs.pathlock_release(lease)
         # Lock released; Phase 1 intent, retained root, metadata and ready
         # metadata are durable before Task-store or QueueFS latency.
 

@@ -468,11 +468,16 @@ class DirectoryTTL:
             raise NotFoundError(item[2], "expired directory")
         agfs = self.fs._async_agfs
         path = self.fs._uri_to_path(uri, ctx=ctx)
+        from openviking.ttl.wiring import get_write_owner
+
+        held = get_write_owner(self.fs, item[2], ctx, lease_ref)
         # Unit lock lives beside a missing unit, so checking before the leaf
         # lock cannot recreate a deleted Session/date through lock sidecars.
-        unit = await agfs.pathlock_acquire_exact(
-            self.fs._uri_to_path(item[2], ctx=ctx), owner_lease_ref=lease_ref
-        )
+        unit = held
+        if unit is None:
+            unit = await agfs.pathlock_acquire_exact(
+                self.fs._uri_to_path(item[2], ctx=ctx), owner_lease_ref=lease_ref
+            )
         try:
             if require_exists:
                 await self.fs.stat(uri, ctx=ctx, skip_count=True)
@@ -492,13 +497,19 @@ class DirectoryTTL:
                 else ""
             )
             async with self.source_guard(source, ctx, unit):
+                if held is not None:
+                    # The caller holds the unit mutex; native writes still
+                    # acquire covering leaf locks, independently for each file.
+                    yield None
+                    return
                 lease = await agfs.pathlock_acquire_exact(path, owner_lease_ref=unit)
                 try:
                     yield lease
                 finally:
                     await agfs.pathlock_release(lease)
         finally:
-            await agfs.pathlock_release(unit)
+            if held is None:
+                await agfs.pathlock_release(unit)
 
     async def on_post_write(self, uri: str, ctx: RequestContext | None, written_at_ms: int) -> None:
         if not self.writer or ctx is None:
@@ -1068,9 +1079,14 @@ class DirectoryTTL:
             yield
             return
         agfs = self.fs._async_agfs
-        lease = await agfs.pathlock_acquire_exact(
-            self.fs._uri_to_path(item[2], ctx=ctx), owner_lease_ref=lease_ref
-        )
+        from openviking.ttl.wiring import get_write_owner
+
+        held = get_write_owner(self.fs, item[2], ctx, lease_ref)
+        lease = held
+        if lease is None:
+            lease = await agfs.pathlock_acquire_exact(
+                self.fs._uri_to_path(item[2], ctx=ctx), owner_lease_ref=lease_ref
+            )
         try:
             await self.fs.stat(source_uri, ctx=ctx, skip_count=True)
             if task_id is None:
@@ -1085,4 +1101,5 @@ class DirectoryTTL:
                     raise NotFoundError(source_uri, "stale Session commit task")
             yield
         finally:
-            await agfs.pathlock_release(lease)
+            if held is None:
+                await agfs.pathlock_release(lease)
