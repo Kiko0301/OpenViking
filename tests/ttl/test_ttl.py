@@ -247,6 +247,7 @@ async def test_disabled_account_no_io(engine):
     e = engine
     e.pair = (TTLConfig(sessions=7), TTLConfig(sessions="disabled"))
     e.client = AsyncMock(side_effect=AssertionError("off path touched Redis"))
+    e._dispatcher.run = AsyncMock(side_effect=AssertionError("off path dispatched TTL work"))
     uri = "viking://user/u/sessions/s"
     await e.on_post_write(uri + "/messages.jsonl", e.context("a"), 1)
     assert await e.resolve_expires_at([uri], e.context("a")) == {uri: None}
@@ -255,6 +256,7 @@ async def test_disabled_account_no_io(engine):
     async with e.write_guard(uri + "/messages.jsonl", e.context("a")):
         pass
     e.client.assert_not_called()
+    e._dispatcher.run.assert_not_called()
     assert not e._retry and not e._wake.is_set()
     e.fs.stat.assert_not_called()
     e.fs._async_agfs.pathlock_acquire_tree.assert_not_called()

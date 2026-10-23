@@ -34,6 +34,7 @@ from openviking.scheduling.expiry.config import ExpiryRedisConfig
 from openviking.scheduling.expiry.redis_store import create_redis_client
 from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
 from openviking.ttl.adapter import TTLBackfillRequest, TTLRecycleRequest, TTLRecycleResult
 from openviking_cli.exceptions import (
     ConflictError,
@@ -178,8 +179,11 @@ class DirectoryTTL:
         self._initial_requests: set[str] = set()
         self._recycle: set[str] = set()
         self._recycle_after_ms = 0
+        self._dispatcher = OwnerLoopDispatcher()
 
     def bind_runtime(self, service: OpenVikingService, account_manager: APIKeyManager) -> None:
+        # Bind before queue workers can invoke the write hooks.
+        self._dispatcher.bind_current_loop()
         self.fs = service.viking_fs
         self.manager = service.runtime_config_manager
         self.account_manager = account_manager
@@ -361,12 +365,15 @@ class DirectoryTTL:
             account_id, lambda v: (v.cluster.ttl, v.account.ttl)
         )
         if self.writer and account_id not in self._recovered and self.enabled(pair):
-            # Hot scopes can request initial registration; cold scopes recover
-            # through expiry's durable tasks without startup enumeration.
+            await self._dispatcher.run(lambda: self._recover(account_id))
+        return pair
+
+    async def _recover(self, account_id: str) -> None:
+        # Queue threads may discover the same scope before the owner runs this.
+        if account_id not in self._recovered:
             self._recovered.add(account_id)
             self._initial_requests.add(account_id)
             self._wake_worker()
-        return pair
 
     @staticmethod
     def policy_roots(pair: tuple[TTLConfig | None, TTLConfig | None]) -> list[str]:
@@ -405,6 +412,7 @@ class DirectoryTTL:
         return self.redis
 
     async def start(self) -> None:
+        self._dispatcher.bind_current_loop()
         self._closed = False
         self._started = True
         self._recycle_after_ms = next_check_ms(self.resource_id, time.time_ns() // 1_000_000)
@@ -502,15 +510,19 @@ class DirectoryTTL:
         if not resolve_effective_ttl(*pair, item[1]).enabled:
             return
         base = written_at_ms if item[0] == "sessions" else self.base(item)
-        key = (ctx.account_id, item[0], item[2])
+        await self._dispatcher.run(
+            lambda: self._enqueue_registration((ctx.account_id, item[0], item[2]), base)
+        )
+
+    async def _enqueue_registration(self, key: tuple[str, TTLIndexType, str], base: int) -> None:
         # Only an in-memory merge on the write path. The worker owns Redis I/O.
         old = self._retry.get(key)
         if old is None and len(self._retry) >= self.retry_limit:
             self.registration_dropped_total += 1
             logger.error(
                 "TTL event=registration_dropped scope=%s uri=%s pending=%s dropped_total=%s",
-                ctx.account_id,
-                uri,
+                key[0],
+                key[2],
                 len(self._retry),
                 self.registration_dropped_total,
             )

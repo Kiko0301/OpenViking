@@ -306,6 +306,7 @@ class ExpiryRuntime:
         self._publisher: ExpiryPublisher | None = None
         self._consumers: dict[str, ExpiryConsumer] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._role_loop: asyncio.AbstractEventLoop | None = None
         self._stop = asyncio.Event()
         self._storage_started = False
         self._storage_closed = False
@@ -383,6 +384,7 @@ class ExpiryRuntime:
         if self._state.accepting_calls:
             return
         bindings = self._registry.freeze()
+        self._role_loop = asyncio.get_running_loop()
         self._stop.clear()
         if self._roles.publish:
             self._publisher = ExpiryPublisher(
@@ -396,6 +398,10 @@ class ExpiryRuntime:
         self._state.accepting_calls = True
 
     def _start_consumer(self, item_type: str) -> None:
+        # Reports can arrive from QueueManager loops; roles belong to startup's loop.
+        if self._role_loop is not None and asyncio.get_running_loop() is not self._role_loop:
+            self._role_loop.call_soon_threadsafe(self._start_consumer, item_type)
+            return
         name = f"callback:{item_type}"
         if not self._roles.consume or self._stop.is_set() or name in self._tasks:
             return

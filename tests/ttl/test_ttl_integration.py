@@ -15,6 +15,87 @@ from openviking_cli.utils.config.ttl_config import TTLConfig
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.skipif(not os.environ.get("TTL_TEST_REDIS"), reason="requires an isolated local Redis")
+async def test_real_queue_writes_keep_ttl_on_service_loop(tmp_path, enabled):
+    import asyncio
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+    from uuid import uuid4
+
+    from openviking.storage.queuefs.named_queue import DequeueHandlerBase
+    from openviking.storage.queuefs.process_result import ProcessResult
+    from openviking.storage.queuefs.queue_manager import QueueManager
+
+    agfs = create_agfs_client(
+        RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path), backend="local"))
+    )
+    fs = VikingFS(agfs=agfs)
+    engine = DirectoryTTL(
+        resource_id="queue-loop-" + uuid4().hex,
+        redis={"endpoints": [os.environ["TTL_TEST_REDIS"]]},
+        timezone_name="UTC",
+    )
+    pair = (TTLConfig(sessions=1, user_events=1) if enabled else TTLConfig(), None)
+    engine.bind_runtime(
+        SimpleNamespace(
+            viking_fs=fs,
+            runtime_config_manager=SimpleNamespace(resolve_account=AsyncMock(return_value=pair)),
+        ),
+        None,
+    )
+    install_ttl_hook(fs, engine)
+    await engine.start()
+    owner = asyncio.get_running_loop()
+    session = "viking://user/u/sessions/one"
+    event = "viking://user/u/memories/events/" + datetime.now(timezone.utc).strftime("%Y/%m/%d")
+    queue_loops = []
+
+    class Writer(DequeueHandlerBase):
+        async def on_dequeue(self, data):
+            queue_loops.append(asyncio.get_running_loop())
+            await fs.write_file(session + "/messages.jsonl", "first", ctx=engine.context("a"))
+            await fs.append_file(session + "/messages.jsonl", "second", ctx=engine.context("a"))
+            await fs.write_file(event + "/event.md", "event", ctx=engine.context("a"))
+            return ProcessResult.success()
+
+    queues = QueueManager(agfs, max_concurrent_session_commit=2)
+    queues._REQUEUE_POLL_INTERVAL = 0.01
+    queue = queues.get_queue(queues.SESSION_COMMIT, dequeue_handler=Writer(), allow_create=True)
+    raw = None
+    try:
+        if enabled:
+            raw = await engine.client()
+            await raw.ping()  # Bind a real connection to the service loop before the queue writes.
+        await queue.enqueue({"test": "ttl-write"})
+        queues.start()
+        async with asyncio.timeout(5):
+            while (await queue.get_status()).processed != 1:
+                await asyncio.sleep(0.01)
+        assert queue_loops and queue_loops[0] is not owner
+        await asyncio.to_thread(queues.stop)
+        if enabled:
+            async with asyncio.timeout(5):
+                while engine._retry or (await engine.read_initial("a"))["done"] is not True:
+                    await asyncio.sleep(0.01)
+            assert engine._task.get_loop() is owner
+            assert engine._registration_task.get_loop() is owner
+            assert await raw.zscore(engine.prefix("a") + "sessions", session) is not None
+            assert await raw.zscore(engine.prefix("a") + "user_events", event) is not None
+            echo = await engine.resolve_expires_at([session, event], engine.context("a"))
+            assert echo[session] and echo[event]
+        else:
+            assert engine.redis is engine._task is engine._registration_task is None
+            assert not engine._retry and not engine._initial_requests
+    finally:
+        await asyncio.to_thread(queues.stop)
+        if raw is not None:
+            async for key in raw.scan_iter(match=engine.prefix("a") + "*"):
+                await raw.delete(key)
+        await engine.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(not os.environ.get("TTL_TEST_REDIS"), reason="requires an isolated local Redis")
 async def test_real_registration_reset_recycle(tmp_path):
     from uuid import uuid4
@@ -515,9 +596,11 @@ async def test_http_configuration_initial_and_lifecycle(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint_env", ["TTL_TEST_REDIS", "TTL_TEST_CLUSTER"])
 async def test_consumer_starts_on_registration_and_recovers_activation(endpoint_env):
+    import asyncio
     from unittest.mock import AsyncMock
     from uuid import uuid4
 
+    from openviking.scheduling.expiry.api import ExpiryRegistration
     from openviking.scheduling.expiry.config import ExpiryConfig
     from openviking.scheduling.expiry.keys import ExpiryKeys, encode_component
     from openviking.scheduling.expiry.runtime import ExpiryRuntime, ExpiryRuntimeRoles
@@ -550,7 +633,16 @@ async def test_consumer_starts_on_registration_and_recovers_activation(endpoint_
             if not replacement:
                 assert list(runtime._consumers) == ["session"]
                 assert list(runtime._tasks) == ["callback:session"]
-                await engine._schedule("a")
+                # Producers really report from their own event loops (queue workers).
+                await asyncio.to_thread(
+                    lambda runtime=runtime: asyncio.run(
+                        runtime.scheduler.report(
+                            ExpiryRegistration(
+                                engine._identity("a"), due_at_ms=1, timeout_seconds=3600
+                            )
+                        )
+                    )
+                )
                 assert (
                     await raw.hget(
                         ExpiryKeys(encode_component(rid)).namespace(), "consumer_enabled:ttl"
@@ -558,6 +650,7 @@ async def test_consumer_starts_on_registration_and_recovers_activation(endpoint_
                     == "1"
                 )
             assert list(runtime._consumers) == ["session", "ttl"]
+            assert runtime._tasks["callback:ttl"].get_loop() is asyncio.get_running_loop()
             await runtime.stop_roles(keep_reporting=True)
             await engine._schedule("b", force=True)
             assert not runtime._tasks  # Producer drain must not restart consumption.
