@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sqlalchemy import and_, case, delete, func, select, update
+from sqlalchemy import and_, case, delete, exists, func, insert, literal, select, update
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import (
@@ -66,6 +66,7 @@ from openviking_cli.utils.config.config_utils import normalize_service_name
 
 _MYSQL_IDENTIFIER_MAX_LENGTH = MAX_IDENTIFIER_LENGTH
 _RETAINED_REVOKED_CREDENTIALS = 10
+_DEFAULT_ACCOUNT_ID = "default"
 
 
 def _validate_length(value: str, name: str) -> None:
@@ -326,6 +327,17 @@ class MySQLAccountStore(AccountStore):
             async with sessions() as session:
                 for model in (Account, User, Group, GroupMember, Credential):
                     await session.execute(select(*model.__table__.columns).limit(1))
+                await session.execute(
+                    insert(Account)
+                    .prefix_with("IGNORE", dialect="mysql")
+                    .from_select(
+                        ["service_name", "account_id"],
+                        select(literal(self._service_name), literal(_DEFAULT_ACCOUNT_ID)).where(
+                            ~exists().where(Account.service_name == self._service_name)
+                        ),
+                    )
+                )
+                await session.commit()
         except ImportError:
             await wait_mysql_cleanup(cleanup_failed_load())
             raise RuntimeError("MySQL account storage requires openviking[mysql]") from None

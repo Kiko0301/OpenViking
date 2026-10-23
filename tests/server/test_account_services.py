@@ -274,6 +274,52 @@ async def test_regenerate_key_preserves_management_not_found_errors():
         await manager.regenerate_key("acme", "missing")
 
 
+async def test_mysql_load_creates_default_account():
+    raw_mysql = os.environ.get("OV_TEST_MYSQL")
+    if not raw_mysql:
+        pytest.skip("Set OV_TEST_MYSQL to exercise MySQL account-store startup")
+
+    service_name = f"test-{uuid4().hex}"
+    manager = build_api_key_manager(
+        "root",
+        None,
+        service_name=service_name,
+        account_store_provider="mysql",
+        account_store_params=json.loads(raw_mysql),
+    )
+    mysql = manager._store
+    engine = create_async_engine(mysql._url, **mysql._engine_options)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        await manager.load()
+
+        accounts = await manager.list_accounts()
+        assert [account["account_id"] for account in accounts] == ["default"]
+        assert accounts[0]["user_count"] == 0
+        await manager.close()
+        await manager.load()
+
+        async with engine.connect() as connection:
+            assert (
+                await connection.scalar(
+                    select(func.count())
+                    .select_from(Account)
+                    .where(
+                        Account.service_name == service_name,
+                        Account.account_id == "default",
+                    )
+                )
+                == 1
+            )
+    finally:
+        await manager.close()
+        async with engine.begin() as connection:
+            await connection.execute(delete(Account).where(Account.service_name == service_name))
+        await engine.dispose()
+
+
 async def test_distributed_authentication_state_is_shared_and_service_scoped():
     """Key rotation and group deletion refresh caches within the owning service."""
     raw_mysql = os.environ.get("OV_TEST_MYSQL")
