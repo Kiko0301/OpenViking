@@ -25,6 +25,7 @@ _KIND_TAG_KEY = "ov-cac-kind"
 _SPEC_TAG_KEY = "ov-cac-spec"
 _RESERVED_TAG_KEYS = frozenset({_OWNER_TAG_KEY, _KIND_TAG_KEY, _SPEC_TAG_KEY})
 _OWNER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_USER_ID_RE = re.compile(r"^[a-zA-Z0-9_.@-]+$")
 _TOOL_URI_RE = re.compile(r"^viking://agent/tools/(?P<server>[^/]+)/(?P<tool>[^/]+)\.json$")
 
 
@@ -128,6 +129,22 @@ class ContextApplyResult:
         }
 
 
+def _is_context_resource_root(uri: str) -> bool:
+    if not uri.startswith("viking://"):
+        return False
+    parts = uri[len("viking://") :].split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return False
+    if parts[:1] == ["resources"]:
+        return True
+    return (
+        len(parts) >= 3
+        and parts[0] == "user"
+        and _USER_ID_RE.fullmatch(parts[1]) is not None
+        and parts[2] == "resources"
+    )
+
+
 class _ContextArrangerBase:
     def __init__(
         self,
@@ -151,10 +168,11 @@ class _ContextArrangerBase:
         )
         self.name = normalized_name
         self.root_uri = VikingURI.normalize(root_uri).rstrip("/")
-        if self.root_uri != "viking://resources" and not self.root_uri.startswith(
-            "viking://resources/"
-        ):
-            raise ValueError("Context project root_uri must be within viking://resources")
+        if not _is_context_resource_root(self.root_uri):
+            raise ValueError(
+                "Context project root_uri must be within viking://resources or "
+                "viking://user/<user_id>/resources"
+            )
         self.max_managed_resources = max_managed_resources
         self._resources: Dict[str, LiveContext] = {}
 

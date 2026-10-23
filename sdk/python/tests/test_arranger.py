@@ -170,6 +170,29 @@ async def test_async_project_converges_live_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_project_converges_in_user_resources() -> None:
+    client = FakeClient()
+    project = AsyncContextArranger(
+        client,
+        "private-context",
+        "user/alice/resources/ops",
+    )
+    declare_alerts(project)
+
+    plan = await project.plan()
+    assert plan.changes[0].action == ContextChangeAction.CREATE
+
+    result = await project.apply(wait=True)
+    assert len(result.applied) == 1
+    node_uri = "viking://user/alice/resources/ops/alerts.md"
+    assert node_uri in client.entries
+
+    converged = await project.plan()
+    assert converged.has_changes is False
+    assert converged.changes[0].action == ContextChangeAction.UNCHANGED
+
+
+@pytest.mark.asyncio
 async def test_dry_run_and_prune_only_delete_owned_live_contexts() -> None:
     client = FakeClient()
     first = AsyncContextArranger(client, "demo", "resources/demo")
@@ -387,8 +410,15 @@ def test_project_main_provides_generated_help(capsys: Any) -> None:
 def test_declarations_validate_scope_tags_and_live_context_fields() -> None:
     project = ContextArranger(FakeClient(), "demo", "resources/demo")
 
-    with pytest.raises(ValueError, match="within viking://resources"):
-        ContextArranger(FakeClient(), "demo", "agent")
+    for root_uri in (
+        "agent",
+        "~/resources/demo",
+        "user/alice/memories/demo",
+        "user//resources/demo",
+        "user/alice/resources/../demo",
+    ):
+        with pytest.raises(ValueError, match="within viking://resources"):
+            ContextArranger(FakeClient(), "demo", root_uri)
     with pytest.raises(ValueError, match="below"):
         project.live_context(
             "viking://resources/other/live.md",

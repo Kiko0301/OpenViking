@@ -324,6 +324,9 @@ python arrange.py apply --prune --wait
 - Output defaults to a human-readable table; `--output json` is for automation.
 - Ownership and drift use `ov-cac-owner`, `ov-cac-kind`, and specification fingerprint tags.
 - An existing target not managed by this arrangement is a conflict and is not overwritten.
+- `root_uri` may be below the account-shared `viking://resources` root or a canonical
+  user-private `viking://user/<user_id>/resources` root. The authenticated user must have
+  access to the selected root.
 
 One `ContextArranger` manages only its owner-tagged live nodes below `root_uri`. Do not use the same arrangement name with overlapping roots and different declarations.
 

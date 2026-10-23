@@ -618,6 +618,9 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
         write=AsyncMock(return_value={}),
         read=AsyncMock(),
         rm=AsyncMock(return_value={}),
+        can_read_many=AsyncMock(
+            side_effect=lambda uris, _ctx: dict.fromkeys(uris, True)
+        ),
     )
     backing = SimpleNamespace(
         fs=fs,
@@ -737,6 +740,68 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
     assert unmounted["unmounted"] is True
     fs.rm.assert_awaited_once_with(node_uri, ctx=_ctx(), recursive=False, wait=True)
     assert (await service.mounts("weather", None, _ctx()))["mounts"] == []
+
+
+async def test_mounts_only_returns_nodes_visible_to_caller(monkeypatch):
+    visible_uri = "viking://resources/demo/shared.md"
+    hidden_uri = "viking://user/alice/resources/private.md"
+    can_read_many = AsyncMock(
+        return_value={
+            visible_uri: True,
+            hidden_uri: False,
+        }
+    )
+    service = MCPService(
+        SimpleNamespace(fs=SimpleNamespace(can_read_many=can_read_many))
+    )
+    monkeypatch.setattr(
+        service,
+        "_registered",
+        AsyncMock(return_value=({"name": "demo"}, {})),
+    )
+
+    def mount_database(_ctx):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            f"""
+            CREATE TABLE live_context_nodes (
+                node_uri TEXT PRIMARY KEY,
+                mcp_name TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_uri TEXT NOT NULL,
+                input_revision TEXT NOT NULL,
+                args_json TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO live_context_nodes VALUES
+                ('{visible_uri}', 'demo', 'current',
+                 'viking://agent/tools/demo/current.json', 'visible-revision',
+                 '{{"scope": "shared"}}',
+                 '{{"title": "Shared", "timeout_seconds": 60}}',
+                 '2026-10-23T00:00:00+00:00'),
+                ('{hidden_uri}', 'demo', 'current',
+                 'viking://agent/tools/demo/current.json', 'hidden-revision',
+                 'not-json', 'not-json',
+                 '2026-10-23T00:00:00+00:00');
+            """
+        )
+        return connection
+
+    monkeypatch.setattr(
+        service,
+        "_open_mount_database",
+        AsyncMock(side_effect=mount_database),
+    )
+
+    result = await service.mounts("demo", "current", _ctx())
+
+    assert result["total"] == 1
+    assert result["mounts"][0]["node_uri"] == visible_uri
+    assert result["mounts"][0]["arguments"] == {"scope": "shared"}
+    checked_uris = can_read_many.await_args.args[0]
+    assert set(checked_uris) == {visible_uri, hidden_uri}
 
 
 async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkeypatch):
@@ -1073,7 +1138,15 @@ async def test_sync_writes_changed_definitions_without_changing_input_revision(m
 
 
 async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeypatch):
-    service = MCPService(SimpleNamespace())
+    hidden_uri = "viking://user/alice/resources/private.md"
+    can_read_many = AsyncMock(
+        side_effect=lambda uris, _ctx: {
+            uri: uri != hidden_uri for uri in uris
+        }
+    )
+    service = MCPService(
+        SimpleNamespace(fs=SimpleNamespace(can_read_many=can_read_many))
+    )
 
     def mount_database(_ctx):
         connection = sqlite3.connect(":memory:")
@@ -1101,6 +1174,9 @@ async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeyp
                  '{}', '2026-10-09T00:00:00+00:00'),
                 ('viking://resources/demo/current.md', 'demo', 'current',
                  'viking://agent/tools/demo/current.json', 'current-revision',
+                 '{}', '2026-10-09T00:00:00+00:00'),
+                ('viking://user/alice/resources/private.md', 'demo', 'private',
+                 'viking://agent/tools/demo/private.json', 'old-private',
                  '{}', '2026-10-09T00:00:00+00:00');
             """
         )
@@ -1154,6 +1230,8 @@ async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeyp
     assert invalid["mounted_input_revision"] == "old-invalid"
     assert invalid["current_input_revision"] == "new-invalid"
     assert all(item["tool"] != "current" for item in first)
+    assert all(item["tool"] != "private" for item in first)
+    assert can_read_many.await_count == 2
 
 
 async def test_router_exposes_and_delegates_only_requested_operations(monkeypatch):

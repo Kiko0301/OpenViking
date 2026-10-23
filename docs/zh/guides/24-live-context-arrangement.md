@@ -324,6 +324,8 @@ python arrange.py apply --prune --wait
 - 默认输出适合人阅读的表格，`--output json` 适合自动化。
 - 通过 `ov-cac-owner`、`ov-cac-kind` 和规格指纹标签识别所有权与漂移。
 - 目标 URI 已存在但不归当前 arrangement 管理时返回冲突，不会覆盖。
+- `root_uri` 可以位于账号共享的 `viking://resources` 下，也可以位于规范化的用户私有
+  `viking://user/<user_id>/resources` 下；调用方必须具备所选根目录的访问权限。
 
 一个 `ContextArranger` 只管理自己 `root_uri` 下、带有其 owner 标签的实时节点。不要让两个 arrangement 使用同一个 name 和重叠的 root 管理不同声明。
 
