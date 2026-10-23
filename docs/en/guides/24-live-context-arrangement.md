@@ -220,11 +220,12 @@ Live execution occurs only on a complete read:
 - REST/CLI: `offset=0` and `limit=-1`.
 - MCP `read`: the default complete read.
 - The response is the upstream MCP tool result, without descriptor frontmatter or an extra label.
+- Tools without annotations are treated as read-only. A tool with `readOnlyHint: false` or `destructiveHint: true` is not executed by `read`; the error returns the mounted URI and arguments for explicit invocation through the current integration.
 - A paginated read returns the stored descriptor and does not call the upstream.
 - `find`, `search`, `list`, and `tree` never execute a live node implicitly.
 - REST `read?raw=true` returns the raw descriptor without executing the tool.
 
-These rules keep retrieval and browsing free of side effects. An agent should retrieve a node first and explicitly call `read` when it needs the live value.
+These rules keep retrieval and browsing free of side effects while still allowing write-capable tools to be mounted as agent guidance. An agent should retrieve a node first and call `read` for a live value; write-capable tools require the separately permissioned `invoke_mcp_tool`.
 
 ## Dynamic agent discovery
 

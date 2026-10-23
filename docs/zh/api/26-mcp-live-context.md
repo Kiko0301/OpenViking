@@ -1,6 +1,6 @@
 # MCP 与实时上下文 API
 
-本模块用于注册 Streamable HTTP MCP Server、同步和检索工具目录、通过 OpenViking 调用工具，以及把工具挂载为可通过 `read` 透明执行的实时上下文节点。所有 REST 路径都以 `/api/v1/mcps` 开头，并使用[通用响应信封](01-overview.md#响应格式)。
+本模块用于注册 Streamable HTTP MCP Server、同步和检索工具目录、通过 OpenViking 调用工具，以及把工具挂载为实时上下文节点。只读挂载工具可通过 `read` 透明执行；显式声明为非只读或破坏性的工具必须显式调用。所有 REST 路径都以 `/api/v1/mcps` 开头，并使用[通用响应信封](01-overview.md#响应格式)。
 
 > **适用范围**
 >
@@ -418,6 +418,8 @@ ov mcps invoke viking://agent/tools/weather/current.json \
 
 `POST /api/v1/mcps/mount` 创建或替换一个 Markdown 实时上下文节点。`POST /api/v1/mcps/batch-mount` 原子校验整批请求后批量写入；同一批次不能包含重复 `node_uri`。
 
+任何工具都可以挂载。为兼容未提供 annotations 的工具，annotations 缺失或为空时默认按只读处理。完整读取会拒绝执行 `annotations.readOnlyHint: false` 或 `destructiveHint: true` 的工具；错误会返回当前集成执行显式调用所需的 `tool_uri` 和已保存参数。
+
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `tool_uri` | string | 是 | - | 已注册工具 URI |
@@ -562,13 +564,13 @@ ov mcps mounts --mcp weather --tool current
 
 ### 读取实时上下文
 
-挂载后使用普通内容读取接口或 `ov read`。OpenViking 识别节点的 `OpenViking Live Context` 元数据，按节点保存的 `tool_uri`、`arguments` 和 `timeout_seconds` 调用工具，并把实时结果追加到读取结果中。
+挂载后使用普通内容读取接口或 `ov read`。OpenViking 识别节点的 `OpenViking Live Context` 元数据，并对符合只读策略的工具按节点保存的 `tool_uri`、`arguments` 和 `timeout_seconds` 发起调用。
 
 ```bash
 ov read viking://resources/live/weather-beijing.md
 ```
 
-实时读取支持 MCP 文本结果和 `structuredContent`。多个文本块用换行连接；只有结构化结果时返回格式化 JSON。上游 `isError=true` 或只有图片、音频等非文本内容时，读取返回 `PROCESSING_ERROR`。直接调用 `/invoke` 仍会保留这些原生 MCP 内容。
+实时读取支持 MCP 文本结果和 `structuredContent`。多个文本块用换行连接；只有结构化结果时返回格式化 JSON。上游 `isError=true`、只有图片或音频等非文本内容，或者工具显式声明为非只读或破坏性时，读取返回 `PROCESSING_ERROR`。直接调用 `/invoke` 可以执行写工具，并仍会保留原生 MCP 内容。
 
 ### 删除挂载
 

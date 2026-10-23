@@ -220,11 +220,12 @@ viking://agent/tools/<server>/<tool>.json
 - REST/CLI：`offset=0` 且 `limit=-1`。
 - MCP `read`：默认完整读取。
 - 返回值是上游 MCP Tool 结果，不附加节点 frontmatter 或额外标签。
+- 未声明 annotations 的工具默认按只读处理。`readOnlyHint: false` 或 `destructiveHint: true` 的工具不会由 `read` 执行；错误会返回挂载 URI 和参数，供当前集成显式调用。
 - 分页读取只返回已存储的描述文件，不调用上游 Tool。
 - `find`、`search`、`list` 和 `tree` 不会隐式执行实时节点。
 - REST `read?raw=true` 返回原始描述文件，不执行 Tool。
 
-这些规则保证检索和目录浏览保持无副作用。Agent 应先通过检索定位节点，再显式调用 `read` 获取实时结果。
+这些规则保证检索和目录浏览保持无副作用，同时允许把写工具挂载为 Agent 指引。Agent 应先通过检索定位节点，再调用 `read` 获取实时结果；写工具必须通过具备独立权限的 `invoke_mcp_tool` 调用。
 
 ## Agent 动态发现
 

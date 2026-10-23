@@ -271,6 +271,12 @@ _READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=False,
 )
+_LIVE_CONTEXT_READ_TOOL_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
 _DESTRUCTIVE_TOOL_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=True,
@@ -987,7 +993,7 @@ def _mcp_media_download_hint(uri: str) -> str:
 
 
 @_mcp_error_results(structured_output=False)
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS, structured_output=False)
+@mcp.tool(annotations=_LIVE_CONTEXT_READ_TOOL_ANNOTATIONS, structured_output=False)
 async def read(
     uris: str | list[str],
     offset: int = 0,

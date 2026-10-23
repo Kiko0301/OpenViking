@@ -264,6 +264,7 @@ async def test_invoke_returns_upstream_result_without_routing_wrapper(monkeypatc
         "viking://agent/tools/demo/get-sum.json",
         {"a": 2, "b": 3},
         _ctx(),
+        require_read_only=True,
     )
 
     assert result == {
@@ -273,6 +274,70 @@ async def test_invoke_returns_upstream_result_without_routing_wrapper(monkeypatc
     }
     assert "uri" not in result
     assert "result" not in result
+
+
+@pytest.mark.parametrize(
+    ("annotations", "expected"),
+    [
+        (None, True),
+        ({}, True),
+        ({"readOnlyHint": True}, True),
+        ({"readOnlyHint": False}, False),
+        ({"destructiveHint": True}, False),
+    ],
+)
+async def test_live_context_read_only_policy(annotations, expected):
+    tool = {"name": "demo"}
+    if annotations is not None:
+        tool["annotations"] = annotations
+
+    assert MCPService._tool_is_read_only({"tool": tool}) is expected
+
+
+async def test_read_live_context_requires_explicit_invoke_for_write_tools(monkeypatch):
+    service = MCPService(SimpleNamespace())
+    monkeypatch.setattr(
+        service,
+        "_registered",
+        AsyncMock(return_value=({"name": "demo", "url": "https://example.com/mcp"}, {})),
+    )
+    monkeypatch.setattr(service, "_catalog_names", AsyncMock(return_value={"write-record"}))
+    monkeypatch.setattr(
+        service,
+        "_tool",
+        AsyncMock(
+            return_value={
+                "tool": {
+                    "name": "write-record",
+                    "annotations": {
+                        "readOnlyHint": False,
+                        "destructiveHint": True,
+                    },
+                    "inputSchema": {"type": "object"},
+                }
+            }
+        ),
+    )
+    open_session = MagicMock()
+    monkeypatch.setattr(service, "_session", open_session)
+    content = """---
+type: OpenViking Live Context
+x-openviking:
+  type: mcp
+  definition: viking://agent/tools/demo/write-record.json
+  args:
+    record: harmless
+---
+"""
+
+    with pytest.raises(ProcessingError) as exc_info:
+        await service.read_live_context(content, _ctx())
+
+    message = str(exc_info.value)
+    assert "Invoke the MCP tool explicitly" in message
+    assert '"tool_uri": "viking://agent/tools/demo/write-record.json"' in message
+    assert '"record": "harmless"' in message
+    open_session.assert_not_called()
 
 
 async def test_invoke_rejects_invalid_arguments_before_opening_session(monkeypatch):
@@ -374,7 +439,8 @@ x-openviking:
 )
 async def test_read_live_context_returns_resource_content(monkeypatch, mcp_result, expected):
     service = MCPService(SimpleNamespace())
-    monkeypatch.setattr(service, "invoke", AsyncMock(return_value=mcp_result))
+    invoke = AsyncMock(return_value=mcp_result)
+    monkeypatch.setattr(service, "invoke", invoke)
     content = """---
 type: OpenViking Live Context
 x-openviking:
@@ -385,6 +451,13 @@ x-openviking:
 """
 
     assert await service.read_live_context(content, _ctx()) == expected
+    invoke.assert_awaited_once_with(
+        "viking://agent/tools/demo/get-sum.json",
+        {},
+        _ctx(),
+        timeout_seconds=60,
+        require_read_only=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -560,6 +633,10 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
             "name": "current",
             "title": "Current Weather",
             "description": "Get current weather",
+            "annotations": {
+                "readOnlyHint": False,
+                "destructiveHint": True,
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {"city": {"type": "string"}},

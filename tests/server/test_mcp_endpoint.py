@@ -392,6 +392,10 @@ async def test_search_tools_expose_only_context_type_parameter():
 async def test_mcp_catalog_tools_are_registered_with_conservative_annotations():
     tools = {tool.name: tool for tool in await mcp_endpoint.mcp.list_tools()}
 
+    assert tools["read"].annotations.readOnlyHint is True
+    assert tools["read"].annotations.destructiveHint is False
+    assert tools["read"].annotations.idempotentHint is True
+    assert tools["read"].annotations.openWorldHint is True
     assert tools["find_mcp_tools"].annotations.readOnlyHint is True
     assert tools["find_mcp_tools"].annotations.idempotentHint is True
     assert tools["invoke_mcp_tool"].annotations.destructiveHint is True

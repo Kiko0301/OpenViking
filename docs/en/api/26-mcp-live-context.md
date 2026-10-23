@@ -1,6 +1,6 @@
 # MCP and Live Context API
 
-This module registers Streamable HTTP MCP servers, synchronizes and searches their tool catalogs, invokes tools through OpenViking, and mounts tools as live context nodes that execute transparently on `read`. Every REST path starts with `/api/v1/mcps` and uses the [standard response envelope](01-overview.md#response-format).
+This module registers Streamable HTTP MCP servers, synchronizes and searches their tool catalogs, invokes tools through OpenViking, and mounts tools as live context nodes. Read-only mounted tools execute transparently on `read`; tools explicitly marked non-read-only or destructive require explicit invocation. Every REST path starts with `/api/v1/mcps` and uses the [standard response envelope](01-overview.md#response-format).
 
 > **Scope**
 >
@@ -419,6 +419,8 @@ ov mcps invoke viking://agent/tools/weather/current.json \
 
 `POST /api/v1/mcps/mount` creates or replaces one Markdown live context node. `POST /api/v1/mcps/batch-mount` validates the full batch before writing it. A batch cannot contain duplicate `node_uri` values.
 
+Any tool can be mounted. Missing or empty annotations are treated as read-only for compatibility. A complete read refuses to execute tools with `annotations.readOnlyHint: false` or `destructiveHint: true`; the error returns the `tool_uri` and stored arguments needed by the integration's explicit invocation mechanism.
+
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `tool_uri` | string | Yes | - | Registered tool URI |
@@ -563,13 +565,13 @@ ov mcps mounts --mcp weather --tool current
 
 ### Read live context
 
-After mounting, use the regular content read API or `ov read`. OpenViking recognizes the node's `OpenViking Live Context` metadata, calls the tool with its stored `tool_uri`, `arguments`, and `timeout_seconds`, and appends the live value to the read result.
+After mounting, use the regular content read API or `ov read`. OpenViking recognizes the node's `OpenViking Live Context` metadata and, for tools allowed by the read-only policy, calls the tool with its stored `tool_uri`, `arguments`, and `timeout_seconds`.
 
 ```bash
 ov read viking://resources/live/weather-beijing.md
 ```
 
-Live reads support MCP text results and `structuredContent`. Multiple text blocks are joined with newlines. A structured-only result becomes formatted JSON. An upstream `isError=true`, or image/audio-only content, causes a `PROCESSING_ERROR` on read. Direct `/invoke` calls still preserve those native MCP content blocks.
+Live reads support MCP text results and `structuredContent`. Multiple text blocks are joined with newlines. A structured-only result becomes formatted JSON. An upstream `isError=true`, image/audio-only content, or a tool explicitly marked non-read-only or destructive causes a `PROCESSING_ERROR` on read. Direct `/invoke` calls can execute write-capable tools and still preserve native MCP content blocks.
 
 ### Remove mounts
 

@@ -483,6 +483,17 @@ class MCPService:
             )
             raise InvalidArgumentError(f"{prefix}: {exc.message}") from exc
 
+    @staticmethod
+    def _tool_is_read_only(tool_document: dict[str, Any]) -> bool:
+        annotations = tool_document["tool"].get("annotations")
+        if annotations is None:
+            return True
+        return (
+            isinstance(annotations, dict)
+            and annotations.get("readOnlyHint") is not False
+            and annotations.get("destructiveHint") is not True
+        )
+
     async def _affected_mounts(
         self,
         server_name: str,
@@ -1391,6 +1402,7 @@ class MCPService:
             arguments,
             ctx,
             timeout_seconds=timeout_seconds,
+            require_read_only=True,
         )
         return self._live_context_read_value(result, tool_uri)
 
@@ -1422,12 +1434,13 @@ class MCPService:
         if isinstance(content, list):
             if text_blocks:
                 return "\n".join(text_blocks)
-            if not content:
-                return ""
 
         structured = result.get("structuredContent")
         if structured is not None:
             return json.dumps(structured, ensure_ascii=False, indent=2)
+
+        if isinstance(content, list) and not content:
+            return ""
 
         raise ProcessingError(
             "Live context read only supports text or structured MCP results",
@@ -1440,6 +1453,8 @@ class MCPService:
         arguments: dict[str, Any],
         ctx: RequestContext,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        *,
+        require_read_only: bool = False,
     ) -> dict[str, Any]:
         match = _TOOL_URI_RE.fullmatch(uri)
         if match is None:
@@ -1452,6 +1467,18 @@ class MCPService:
         if tool_name not in await self._catalog_names(server_name, ctx):
             raise NotFoundError(uri, "MCP tool")
         tool_document = await self._tool(uri, ctx)
+        if require_read_only and not self._tool_is_read_only(tool_document):
+            invocation = json.dumps(
+                {"tool_uri": uri, "arguments": arguments},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            raise ProcessingError(
+                "Live context read cannot execute a tool explicitly marked as "
+                "non-read-only or destructive. Invoke the MCP tool explicitly with "
+                f"{invocation}",
+                source=uri,
+            )
         self._validate_tool_arguments(tool_document, arguments)
 
         async with self._session(server, headers, timeout_seconds) as session:
