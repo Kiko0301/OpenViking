@@ -74,7 +74,6 @@ def test_compile_builtin_skill_namespace_is_source_only():
     with pytest.raises(InvalidArgumentError, match="supported skills namespace"):
         CompileService._validate_target("viking://system/compile/example-skills")
 
-
 @pytest.mark.asyncio
 async def test_page_reads_past_200_and_isolates_owner():
     agfs = _FakeAgfs()

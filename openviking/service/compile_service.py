@@ -17,7 +17,7 @@ from openviking.core.namespace import classify_uri, uri_parts
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.server.identity import RequestContext
-from openviking.service.compile_targets import CompileLifecycle, UpdateSchedule
+from openviking.service.compile_targets import CompileLifecycle, UpdateSchedule, split_control_args
 from openviking.service.external_task_service import (
     ExternalTaskError,
     ExternalTaskService,
@@ -433,11 +433,17 @@ class CompileService:
         submitted, private_payload = self._split_payload(normalized)
         payload = submitted
         if self._lifecycle is not None:
+            control, runtime_args = split_control_args(submitted.get("args"))
+            payload = {key: value for key, value in submitted.items() if key != "args"}
+            if runtime_args:
+                payload["args"] = runtime_args
+            payload["compile"] = {
+                "mode": control.get("mode", "incremental"),
+                "trigger": "manual",
+            }
             started_at = time.perf_counter()
             try:
-                payload = await self._lifecycle.prepare(
-                    submitted, ctx, instruction_set=request._instruction_sent
-                )
+                asyncio.create_task(self._lifecycle.prepare(submitted, ctx, instruction_set=request._instruction_sent))
             finally:
                 logger.info(
                     "Compile submission prepare duration_ms=%.3f",
