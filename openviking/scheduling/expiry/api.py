@@ -71,6 +71,7 @@ class HandlerOptions:
     # None retains a failed claim for retry after the processing timeout.
     max_attempts: int | None = 3
     metadata_enabled: bool = True
+    lazy_start: bool = False
 
 
 class ExpiryHandler(Protocol):

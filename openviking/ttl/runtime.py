@@ -161,9 +161,11 @@ class DirectoryTTL:
         self.retry_limit = retry_limit
         self.redis = None
         self._task = None
+        self._registration_task = None
         self._started = False
         self._closed = False
         self._wake = asyncio.Event()
+        self._registration_wake = asyncio.Event()
         self._pending = set()
         self._recovered = set()
         self._locks = {}
@@ -190,7 +192,9 @@ class DirectoryTTL:
         scheduler.register_handler(
             TTL_ITEM_TYPE,
             self,
-            options=HandlerOptions(concurrency=1, max_attempts=None, metadata_enabled=False),
+            options=HandlerOptions(
+                concurrency=1, max_attempts=None, metadata_enabled=False, lazy_start=True
+            ),
         )
 
     @staticmethod
@@ -228,6 +232,31 @@ class DirectoryTTL:
         if self.writer and self._started and not self._closed:
             if self._task is None or self._task.done():
                 self._task = asyncio.create_task(self._run(), name="ttl-maintenance")
+
+    def _wake_registrations(self) -> None:
+        self._registration_wake.set()
+        if self.writer and self._started and not self._closed:
+            if self._registration_task is None or self._registration_task.done():
+                self._registration_task = asyncio.create_task(
+                    self._flush_registrations(), name="ttl-registration"
+                )
+
+    async def _flush_registrations(self) -> None:
+        delay = 1
+        while self._retry and not self._closed:
+            self._registration_wake.clear()
+            try:
+                await self._retry_writes()
+            except Exception:
+                logger.exception("TTL registration retry delay=%s", delay)
+                try:
+                    await asyncio.wait_for(self._registration_wake.wait(), delay)
+                except TimeoutError:
+                    pass
+                delay = min(delay * 2, 60)
+            else:
+                delay = 1
+                await asyncio.sleep(0)
 
     async def patch_configuration(self, settings: dict, account_id: str | None = None) -> None:
         patch = settings["ttl"]
@@ -379,13 +408,19 @@ class DirectoryTTL:
         self._closed = False
         self._started = True
         self._recycle_after_ms = next_check_ms(self.resource_id, time.time_ns() // 1_000_000)
-        if self._retry or self._initial_requests or self._pending:
+        if self._retry:
+            self._wake_registrations()
+        if self._initial_requests or self._pending:
             self._wake_worker()
 
     async def aclose(self) -> None:
         self._closed = True
         self._started = False
         self._wake.set()
+        self._registration_wake.set()
+        if self._registration_task:
+            await self._registration_task
+            self._registration_task = None
         if self._task:
             await self._task  # Finish in-flight I/O; never cancel a Redis checkpoint write.
             self._task = None
@@ -484,7 +519,7 @@ class DirectoryTTL:
         self._retry[key] = max(base, old) if old is not None else base
         # Updates to a failed batch must not defeat the worker's retry backoff.
         if was_empty:
-            self._wake_worker()
+            self._wake_registrations()
 
     async def _register(self, key, base):
         account, kind, uri = key
@@ -627,7 +662,6 @@ class DirectoryTTL:
         while not self._closed:
             self._wake.clear()
             try:
-                await self._retry_writes()
                 for account in self._initial_requests | self._recycle:
                     if self._closed:
                         break
@@ -666,9 +700,9 @@ class DirectoryTTL:
                 logger.exception("TTL worker retry delay=%s", delay)
                 delay = min(delay * 2, 60)
             else:
-                if not (self._retry or self._initial_requests or self._pending or self._recycle):
+                if not (self._initial_requests or self._pending or self._recycle):
                     return
-                if self._retry or self._initial_requests:
+                if self._initial_requests:
                     await asyncio.sleep(0)
                     continue
             try:
@@ -783,7 +817,6 @@ class DirectoryTTL:
                 "checkpoint",
                 json.dumps(checkpoint, separators=(",", ":")),
             )
-            await self._retry_writes()
         if self._closed or account in self._stop_scan:
             return
         await redis.set(prefix + "initial:done", "1")
@@ -901,9 +934,6 @@ class DirectoryTTL:
                             logger.exception("TTL recycle failed scope=%s uri=%s", account, uri)
                         await asyncio.sleep(self.delete_interval)
                     offset += len(candidates) - removed
-                    # Recycling shares the serial worker with registrations.
-                    # Flush between pages so a large backlog cannot fill the buffer.
-                    await self._retry_writes()
         return TTLRecycleResult(**counts)
 
     async def _delete(self, account, uri, score, ctx):

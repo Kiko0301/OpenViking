@@ -514,6 +514,64 @@ async def test_http_configuration_initial_and_lifecycle(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint_env", ["TTL_TEST_REDIS", "TTL_TEST_CLUSTER"])
+async def test_consumer_starts_on_registration_and_recovers_activation(endpoint_env):
+    from unittest.mock import AsyncMock
+    from uuid import uuid4
+
+    from openviking.scheduling.expiry.config import ExpiryConfig
+    from openviking.scheduling.expiry.keys import ExpiryKeys, encode_component
+    from openviking.scheduling.expiry.runtime import ExpiryRuntime, ExpiryRuntimeRoles
+
+    endpoint = os.environ.get(endpoint_env)
+    if not endpoint:
+        pytest.skip("requires an isolated local Redis")
+    rid = "ttl-activation-" + uuid4().hex
+    config = ExpiryConfig(
+        service_name=rid,
+        shard_count=2,
+        redis={
+            "mode": "cluster" if endpoint_env.endswith("CLUSTER") else "standalone",
+            "endpoints": [endpoint],
+        },
+    )
+    engine = DirectoryTTL(resource_id=rid, redis=config.redis.model_dump())
+    raw = await engine.client()
+    runtimes = []
+    try:
+        for replacement in (False, True):
+            runtime = ExpiryRuntime(
+                config, roles=ExpiryRuntimeRoles(report=True, publish=False, consume=True)
+            )
+            runtimes.append(runtime)
+            runtime.scheduler.register_handler("session", SimpleNamespace(handle=AsyncMock()))
+            engine.install_expiry(runtime.scheduler)
+            await runtime.start_storage()
+            await runtime.start_roles()
+            if not replacement:
+                assert list(runtime._consumers) == ["session"]
+                assert list(runtime._tasks) == ["callback:session"]
+                await engine._schedule("a")
+                assert (
+                    await raw.hget(
+                        ExpiryKeys(encode_component(rid)).namespace(), "consumer_enabled:ttl"
+                    )
+                    == "1"
+                )
+            assert list(runtime._consumers) == ["session", "ttl"]
+            await runtime.stop_roles(keep_reporting=True)
+            await engine._schedule("b", force=True)
+            assert not runtime._tasks  # Producer drain must not restart consumption.
+            await runtime.close()
+    finally:
+        for runtime in runtimes:
+            await runtime.close()
+        async for key in raw.scan_iter(match=f"expiry:*{encode_component(rid)}*"):
+            await raw.delete(key)
+        await engine.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_env", ["TTL_TEST_REDIS", "TTL_TEST_CLUSTER"])
 async def test_real_expiry_resumes_initial_and_recycles_without_server(tmp_path, endpoint_env):
     import asyncio
     import time

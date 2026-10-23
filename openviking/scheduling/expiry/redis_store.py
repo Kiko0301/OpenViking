@@ -108,6 +108,7 @@ class RedisExpiryStore:
         self._scripts: dict[str, str] = {}
         self._script_shas: dict[str, str] = {}
         self._ready = False
+        self._enabled_consumers: set[str] = set()
 
     async def open(self) -> None:
         await self._io.run(self._open_on_loop)
@@ -126,6 +127,11 @@ class RedisExpiryStore:
             "identity_encoding": spec.identity_encoding,
         }
         current = await self._command("hgetall", key)
+        self._enabled_consumers = {
+            field.removeprefix("consumer_enabled:")
+            for field, value in current.items()
+            if field.startswith("consumer_enabled:") and value == "1"
+        }
         initializing = True
         if current:
             normalized = {str(k): str(v) for k, v in current.items()}
@@ -153,6 +159,20 @@ class RedisExpiryStore:
         if initializing:
             await self._command("hset", key, "state", "READY", retry="idempotent")
         self._ready = True
+
+    def consumer_enabled(self, item_type: str) -> bool:
+        return item_type in self._enabled_consumers
+
+    async def enable_consumer(self, item_type: str) -> None:
+        if not self.consumer_enabled(item_type):
+            await self._command(
+                "hset",
+                self._keys.namespace(),
+                f"consumer_enabled:{item_type}",
+                "1",
+                retry="idempotent",
+            )
+            self._enabled_consumers.add(item_type)
 
     async def ensure_metadata(self, item_id: str, task: ExpiryRegistration) -> None:
         identity = task.identity

@@ -299,6 +299,7 @@ class ExpiryRuntime:
             shard_count=config.shard_count,
             reporting_enabled=roles.report,
             metrics=self._metrics,
+            on_report=self._start_consumer,
         )
         self._leases = ShardLeaseCoordinator(self._store, config, self._metrics)
         self._shard_runner = ShardRunner(self._leases, config, self._metrics)
@@ -390,20 +391,22 @@ class ExpiryRuntime:
             self._spawn_role("publisher", self._publisher.run(self._stop))
         if self._roles.consume:
             for item_type, binding in bindings.items():
-                consumer = ExpiryConsumer(
-                    self._store,
-                    self._shard_runner,
-                    item_type,
-                    binding,
-                    self._config,
-                    self._metrics,
-                )
-                self._consumers[item_type] = consumer
-                self._spawn_role(
-                    f"callback:{item_type}",
-                    consumer.run(self._stop),
-                )
+                if not binding.options.lazy_start or self._store.consumer_enabled(item_type):
+                    self._start_consumer(item_type)
         self._state.accepting_calls = True
+
+    def _start_consumer(self, item_type: str) -> None:
+        name = f"callback:{item_type}"
+        if not self._roles.consume or self._stop.is_set() or name in self._tasks:
+            return
+        binding = self._registry.get(item_type)
+        if binding is None:
+            return
+        consumer = ExpiryConsumer(
+            self._store, self._shard_runner, item_type, binding, self._config, self._metrics
+        )
+        self._consumers[item_type] = consumer
+        self._spawn_role(name, consumer.run(self._stop))
 
     async def wait(self) -> None:
         if not self._tasks:

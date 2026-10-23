@@ -568,9 +568,9 @@ async def test_async_buffer_full_merges_existing_and_reports_drop(engine, caplog
     assert e._retry == {("a", "sessions", first): 3}
     assert e.registration_dropped_total == 1
     assert "event=registration_dropped" in caplog.text and "dropped_total=1" in caplog.text
-    e._wake.clear()
+    e._registration_wake.clear()
     await e.on_post_write(first + "/messages.jsonl", e.context("a"), 4)
-    assert not e._wake.is_set()  # Updates do not defeat Redis failure backoff.
+    assert not e._registration_wake.is_set()  # Updates do not defeat Redis failure backoff.
 
 
 @pytest.mark.asyncio
@@ -626,7 +626,7 @@ async def test_shutdown_registration_failure_is_retained_and_logged(engine, capl
 
 
 @pytest.mark.asyncio
-async def test_backfill_flushes_incremental_between_batches(engine):
+async def test_backfill_does_not_block_incremental_registration(engine):
     e = engine
     e.batch_size = 1
     root = "viking://user/u/sessions"
@@ -637,13 +637,56 @@ async def test_backfill_flushes_incremental_between_batches(engine):
         if uri == root + "/a/messages.jsonl":
             await e.on_post_write(event + "/file", e.context("a"), 1)
         else:
-            assert await e.redis.zscore(e.prefix("a") + "user_events", event) is not None
+            async with asyncio.timeout(2):
+                while await e.redis.zscore(e.prefix("a") + "user_events", event) is None:
+                    await asyncio.sleep(0)
         return {"modTime": "2020-01-01T00:00:00Z"}
 
     e.fs.stat.side_effect = stat
     await e.register_initial_backfill(TTLBackfillRequest("r", "a", (root,)))
-    await e._scan("a")
-    assert not e._retry and e.fs.stat.await_count == 2
+    await e.start()
+    try:
+        async with asyncio.timeout(2):
+            await e._task
+        assert not e._retry and e.fs.stat.await_count == 2
+    finally:
+        await e.aclose()
+
+
+@pytest.mark.asyncio
+async def test_slow_delete_does_not_block_incremental_registration(engine):
+    e = engine
+    e.retry_limit = 16
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_rm(*args, **kwargs):
+        entered.set()
+        await release.wait()
+
+    e.fs.rm.side_effect = slow_rm
+    prefix = e.prefix("a")
+    await e.redis.hset(
+        prefix + "backfill:initial", mapping={"roots": "[]", "checkpoint": '{"root":0,"stack":[]}'}
+    )
+    await e.redis.set(prefix + "backfill:initial:done", "1")
+    await e.redis.zadd(prefix + "user_events", {"viking://user/u/memories/events/2020/01/01": 1})
+    await e.start()
+    e._recycle.add("a")
+    e._wake_worker()
+    try:
+        async with asyncio.timeout(2):
+            await entered.wait()
+            for i in range(64):
+                uri = f"viking://user/u/sessions/s{i}"
+                await e.on_post_write(uri + "/messages.jsonl", e.context("a"), i)
+                while await e.redis.zscore(prefix + "sessions", uri) is None:
+                    await asyncio.sleep(0)
+        assert await e.redis.zcard(prefix + "sessions") == 64
+        assert e.registration_dropped_total == 0
+        assert not release.is_set() and not e._task.done()
+    finally:
+        release.set()
+        await e.aclose()
 
 
 @pytest.mark.asyncio
