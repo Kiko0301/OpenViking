@@ -843,7 +843,7 @@ enum Commands {
         /// Who made the edit, recorded in Compile output versions
         #[arg(
             long = "edit-source",
-            default_value = "agent",
+            default_value = "manual",
             value_parser = ["manual", "agent", "compile"],
             help_heading = "Advanced options"
         )]

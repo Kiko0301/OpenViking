@@ -717,7 +717,7 @@ class VikingClient:
         wait: bool = True,
         skip_conflicts: bool = False,
         defer_processing: bool = False,
-        edit_source: Literal["manual", "agent", "compile"] = "agent",
+        edit_source: Literal["manual", "agent", "compile"] = "manual",
     ) -> Dict[str, Any]:
         """Publish a bundle, optionally retaining conflicting targets and reporting their URIs."""
         return await self.client.batch_write(

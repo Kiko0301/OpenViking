@@ -52,7 +52,7 @@ class WriteContentRequest(BaseModel):
     tag_mode: Literal["replace", "append", "clear"] = "replace"
     acl: AclSpec | None = None
     # Who made the edit; versions of Compile outputs record it (console edit = manual).
-    edit_source: Literal["manual", "agent", "compile"] = "agent"
+    edit_source: Literal["manual", "agent", "compile"] = "manual"
 
 
 class BatchWriteOperation(BaseModel):
@@ -87,7 +87,7 @@ class BatchWriteRequest(BaseModel):
     # Save content without semantic or vector work; the caller schedules processing.
     defer_processing: bool = False
     processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
-    edit_source: Literal["manual", "agent", "compile"] = "agent"
+    edit_source: Literal["manual", "agent", "compile"] = "manual"
 
 
 class SetTagsRequest(BaseModel):

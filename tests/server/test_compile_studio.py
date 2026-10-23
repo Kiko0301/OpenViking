@@ -489,7 +489,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
         "rollback_head",
     }
     ordinary_operation = next(
-        op for op in history["operations"] if op["operation_type"] == "agent_revise"
+        op for op in history["operations"] if op["operation_type"] == "manual_revise"
     )
     assert ordinary_operation["meta"] == {}
     assert ordinary_operation["params"] == {"batch": True, "uris": [page]}

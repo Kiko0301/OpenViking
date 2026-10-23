@@ -398,7 +398,7 @@ impl HttpClient {
             body["acl"] = acl;
         }
         // Omit the default so the request stays valid for servers without edit_source.
-        if edit_source != "agent" {
+        if edit_source != "manual" {
             body["edit_source"] = Value::from(edit_source);
         }
         self.post("/api/v1/content/write", &body).await
@@ -3048,6 +3048,36 @@ mod tests {
             assert_eq!(params.get("uri").unwrap(), "viking://resources/example.md");
             assert_eq!(params.get("offset").unwrap(), &offset.to_string());
             assert_eq!(params.get("limit").unwrap(), &limit.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn write_omits_manual_source_and_forwards_explicit_sources() {
+        for source in ["manual", "agent", "compile"] {
+            let (base_url, request_rx) = spawn_request_capture_server().await;
+            let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+            client
+                .write(
+                    "viking://resources/demo.md",
+                    "content",
+                    "replace",
+                    false,
+                    "semantic_and_vectors",
+                    vec![],
+                    "replace",
+                    None,
+                    source,
+                )
+                .await
+                .expect("write request should succeed");
+            let request = request_rx.await.expect("request should be captured");
+            let body: serde_json::Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            if source == "manual" {
+                assert!(body.get("edit_source").is_none());
+            } else {
+                assert_eq!(body["edit_source"], source);
+            }
         }
     }
 

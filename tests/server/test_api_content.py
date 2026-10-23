@@ -86,7 +86,10 @@ def test_batch_write_request_accepts_write_parity_options():
     assert request.operations[0].acl.acl_mode == "restricted"
 
 
-async def test_batch_write_forwards_processing_mode_and_operation_metadata(monkeypatch):
+@pytest.mark.parametrize("edit_source", [None, "manual", "agent", "compile"])
+async def test_batch_write_forwards_processing_mode_and_operation_metadata(
+    monkeypatch, edit_source
+):
     seen = {}
 
     async def fake_batch_write(**kwargs):
@@ -105,6 +108,7 @@ async def test_batch_write_forwards_processing_mode_and_operation_metadata(monke
             root_uri="viking://resources/demo",
             processing_mode="vectors_only",
             defer_processing=True,
+            **({"edit_source": edit_source} if edit_source is not None else {}),
             operations=[
                 BatchWriteOperation(
                     uri="viking://resources/demo/a.md",
@@ -120,7 +124,7 @@ async def test_batch_write_forwards_processing_mode_and_operation_metadata(monke
 
     assert seen["processing_mode"] == "vectors_only"
     assert seen["defer_processing"] is True
-    assert seen["edit_source"] == "agent"
+    assert seen["edit_source"] == (edit_source or "manual")
     operation = seen["operations"][0]
     assert operation["tags"] == ["team=search"]
     assert operation["tag_mode"] == "append"
@@ -128,7 +132,8 @@ async def test_batch_write_forwards_processing_mode_and_operation_metadata(monke
     assert list(operation["acl"]["entries"]) == []
 
 
-async def test_write_forwards_processing_mode_to_service(monkeypatch):
+@pytest.mark.parametrize("edit_source", [None, "manual", "agent", "compile"])
+async def test_write_forwards_processing_mode_to_service(monkeypatch, edit_source):
     seen = {}
 
     async def fake_write(**kwargs):
@@ -144,14 +149,14 @@ async def test_write_forwards_processing_mode_to_service(monkeypatch):
             uri="viking://resources/demo.md",
             content="updated",
             processing_mode="vectors_only",
-            edit_source="manual",
+            **({"edit_source": edit_source} if edit_source is not None else {}),
         ),
         ctx,
     )
 
     assert response["status"] == "ok"
     assert seen["processing_mode"] == "vectors_only"
-    assert seen["edit_source"] == "manual"
+    assert seen["edit_source"] == (edit_source or "manual")
 
 
 async def test_write_forwards_tags_and_tag_mode_to_service(monkeypatch):

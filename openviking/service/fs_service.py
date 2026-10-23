@@ -1673,7 +1673,7 @@ class FSService:
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
-        edit_source: Literal["manual", "agent", "compile"] = "agent",
+        edit_source: Literal["manual", "agent", "compile"] = "manual",
         record_version: bool = True,
         commit_content: Optional[Callable[..., Awaitable[Any]]] = None,
     ) -> Dict[str, Any]:
@@ -1723,7 +1723,7 @@ class FSService:
         skip_conflicts: bool = False,
         defer_processing: bool = False,
         processing_mode: str = "semantic_and_vectors",
-        edit_source: Literal["manual", "agent", "compile"] = "agent",
+        edit_source: Literal["manual", "agent", "compile"] = "manual",
     ) -> Dict[str, Any]:
         """Apply multiple file writes and aggregate downstream refresh."""
         viking_fs = self._ensure_initialized()
