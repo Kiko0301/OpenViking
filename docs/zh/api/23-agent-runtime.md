@@ -121,7 +121,8 @@ task, err := client.Compile(
 | `GET /api/v1/compile/configs` | 可选查询参数 `limit`（1–100，默认 20）和 `cursor`；`result.targets` 按 `target_id` 升序返回本页可见目标摘要；将 `result.next_cursor` 原样作为下一页的 `cursor`，末页为 `null` |
 | `POST /api/v1/compile/configs/query` | JSON 请求体 `{"to": ["viking://resources/wiki"]}` 精确查询 1–50 个目标 URI；单条不超过 2048 UTF-8 字节，JSON 请求体不超过 128 KiB。`result` 以输入 URI 为键、布尔值为值：有效 Compile 目标为 `true`，未注册或已删除的目标为 `false`。每条 URI 均需读取权限；查询不分页、不扫描整个注册表、不修改状态 |
 | `GET /api/v1/compile/operations?to={to}` | `result.operations` 按时间倒序返回操作记录；`result.next_cursor` 用于翻页 |
-| `GET /api/v1/compile/operations/{operation_id}/outputs?to={to}` | `result.outputs` 按 URI 排序返回产出文件及冻结版本引用；`result.next_cursor` 用于翻页 |
+| `GET /api/v1/compile/operations/{operation_id}?to={to}&target_id={target_id}` | `result` 返回单条操作详情，字段与操作列表中的记录一致，包含 `params` 和公开的 `meta`，不包含私有执行检查点 |
+| `GET /api/v1/compile/operations/{operation_id}/outputs?to={to}&target_id={target_id}` | `result.outputs` 按 URI 排序返回产出文件及冻结版本引用；`result.next_cursor` 用于翻页 |
 
 更新请求体必填 `to`、`from`（非空来源 URI 数组）、`skill` 和 `auto_update`（布尔值）。`auto_update=true` 时必须提供有效的 `update_schedule`；`auto_update=false` 时可省略或传 `null`，已保存的规则会清空，返回值为 `null`。新目标不设置默认规则，关闭后重新开启需要提供规则。可选 `instruction` 省略时保留已保存的值，传 `null` 或空字符串时清空。更新配置不提交 Compile 任务。
 
@@ -129,7 +130,7 @@ task, err := client.Compile(
 
 定时自动更新需要显式配置 `compile_api.scheduler_enabled=true`（默认 `false`），并提供有效的 `expiry.service_name` 和 `expiry.redis` 配置。`compile_api.scheduler_backend` 仅接受 `redis`（默认值），配置 `local` 无效。调度关闭时开启 `auto_update` 会返回 `COMPILE_SCHEDULER_DISABLED`。手动增量编译和版本管理不依赖 Redis。
 
-两个历史接口均接受可选查询参数 `limit`（1–100，默认 20）和 `cursor`。翻页时原样传入返回的 `next_cursor`，其为 `null` 时表示最后一页。`operation_id` 长度为 1–128 个字符，以字母或数字开头，其余字符允许字母、数字、`:`、`.`、`_` 和 `-`。目标删除后仍可查询操作记录。目标、操作或产出清单不存在时返回 `404`。产出项的 `version_id` 或 `snapshot_id` 为 `null` 时，表示对应引用不可用。
+操作列表和产出列表接口均接受可选查询参数 `limit`（1–100，默认 20）和 `cursor`。翻页时原样传入返回的 `next_cursor`，其为 `null` 时表示最后一页。
 
 ### 检查 Compile 可用性
 

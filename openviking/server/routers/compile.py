@@ -104,6 +104,20 @@ async def list_compile_operations(
     return Response(status="ok", result=result)
 
 
+@router.get("/compile/operations/{operation_id}")
+async def get_compile_operation(
+    operation_id: str = Path(
+        ..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9:._-]*$"
+    ),
+    to: str = Query(..., min_length=1),
+    target_id: str | None = Query(None, pattern=r"^target_[0-9a-f]{16}$"),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """Read one operation using to for authorization and the history's public field set."""
+    result = await get_service().compile.get_operation(to, operation_id, ctx, target_id=target_id)
+    return Response(status="ok", result=result)
+
+
 @router.get("/compile/operations/{operation_id}/outputs")
 async def operation_outputs(
     operation_id: str = Path(
@@ -112,13 +126,14 @@ async def operation_outputs(
     to: str = Query(..., min_length=1),
     limit: int = Query(20, ge=1, le=100),
     cursor: str | None = Query(None),
+    target_id: str | None = Query(None, pattern=r"^target_[0-9a-f]{16}$"),
     ctx: RequestContext = Depends(get_request_context),
 ):
     """List one operation's output files and frozen version references."""
     return Response(
         status="ok",
         result=await get_service().compile.operation_outputs(
-            to, operation_id, ctx, limit=limit, cursor=cursor
+            to, operation_id, ctx, limit=limit, cursor=cursor, target_id=target_id
         ),
     )
 

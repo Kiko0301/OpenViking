@@ -624,6 +624,25 @@ class CompileService:
             raise NotFoundError(to, "compile target")
         return record
 
+    async def _operation_target_id(
+        self,
+        to: str,
+        ctx: RequestContext,
+        *,
+        target_id: str | None,
+        include_deleted: bool = False,
+    ) -> str:
+        """Validate a supplied ID or resolve it from the authorized target configuration.
+
+        Callers authorize to and guarantee its association with a supplied ID.
+        """
+        if target_id is not None:
+            if not re.fullmatch(r"target_[0-9a-f]{16}", target_id):
+                raise InvalidArgumentError("Invalid target_id")
+            return target_id
+        record = await self._target(to, ctx, include_deleted=include_deleted)
+        return record["id"]
+
     @staticmethod
     def _config_view(record: Mapping[str, Any]) -> dict[str, Any]:
         from openviking.service.compile_scheduler import next_run_at
@@ -753,43 +772,68 @@ class CompileService:
             ctx.account_id, record["id"], limit=limit + 1, cursor=cursor
         )
         page = operations[:limit]
-        public = [
-            {
-                key: operation[key]
-                for key in (
-                    "operation_id",
-                    "operation_type",
-                    "actor",
-                    "created_at",
-                    "status",
-                    "started_at",
-                    "finished_at",
-                    "params",
-                    "result",
-                    "conflicts_num",
-                    "error",
-                )
-            }
-            | {
-                "meta": {
-                    key: operation["meta"][key]
-                    for key in (
-                        "task_id",
-                        "trigger",
-                        "execution",
-                        "skill_snapshot",
-                        "base",
-                        "head",
-                        "changes",
-                        "reindex_task_id",
-                    )
-                    if key in operation["meta"]
-                },
-            }
-            for operation in page
-        ]
+        public = [self._operation_view(operation) for operation in page]
         next_cursor = page[-1]["operation_id"] if len(operations) > limit else None
         return {"operations": public, "next_cursor": next_cursor}
+
+    @staticmethod
+    def _operation_view(operation: Mapping[str, Any]) -> dict[str, Any]:
+        """Expose operation fields and public metadata while excluding private checkpoints."""
+        return {
+            key: operation[key]
+            for key in (
+                "operation_id",
+                "operation_type",
+                "actor",
+                "created_at",
+                "status",
+                "started_at",
+                "finished_at",
+                "params",
+                "result",
+                "conflicts_num",
+                "error",
+            )
+        } | {
+            "meta": {
+                key: operation["meta"][key]
+                for key in (
+                    "task_id",
+                    "trigger",
+                    "execution",
+                    "skill_snapshot",
+                    "base",
+                    "head",
+                    "changes",
+                    "reindex_task_id",
+                )
+                if key in operation["meta"]
+            },
+        }
+
+    async def get_operation(
+        self,
+        to: str,
+        operation_id: str,
+        ctx: RequestContext,
+        *,
+        target_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Read one authorized operation, including deleted targets and public metadata only."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}", operation_id):
+            raise InvalidArgumentError("Invalid operation_id")
+        if target_id is not None:
+            target = validate_request_viking_uri(resolve_path_variables(to), ctx, field_name="to")
+            await self._fs.ensure_write_access(target.rstrip("/"), ctx)
+        target_id = await self._operation_target_id(
+            to, ctx, include_deleted=True, target_id=target_id
+        )
+        operation = await self._require_lifecycle().store.get_operation(
+            ctx.account_id, target_id, operation_id
+        )
+        if operation is None:
+            raise NotFoundError(operation_id, "operation")
+        return self._operation_view(operation)
 
     async def operation_outputs(
         self,
@@ -799,15 +843,19 @@ class CompileService:
         *,
         limit: int,
         cursor: str | None,
+        target_id: str | None = None,
     ) -> dict[str, Any]:
         """Read one authorized operation's immutable-path version references, ordered by URI."""
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}", operation_id):
             raise InvalidArgumentError("Invalid operation_id")
-        record = await self._target(to, ctx)
+        if target_id is not None:
+            target = validate_request_viking_uri(resolve_path_variables(to), ctx, field_name="to")
+            await self._fs.ensure_write_access(target.rstrip("/"), ctx)
+        target_id = await self._operation_target_id(to, ctx, target_id=target_id)
         store = self._require_lifecycle().store
-        if await store.get_operation(ctx.account_id, record["id"], operation_id) is None:
+        if await store.get_operation(ctx.account_id, target_id, operation_id) is None:
             raise NotFoundError(operation_id, "operation")
-        manifest = await store.get_outputs(ctx.account_id, record["id"], operation_id)
+        manifest = await store.get_outputs(ctx.account_id, target_id, operation_id)
         if manifest is None:
             raise NotFoundError(operation_id, "operation outputs not recorded")
         outputs = sorted(manifest["outputs"], key=lambda item: item["uri"])

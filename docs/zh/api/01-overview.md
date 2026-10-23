@@ -581,6 +581,7 @@ JSON 输出 - 错误：
 | GET | `/api/v1/compile/configs` | 列出可见目标 |
 | POST | `/api/v1/compile/configs/query` | 批量判断每个 URI 是否为 Compile 目标 |
 | GET | `/api/v1/compile/operations` | 列出目标操作记录 |
+| GET | `/api/v1/compile/operations/{operation_id}` | 读取单条操作详情 |
 | GET | `/api/v1/compile/operations/{operation_id}/outputs` | 列出操作产出及版本引用 |
 | POST | `/api/v1/compile/embeddings` | 生成 Compile 临时路由文本的向量 |
 | GET | `/api/v1/compile/capabilities` | 检查 Compile 可用性 |

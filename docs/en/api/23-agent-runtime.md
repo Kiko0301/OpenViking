@@ -121,7 +121,8 @@ These endpoints use the current account and authentication context. `to` is the 
 | `GET /api/v1/compile/configs` | Optional query parameters: `limit` (1–100, default 20) and `cursor`; `result.targets` contains this page of visible target summaries ordered by `target_id` ascending; pass `result.next_cursor` unchanged as the next page's `cursor`; null marks the last page |
 | `POST /api/v1/compile/configs/query` | JSON body `{"to": ["viking://resources/wiki"]}` queries 1–50 exact target URIs. Each URI is at most 2048 UTF-8 bytes; the JSON body is at most 128 KiB. `result` maps each input URI to a boolean: true for an active Compile target, false for an unregistered or deleted target. Read permission is required for every URI; the query does not paginate, scan the registry or modify state |
 | `GET /api/v1/compile/operations?to={to}` | `result.operations` contains operations, newest first; `result.next_cursor` continues pagination |
-| `GET /api/v1/compile/operations/{operation_id}/outputs?to={to}` | `result.outputs` contains output files and frozen version references, ordered by URI; `result.next_cursor` continues pagination |
+| `GET /api/v1/compile/operations/{operation_id}?to={to}&target_id={target_id}` | `result` contains one operation with the same fields as a history item, including `params` and public `meta`, excluding private execution checkpoints |
+| `GET /api/v1/compile/operations/{operation_id}/outputs?to={to}&target_id={target_id}` | `result.outputs` contains output files and frozen version references, ordered by URI; `result.next_cursor` continues pagination |
 
 The update body requires `to`, `from` (a non-empty source URI array), `skill`, and `auto_update` (boolean). When `auto_update=true`, a valid `update_schedule` is required. When `auto_update=false`, the schedule can be omitted or null; the saved rule is cleared and the returned value is null. New targets have no default rule, and enabling updates after disabling them requires a rule. Optional `instruction` preserves the saved value when omitted; `null` or an empty string clears it. Updating settings does not submit a Compile task.
 
@@ -129,7 +130,7 @@ The update body requires `to`, `from` (a non-empty source URI array), `skill`, a
 
 Scheduled updates require `compile_api.scheduler_enabled=true` (default `false`) and valid `expiry.service_name` and `expiry.redis` configuration. `compile_api.scheduler_backend` only accepts `redis` (the default); `local` is invalid. Enabling `auto_update` while scheduling is disabled returns `COMPILE_SCHEDULER_DISABLED`. Manual incremental Compile and version management do not require Redis.
 
-Both history endpoints accept optional query parameters `limit` (1–100, default 20) and `cursor`. Pass the returned `next_cursor` unchanged; `null` marks the last page. `operation_id` is 1–128 characters, starts with a letter or digit, and otherwise allows letters, digits, `:`, `.`, `_`, and `-`. Operations remain queryable after target deletion. Missing targets, operations, or output manifests return `404`. A null `version_id` or `snapshot_id` on an output item indicates that the corresponding reference is unavailable.
+The history and output list endpoints accept optional query parameters `limit` (1–100, default 20) and `cursor`. Pass the returned `next_cursor` unchanged; `null` marks the last page.
 
 ### Check Compile availability
 
