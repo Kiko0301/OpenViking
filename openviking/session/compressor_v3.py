@@ -45,6 +45,7 @@ from openviking.session.memory.experience.dag import MAX_EVIDENCE_SUMMARY_CHARS
 from openviking.session.memory.experience.rubric import parse_case_rubric
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import get_default_registry
+from openviking.session.memory.range_padding import EventRangePaddingError
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
 )
@@ -614,7 +615,11 @@ class SessionCompressorV3:
                 archive_uri=archive_uri or "",
             )
         except Exception as exc:
-            if minimal_mode or strict_extract_errors or isinstance(exc, ConflictError):
+            if (
+                minimal_mode
+                or strict_extract_errors
+                or isinstance(exc, (ConflictError, EventRangePaddingError))
+            ):
                 raise
             tracer.error(
                 "V3 memory extraction failed; returning empty result", e=exc, console=False
@@ -730,12 +735,12 @@ class SessionCompressorV3:
             thinking=extract_thinking,
         )
         operations, _tools_used = await orchestrator.run()
-        if minimal_mode and operations is not None:
-            # Validate the model's unpadded selection first. Padding must not turn
-            # invalid/assistant-only ranges into apparently supported events.
-            context_provider.expand_ranges(operations, memory_config.minimal_mode_range_padding)
-            # Use the same prepared messages for range rendering, including vision preprocessing.
-            messages = context_provider.messages
+        if operations is not None:
+            # Both modes pad only resolved events after extraction/validation.
+            context_provider.expand_ranges(operations, memory_config.event_range_padding)
+            if minimal_mode or memory_config.event_range_padding > 0:
+                # Keep rendering aligned with preprocessing, including vision descriptions.
+                messages = context_provider.messages
         if operations is None:
             tracer.info("[v3_patch_merge] No memory operations generated")
             return _V3ExtractionResult()

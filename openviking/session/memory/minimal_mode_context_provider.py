@@ -17,7 +17,6 @@ from openviking.session.memory.dataclass import (
 )
 from openviking.session.memory.extraction_output_protocol import ExtractionOutputContext
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
-from openviking.session.memory.range_padding import expand_event_ranges, parse_ranges
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
 
 _EVENT_RANGE_INSTRUCTIONS = """Select source message ranges for long-term event memory.
@@ -148,24 +147,3 @@ class MinimalModeContextProvider(SessionExtractContextProvider):
                     }
                 )
         return errors
-
-    def expand_ranges(self, operations: ResolvedOperations, padding: int) -> None:
-        """Pad validated ranges without changing event identities or broadening ownership."""
-        context = self.get_extract_context()
-        for operation in operations.upsert_operations:
-            ranges = operation.memory_fields["ranges"]
-            expanded = expand_event_ranges(context, self.messages, ranges, padding=padding)
-            selected = parse_ranges(ranges, len(context.messages))
-            padded = parse_ranges(expanded, len(context.messages))
-            owners = {
-                message.peer_id or "__self"
-                for i in selected
-                if (message := context.messages[i]).role == "user" or message.peer_id
-            }
-            if any(
-                (message.peer_id or "__self") not in owners
-                for i in padded - selected
-                if (message := context.messages[i]).role == "user" or message.peer_id
-            ):
-                raise ValueError("Event range padding must not cross memory-owner boundaries")
-            operation.memory_fields["ranges"] = expanded

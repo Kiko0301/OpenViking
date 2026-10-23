@@ -214,7 +214,7 @@ async def test_compressor_uses_llm_and_skips_other_memory_learning(
     import openviking.session.compressor_v3 as module
     from openviking.session.memory import account_templates
 
-    setup.config.memory.minimal_mode_range_padding = padding
+    setup.config.memory.event_range_padding = padding
     messages = make_messages(*(f"Fact {i}." for i in range(5)))
     if prepared:
         from dataclasses import replace
@@ -434,8 +434,8 @@ async def test_disabled_or_omitted_mode_uses_standard_provider_and_learning(
     )
 
     setup.config.memory = MemoryConfig(**({"minimal_mode": False} if explicit_false else {}))
-    # Even a large padding setting must have no effect outside minimal mode.
-    setup.config.memory.minimal_mode_range_padding = 100
+    # Padding is independent of selecting the standard provider and learning pipeline.
+    setup.config.memory.event_range_padding = 100
     setup.registry.initialize_memory_files = AsyncMock()
     monkeypatch.setattr(module, "get_viking_fs", lambda: SimpleNamespace())
     monkeypatch.setattr(
@@ -497,3 +497,18 @@ async def test_mode_specific_error_handling_preserves_standard_behavior(
             make_messages("A fact."), ctx=setup.ctx
         )
         assert result["contexts"] == []
+
+
+@pytest.mark.asyncio
+async def test_padding_errors_propagate_in_normal_mode(setup, monkeypatch):
+    import openviking.session.compressor_v3 as module
+    from openviking.session.memory.range_padding import EventRangePaddingError
+
+    setup.config.memory.minimal_mode = False
+    monkeypatch.setattr(module, "get_viking_fs", lambda: SimpleNamespace())
+    compressor = module.SessionCompressorV3(vikingdb=None)
+    compressor._extract_user_memories = AsyncMock(
+        side_effect=EventRangePaddingError("unsafe padding")
+    )
+    with pytest.raises(EventRangePaddingError, match="unsafe padding"):
+        await compressor.extract_long_term_memories(make_messages("A fact."), ctx=setup.ctx)
