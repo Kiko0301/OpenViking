@@ -584,6 +584,7 @@ When the gateway runs inside the server, use the server's port; when it runs sta
 | GET | `/api/v1/compile/config` | Read target settings |
 | POST | `/api/v1/compile/config/update` | Update target settings |
 | GET | `/api/v1/compile/configs` | List visible targets |
+| POST | `/api/v1/compile/configs/query` | Check whether each URI in a batch is a Compile target |
 | GET | `/api/v1/compile/operations` | List target operations |
 | GET | `/api/v1/compile/operations/{operation_id}/outputs` | List operation outputs and version references |
 | POST | `/api/v1/compile/embeddings` | Embed transient Compile routing texts |

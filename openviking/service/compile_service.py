@@ -47,6 +47,23 @@ _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 MEMORY_COMPILE_SKILL = "memory"
 
 
+class CompileConfigQuery(BaseModel):
+    """Exact target lookup with 1–50 URIs, each at most 2048 UTF-8 bytes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    to: list[str] = Field(
+        min_length=1, max_length=50, description="Exact target URIs, each at most 2048 UTF-8 bytes"
+    )
+
+    @model_validator(mode="after")
+    def _validate_paths(self) -> "CompileConfigQuery":
+        """Reject blank targets and bound URI bytes before storage access."""
+        if any(not uri.strip() or len(uri.encode("utf-8")) > 2048 for uri in self.to):
+            raise ValueError("to entries require 1..2048 UTF-8 bytes")
+        return self
+
+
 class CompileConfigUpdate(BaseModel):
     """Whole update settings for one Compile target (POST /compile/config/update)."""
 
@@ -664,6 +681,22 @@ class CompileService:
         if lifecycle.reschedule is not None:
             await lifecycle.reschedule(ctx.account_id, record)
         return self._config_view(record)
+
+    async def query_configs(self, body: CompileConfigQuery, ctx: RequestContext) -> dict[str, bool]:
+        """Map each supplied URI to whether it is an active Compile target in the caller's account.
+
+        Missing or deleted registrations return false. Read denial and storage failures propagate;
+        lookup normalizes URIs without changing response keys or scanning the registry.
+        """
+        lifecycle = self._require_lifecycle()
+        result = {}
+        for uri in dict.fromkeys(body.to):
+            target = validate_request_viking_uri(
+                resolve_path_variables(uri), ctx, field_name="to"
+            ).rstrip("/")
+            await lifecycle._fs._ensure_access(target, ctx)
+            result[uri] = await lifecycle.store.get_by_to(ctx.account_id, target) is not None
+        return result
 
     async def list_configs(
         self, ctx: RequestContext, *, limit: int, cursor: str | None

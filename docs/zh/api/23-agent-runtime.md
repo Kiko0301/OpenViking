@@ -119,6 +119,7 @@ task, err := client.Compile(
 | `GET /api/v1/compile/config?to={to}` | `result` 包含目标配置和运行状态 |
 | `POST /api/v1/compile/config/update` | 请求体必填 `to`，指定要更新配置的已注册编译产物目录；`result` 包含更新后的配置和运行状态 |
 | `GET /api/v1/compile/configs` | 可选查询参数 `limit`（1–100，默认 20）和 `cursor`；`result.targets` 按 `target_id` 升序返回本页可见目标摘要；将 `result.next_cursor` 原样作为下一页的 `cursor`，末页为 `null` |
+| `POST /api/v1/compile/configs/query` | JSON 请求体 `{"to": ["viking://resources/wiki"]}` 精确查询 1–50 个目标 URI；单条不超过 2048 UTF-8 字节，JSON 请求体不超过 128 KiB。`result` 以输入 URI 为键、布尔值为值：有效 Compile 目标为 `true`，未注册或已删除的目标为 `false`。每条 URI 均需读取权限；查询不分页、不扫描整个注册表、不修改状态 |
 | `GET /api/v1/compile/operations?to={to}` | `result.operations` 按时间倒序返回操作记录；`result.next_cursor` 用于翻页 |
 | `GET /api/v1/compile/operations/{operation_id}/outputs?to={to}` | `result.outputs` 按 URI 排序返回产出文件及冻结版本引用；`result.next_cursor` 用于翻页 |
 
