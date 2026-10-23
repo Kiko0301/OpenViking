@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -41,7 +40,7 @@ from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
     ids=["memory-omitted", "mode-omitted", "padding-zero", "padding-one", "padding-two"],
 )
 async def test_normal_mode_pads_events_and_preserves_standard_extraction(
-    monkeypatch, record_property, config_data, expected_ranges
+    monkeypatch, config_data, expected_ranges
 ):
     import openviking.session.compressor_v3 as module
     from openviking.session.memory import account_templates
@@ -156,25 +155,6 @@ async def test_normal_mode_pads_events_and_preserves_standard_extraction(
     assert ("Thanks." in body) is (expected_ranges != "2")
     assert ("First context." in body) is (expected_ranges == "0-4")
     assert ("Last context." in body) is (expected_ranges == "0-4")
-
-    # Capture deterministic observables for an external before/after-base comparison.
-    # Runtime trace/extraction IDs and clocks are deliberately not part of this contract.
-    snapshot = {
-        "provider": type(provider).__name__,
-        "schemas": original_schemas,
-        "model_requests": [call.kwargs for call in vlm.get_completion_async.await_args_list],
-        "prefetch_requests": [
-            {"args": call.args, "kwargs": call.kwargs} for call in prefetch.await_args_list
-        ],
-        "memory_fields": operation.memory_fields,
-        "uris": operation.uris,
-        "rendered": rendered,
-        "train_calls": compressor.train_from_extracted_cases.await_count,
-        "skill_calls": compressor.extract_session_skills.await_count,
-    }
-    record_property(
-        "default_mode_snapshot", json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
-    )
 
 
 def test_padding_skips_other_types_unresolved_and_summary_only_events(monkeypatch):

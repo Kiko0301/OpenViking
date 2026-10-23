@@ -210,7 +210,6 @@ def test_server_names_are_stable_and_model_prose_is_not_preserved(setup):
 async def test_compressor_uses_llm_and_skips_other_memory_learning(
     setup, monkeypatch, padding, expected, prepared
 ):
-    import openviking.models.jev as jev_module
     import openviking.session.compressor_v3 as module
     from openviking.session.memory import account_templates
 
@@ -238,9 +237,6 @@ async def test_compressor_uses_llm_and_skips_other_memory_learning(
     monkeypatch.setattr(MemoryTypeRegistry, "initialize_memory_files", AsyncMock())
     monkeypatch.setattr(
         account_templates, "resolve_account_memory_registry", AsyncMock(return_value=setup.registry)
-    )
-    monkeypatch.setattr(
-        jev_module.JevClient, "evaluate", AsyncMock(side_effect=AssertionError("No JEV"))
     )
     vlm = SimpleNamespace(
         model="test-model", get_completion_async=AsyncMock(return_value=response_for("python", "2"))

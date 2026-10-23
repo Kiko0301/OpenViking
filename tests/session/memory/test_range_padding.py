@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from benchmark.locomo.vikingbot.range_padding import expand_event_ranges, parse_ranges
 from openviking.message import Message, TextPart
 from openviking.session.memory.memory_updater import ExtractContext
+from openviking.session.memory.range_padding import expand_event_ranges, parse_ranges
 
 
 def messages(count):
@@ -30,7 +30,7 @@ def messages(count):
 def test_span_padding_clips_and_unions_within_event(ranges, expected):
     source = messages(11)
     context = ExtractContext(source)
-    actual = expand_event_ranges(context, source, ranges)
+    actual = expand_event_ranges(context, source, ranges, padding=2)
     assert actual == expected
     assert parse_ranges(ranges, 11) <= parse_ranges(actual, 11)
 
@@ -65,7 +65,7 @@ def test_padding_counts_original_messages_not_chunks(padding):
 def test_invalid_input_is_not_hidden_by_clipping(ranges):
     source = messages(11)
     with pytest.raises(ValueError):
-        expand_event_ranges(ExtractContext(source), source, ranges)
+        expand_event_ranges(ExtractContext(source), source, ranges, padding=2)
 
 
 @pytest.mark.parametrize("padding", [-1, True, 1.5])
@@ -83,7 +83,7 @@ def test_large_padding_never_crosses_session_bounds():
 def test_missing_source_mapping_is_rejected():
     source = messages(3)
     with pytest.raises(ValueError, match="no original source"):
-        expand_event_ranges(ExtractContext(source), source[:2], "1")
+        expand_event_ranges(ExtractContext(source), source[:2], "1", padding=2)
 
 
 @pytest.mark.parametrize(

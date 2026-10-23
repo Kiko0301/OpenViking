@@ -49,7 +49,7 @@ def expand_event_ranges(
     source_messages: list[Message],
     ranges: str,
     *,
-    padding: int = 2,
+    padding: int,
 ) -> str:
     """Expand each selected span by original messages, not extraction chunks.
 
