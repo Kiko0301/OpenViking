@@ -494,6 +494,19 @@ class MCPService:
             and annotations.get("destructiveHint") is not True
         )
 
+    async def _readable_mount_rows(
+        self,
+        rows: list[sqlite3.Row],
+        ctx: RequestContext,
+    ) -> list[sqlite3.Row]:
+        if not rows:
+            return []
+        access = await self._service.fs.can_read_many(
+            [row["node_uri"] for row in rows],
+            ctx,
+        )
+        return [row for row in rows if access.get(row["node_uri"], False)]
+
     async def _affected_mounts(
         self,
         server_name: str,
@@ -513,6 +526,7 @@ class MCPService:
         finally:
             self._close_mount_database(connection)
 
+        rows = await self._readable_mount_rows(rows, ctx)
         affected: list[dict[str, Any]] = []
         for row in rows:
             current = current_tools.get(row["tool_name"])
@@ -1320,6 +1334,7 @@ class MCPService:
         finally:
             self._close_mount_database(connection)
 
+        rows = await self._readable_mount_rows(rows, ctx)
         items = []
         for row in rows:
             data = json.loads(row["data"])
