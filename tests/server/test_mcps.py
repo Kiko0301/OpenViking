@@ -640,7 +640,20 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
 
     listed = await service.mounts("weather", "current", _ctx())
     assert listed["total"] == 1
-    assert listed["mounts"][0]["arguments"] == {"city": "Shanghai"}
+    assert listed["mounts"][0] == {
+        "node_uri": node_uri,
+        "mcp": "weather",
+        "tool": "current",
+        "tool_uri": tool_uri,
+        "input_revision": "input-revision-1",
+        "arguments": {"city": "Shanghai"},
+        "title": "Shanghai Weather",
+        "description": "Current weather in Shanghai",
+        "timeout_seconds": 120,
+        "tags": ["project=demo", "kind=live-context"],
+        "created_at": mounted["created_at"],
+    }
+    assert repeated["tags"] == ["project=demo", "kind=live-context"]
 
     fs.read.return_value = updated
     unmounted = await service.unmount(node_uri, _ctx(), wait=True)
@@ -722,6 +735,8 @@ async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkey
 
     assert mounted["total"] == 2
     assert [item["node_uri"] for item in mounted["mounts"]] == [mount.node_uri for mount in mounts]
+    assert mounted["mounts"][0]["tags"] == ["project=demo"]
+    assert mounted["mounts"][1]["tags"] == []
     fs.batch_write.assert_awaited_once()
     batch_call = fs.batch_write.await_args.kwargs
     assert batch_call["root_uri"] == "viking://resources/demo"

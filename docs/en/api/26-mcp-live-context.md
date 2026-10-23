@@ -427,7 +427,7 @@ ov mcps invoke viking://agent/tools/weather/current.json \
 | `description` | string/null | No | `null` | Node description |
 | `timeout_seconds` | integer | No | `60` | Per-call timeout; must be positive |
 | `arguments` | object | No | `{}` | Preset arguments validated against the tool schema |
-| `tags` | string[]/null | No | `null` | Retrieval tags for the node |
+| `tags` | string[]/null | No | `null` | Retrieval tags; omission preserves existing tags on replacement, while `[]` clears them |
 | `wait` | boolean | No | `false` | Wait for node processing; at the outer level for a batch |
 
 **Python SDK**
@@ -506,6 +506,7 @@ The current CLI `mount` command has no `--tags` option. Use an SDK or HTTP when 
     "description": "Query current weather in Beijing",
     "timeout_seconds": 60,
     "arguments": {"city": "Beijing"},
+    "tags": ["source=mcp"],
     "created_at": "2026-10-21T08:30:00+00:00",
     "mounted": true
   }
@@ -549,6 +550,10 @@ ov mcps mounts --mcp weather --tool current
       "tool_uri": "viking://agent/tools/weather/current.json",
       "input_revision": "sha256-input-revision",
       "arguments": {"city": "Beijing"},
+      "title": "Beijing live weather",
+      "description": "Query current weather in Beijing",
+      "timeout_seconds": 60,
+      "tags": ["source=mcp"],
       "created_at": "2026-10-21T08:30:00+00:00"
     }],
     "total": 1

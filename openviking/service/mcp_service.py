@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS live_context_nodes (
     tool_uri TEXT NOT NULL,
     input_revision TEXT NOT NULL,
     args_json TEXT NOT NULL,
+    data TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_live_context_nodes_tool
@@ -922,6 +923,13 @@ class MCPService:
                 )
                 arguments_json = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
                 created_at = existing["created_at"] if existing is not None else _now()
+                existing_data = json.loads(existing["data"]) if existing is not None else {}
+                mount_data = {
+                    "title": title,
+                    "description": description,
+                    "timeout_seconds": timeout_seconds,
+                    "tags": tags if tags is not None else existing_data.get("tags", []),
+                }
                 await self._service.fs.write(
                     node_uri,
                     content,
@@ -934,14 +942,15 @@ class MCPService:
                     """
                     INSERT INTO live_context_nodes (
                         node_uri, mcp_name, tool_name, tool_uri, input_revision, args_json,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        data, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(node_uri) DO UPDATE SET
                         mcp_name = excluded.mcp_name,
                         tool_name = excluded.tool_name,
                         tool_uri = excluded.tool_uri,
                         input_revision = excluded.input_revision,
-                        args_json = excluded.args_json
+                        args_json = excluded.args_json,
+                        data = excluded.data
                     """,
                     (
                         node_uri,
@@ -950,6 +959,7 @@ class MCPService:
                         tool_uri,
                         tool_document["input_revision"],
                         arguments_json,
+                        json.dumps(mount_data, ensure_ascii=False, sort_keys=True),
                         created_at,
                     ),
                 )
@@ -967,6 +977,7 @@ class MCPService:
             "description": description,
             "timeout_seconds": timeout_seconds,
             "arguments": arguments,
+            "tags": mount_data["tags"],
             "created_at": created_at,
             "mounted": True,
         }
@@ -1033,10 +1044,21 @@ class MCPService:
             try:
                 for item in prepared:
                     existing = connection.execute(
-                        "SELECT created_at FROM live_context_nodes WHERE node_uri = ?",
+                        "SELECT created_at, data FROM live_context_nodes WHERE node_uri = ?",
                         (item["node_uri"],),
                     ).fetchone()
                     item["created_at"] = existing["created_at"] if existing is not None else _now()
+                    existing_data = json.loads(existing["data"]) if existing is not None else {}
+                    item["data"] = {
+                        "title": item["title"],
+                        "description": item["description"],
+                        "timeout_seconds": item["timeout_seconds"],
+                        "tags": (
+                            item["tags"]
+                            if item["tags"] is not None
+                            else existing_data.get("tags", [])
+                        ),
+                    }
 
                 operations_by_root: dict[str, list[dict[str, Any]]] = {}
                 direct_writes: list[dict[str, Any]] = []
@@ -1077,14 +1099,15 @@ class MCPService:
                         """
                         INSERT INTO live_context_nodes (
                             node_uri, mcp_name, tool_name, tool_uri, input_revision, args_json,
-                            created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            data, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(node_uri) DO UPDATE SET
                             mcp_name = excluded.mcp_name,
                             tool_name = excluded.tool_name,
                             tool_uri = excluded.tool_uri,
                             input_revision = excluded.input_revision,
-                            args_json = excluded.args_json
+                            args_json = excluded.args_json,
+                            data = excluded.data
                         """,
                         (
                             item["node_uri"],
@@ -1097,6 +1120,7 @@ class MCPService:
                                 ensure_ascii=False,
                                 sort_keys=True,
                             ),
+                            json.dumps(item["data"], ensure_ascii=False, sort_keys=True),
                             item["created_at"],
                         ),
                     )
@@ -1115,6 +1139,7 @@ class MCPService:
                 "description": item.get("description"),
                 "timeout_seconds": item["timeout_seconds"],
                 "arguments": item["arguments"],
+                "tags": item["data"]["tags"],
                 "created_at": item["created_at"],
                 "mounted": True,
             }
@@ -1284,18 +1309,24 @@ class MCPService:
         finally:
             self._close_mount_database(connection)
 
-        items = [
-            {
-                "node_uri": row["node_uri"],
-                "mcp": row["mcp_name"],
-                "tool": row["tool_name"],
-                "tool_uri": row["tool_uri"],
-                "input_revision": row["input_revision"],
-                "arguments": json.loads(row["args_json"]),
-                "created_at": row["created_at"],
-            }
-            for row in rows
-        ]
+        items = []
+        for row in rows:
+            data = json.loads(row["data"])
+            items.append(
+                {
+                    "node_uri": row["node_uri"],
+                    "mcp": row["mcp_name"],
+                    "tool": row["tool_name"],
+                    "tool_uri": row["tool_uri"],
+                    "input_revision": row["input_revision"],
+                    "arguments": json.loads(row["args_json"]),
+                    "title": data["title"],
+                    "description": data.get("description"),
+                    "timeout_seconds": data["timeout_seconds"],
+                    "tags": data.get("tags", []),
+                    "created_at": row["created_at"],
+                }
+            )
         return {"mounts": items, "total": len(items)}
 
     @staticmethod

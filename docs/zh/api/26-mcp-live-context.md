@@ -426,7 +426,7 @@ ov mcps invoke viking://agent/tools/weather/current.json \
 | `description` | string/null | 否 | `null` | 节点说明 |
 | `timeout_seconds` | integer | 否 | `60` | 单次工具调用超时，必须大于 0 |
 | `arguments` | object | 否 | `{}` | 固定注入并按工具 schema 校验的参数 |
-| `tags` | string[]/null | 否 | `null` | 节点检索标签 |
+| `tags` | string[]/null | 否 | `null` | 节点检索标签；替换挂载时省略则保留原标签，传 `[]` 则清空 |
 | `wait` | boolean | 否 | `false` | 是否等待节点处理完成；批量接口位于最外层 |
 
 **Python SDK**
@@ -505,6 +505,7 @@ ov mcps mount \
     "description": "查询北京当前天气",
     "timeout_seconds": 60,
     "arguments": {"city": "Beijing"},
+    "tags": ["source=mcp"],
     "created_at": "2026-10-21T08:30:00+00:00",
     "mounted": true
   }
@@ -548,6 +549,10 @@ ov mcps mounts --mcp weather --tool current
       "tool_uri": "viking://agent/tools/weather/current.json",
       "input_revision": "sha256-input-revision",
       "arguments": {"city": "Beijing"},
+      "title": "北京实时天气",
+      "description": "查询北京当前天气",
+      "timeout_seconds": 60,
+      "tags": ["source=mcp"],
       "created_at": "2026-10-21T08:30:00+00:00"
     }],
     "total": 1

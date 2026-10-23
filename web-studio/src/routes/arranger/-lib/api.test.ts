@@ -98,19 +98,18 @@ describe('MCP response parsing', () => {
     expect(parseMcpServers([{ name: 'database' }])).toEqual([
       { name: 'database' },
     ])
-    expect(
-      parseMcpMounts({
-        mounts: [
-          {
-            arguments: {},
-            mcp: 'k8s',
-            node_uri: 'viking://resources/arrange/status.md',
-            tool: 'status',
-            tool_uri: 'viking://agent/tools/mcp/k8s/status.mcp',
-          },
-        ],
-      }),
-    ).toHaveLength(1)
+    const mount = {
+      arguments: { cluster: 'production' },
+      description: 'Production cluster health',
+      mcp: 'k8s',
+      node_uri: 'viking://resources/arrange/status.md',
+      tags: ['environment=production'],
+      timeout_seconds: 120,
+      title: 'Cluster health',
+      tool: 'status',
+      tool_uri: 'viking://agent/tools/k8s/status.json',
+    }
+    expect(parseMcpMounts({ mounts: [mount] })).toEqual([mount])
   })
 
   it('reports a connection error when Vite HTML is returned', () => {
