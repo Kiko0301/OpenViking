@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -405,22 +406,43 @@ class CompileService:
         request = self._normalize_request_uris(request, ctx)
         if idempotency_key:
             payload, private_payload = self._split_payload(request)
-            existing = await self._tasks.recover_submission(
-                self.task_type, payload, private_payload, ctx, idempotency_key
-            )
+            started_at = time.perf_counter()
+            try:
+                existing = await self._tasks.recover_submission(
+                    self.task_type, payload, private_payload, ctx, idempotency_key
+                )
+            finally:
+                logger.info(
+                    "Compile submission recover_submission duration_ms=%.3f",
+                    (time.perf_counter() - started_at) * 1000,
+                )
             if existing is not None:
                 self._schedule_history(existing)
                 return existing
         endpoint = self._endpoint()
         if not endpoint.local and not str(connection.get("api_key") or "").strip():
             raise UnauthenticatedError("Compile requires a forwardable OpenViking API key")
-        normalized = await self._normalize_request(request, ctx)
+        started_at = time.perf_counter()
+        try:
+            normalized = await self._normalize_request(request, ctx)
+        finally:
+            logger.info(
+                "Compile submission _normalize_request duration_ms=%.3f",
+                (time.perf_counter() - started_at) * 1000,
+            )
         submitted, private_payload = self._split_payload(normalized)
         payload = submitted
         if self._lifecycle is not None:
-            payload = await self._lifecycle.prepare(
-                submitted, ctx, instruction_set=request._instruction_sent
-            )
+            started_at = time.perf_counter()
+            try:
+                payload = await self._lifecycle.prepare(
+                    submitted, ctx, instruction_set=request._instruction_sent
+                )
+            finally:
+                logger.info(
+                    "Compile submission prepare duration_ms=%.3f",
+                    (time.perf_counter() - started_at) * 1000,
+                )
         return await self._create_task(
             payload, submitted, private_payload, normalized, connection, ctx, idempotency_key
         )
