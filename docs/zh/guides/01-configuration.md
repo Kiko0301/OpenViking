@@ -1682,9 +1682,31 @@ openviking-server --config /path/to/ov.conf
 | `version` | 已废弃且会被忽略。OpenViking 始终使用 v3 记忆抽取链路；已有配置中保留该字段仍可正常加载，不会报错。 | `"v3"` |
 | `custom_templates_dir` | 自定义 memory templates 目录。设置后会在内置模板之外加载该目录中的模板。 | `""` |
 | `extraction_enabled` | session commit 时是否执行长期记忆抽取。 | `true` |
+| `minimal_mode` | 极简长期记忆模式：LLM 只选事件 ranges，代码拼接原文，不生成事件摘要，也不执行其他类型的记忆学习。关闭或省略时使用原有抽取/学习流程。 | `false` |
+| `minimal_mode_range_padding` | 仅极简模式生效；每段 range 前后各扩展的**原始消息**条数（非拆分 chunk），非负整数。0 保留原选区；1、2 对应扩一条、两条实验。 | `1` |
 | `session_skill_extraction_enabled` | session commit 时是否同时抽取可复用 skill 到当前用户的 skill 目录。 | `false` |
 | `link_enabled` | 记忆抽取是否写入和解析 memory links。 | `false` |
 | `session_auto_commit` | 服务端 session 自动 commit 的全局控制项。该配置属于 `memory` 段，不属于 `server` 段；详见 [Session Auto Commit 配置](#session-auto-commit-配置)。 | 见上文 |
+
+#### 极简记忆模式
+
+只需在现有 `ov.conf` 的 `memory` 段中设置：
+
+```json
+{
+  "memory": {
+    "minimal_mode": true,
+    "minimal_mode_range_padding": 1
+  }
+}
+```
+
+- `minimal_mode` 默认关闭；设为 `false` 或省略，保留原有模板、摘要、记忆类型、Agent evolution 和 Skill 开关语义。`minimal_mode_range_padding` 在此时不生效。
+- 开启后，使用现有 LLM/ExtractLoop 分事件并选择可不连续的 ranges；只写 events，文件名由代码生成，不让模型生成事件标题、goal 或 summary。暂停此 session commit 的 Case、Trajectory、Experience、Skill 及其他类型的记忆学习，不修改相关全局开关。
+- 在原始 ranges 校验成功后用代码扩展消息，截断于当前提交的消息边界，同一事件内合并范围，不合并不同事件，保留扩展前的文件名和 URI。扩展若引入其他记忆所有者的消息则报错，避免跨 peer 写入；无效 ranges 不会因扩展而变合法。
+- 默认前后各扩 1 条原始消息；可显式设为 0 或 2 对应其他实验方案。扩展不额外调用 LLM，但最初分段仍调用 LLM，embedding 仍有成本。
+- 在线问答/检索、已有记忆、会话 working-memory/归档摘要策略均不改变。这里“不生成摘要”特指新 event 记忆正文；仍沿用现有目录索引。关闭开关不会删除或改写已产生的极简记忆。
+- 这是服务端启动配置，按正常配置加载流程生效；无需为保持原有行为而修改现有 `ov.conf`。
 
 ### ovcli.conf
 

@@ -1715,9 +1715,31 @@ For memory-related settings, add a `memory` section in `ov.conf`:
 | `version` | Deprecated and ignored. OpenViking always uses the v3 memory extraction pipeline; existing configs that set this field still load without error. | `"v3"` |
 | `custom_templates_dir` | Custom memory templates directory. If set, templates from this directory are loaded in addition to built-in templates. | `""` |
 | `extraction_enabled` | Whether session commit runs long-term memory extraction. | `true` |
+| `minimal_mode` | Opt-in events-only memory: an LLM selects ranges and code assembles source text, without event summaries or other memory learning. Disabled or omitted preserves normal extraction and learning. | `false` |
+| `minimal_mode_range_padding` | Only in minimal mode: nonnegative number of **original messages**, not chunks, added on each side of a selected range. Zero preserves the selection; 1 and 2 reproduce the padding treatments. | `1` |
 | `session_skill_extraction_enabled` | Whether session commit also extracts reusable skills into the current user's skill directory. | `false` |
 | `link_enabled` | Whether memory extraction writes and resolves memory links. | `false` |
 | `session_auto_commit` | Server-wide automatic session commit controls. This belongs under `memory`, not under `server`; see [Session Auto Commit Configuration](#session-auto-commit-configuration). | See section above |
+
+#### Minimal memory mode
+
+Set these fields in the existing `memory` section of `ov.conf`:
+
+```json
+{
+  "memory": {
+    "minimal_mode": true,
+    "minimal_mode_range_padding": 1
+  }
+}
+```
+
+- The mode is disabled by default. With `false` or no setting, existing templates, summaries, memory types, Agent evolution and Skill settings keep their original behavior; padding is ignored.
+- When enabled, the existing LLM/ExtractLoop selects possibly non-contiguous event ranges. Only events are written, with code-generated names and no generated event titles, goals or summaries. Other memory learning, including Case, Trajectory, Experience and Skill, is skipped for this session commit without changing those global settings.
+- Code pads validated ranges within the submitted messages, unions overlaps within each event, and preserves separate event identities and pre-padding file names/URIs. Padding that introduces another memory owner's messages fails rather than writing across peers. Padding cannot repair invalid source selections.
+- The default adds one original message on each side. Set 0 or 2 explicitly for the other experimental treatments. Padding adds no LLM calls; initial segmentation and embedding still incur their usual costs.
+- Online answering/retrieval, existing memories, working-memory/archive summaries and directory indexing are unchanged. No-summary refers to newly created event bodies. Disabling the mode does not delete or rewrite previously generated memories.
+- This is startup configuration, applied through normal configuration loading. Existing `ov.conf` files need no changes to preserve their original behavior.
 
 ### ovcli.conf
 

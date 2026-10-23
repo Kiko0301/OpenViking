@@ -94,6 +94,25 @@ class MemoryConfig(BaseModel):
             "stateless deployments."
         ),
     )
+    minimal_mode: bool = Field(
+        default=False,
+        description=(
+            "Opt in to events-only memory: an LLM selects source ranges and code writes "
+            "the original conversation, without event summaries or other memory learning. "
+            "When disabled, the normal extraction and learning pipeline is unchanged."
+        ),
+    )
+    minimal_mode_range_padding: int = Field(
+        default=1,
+        ge=0,
+        strict=True,
+        description=(
+            "Original messages added before and after each selected event range in minimal "
+            "mode, clipped to the session. Zero preserves the selected ranges exactly. "
+            "Ignored when minimal_mode is disabled."
+        ),
+    )
+
     extraction_output_format: Literal["json", "python"] = Field(
         default="python",
         description=(
