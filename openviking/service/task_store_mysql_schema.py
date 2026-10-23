@@ -141,8 +141,8 @@ def make_task_store_models(table_prefix: str = "ov_tasks") -> TaskStoreModels:
         task_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"), primary_key=True)
         task_type: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
         status: Mapped[str] = mapped_column(String(16, collation="ascii_bin"))
-        created_at: Mapped[float] = mapped_column(DOUBLE)
-        updated_at: Mapped[float] = mapped_column(DOUBLE)
+        created_at: Mapped[float] = mapped_column(DOUBLE(asdecimal=False))
+        updated_at: Mapped[float] = mapped_column(DOUBLE(asdecimal=False))
         resource_id: Mapped[Optional[str]] = mapped_column(
             Text(collation="utf8mb4_bin"), nullable=True
         )
@@ -156,7 +156,9 @@ def make_task_store_models(table_prefix: str = "ov_tasks") -> TaskStoreModels:
         result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
         error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
         auth: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
-        processing_seconds: Mapped[Optional[float]] = mapped_column(DOUBLE, nullable=True)
+        processing_seconds: Mapped[Optional[float]] = mapped_column(
+            DOUBLE(asdecimal=False), nullable=True
+        )
         reject_if_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
         is_internal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
         active_business_key: Mapped[Optional[str]] = mapped_column(
@@ -204,10 +206,14 @@ def make_task_store_models(table_prefix: str = "ov_tasks") -> TaskStoreModels:
         error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
         errors: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
         context_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-        enqueued_at: Mapped[float] = mapped_column(DOUBLE)
-        started_at: Mapped[Optional[float]] = mapped_column(DOUBLE, nullable=True)
-        finished_at: Mapped[Optional[float]] = mapped_column(DOUBLE, nullable=True)
-        updated_at: Mapped[float] = mapped_column(DOUBLE)
+        enqueued_at: Mapped[float] = mapped_column(DOUBLE(asdecimal=False))
+        started_at: Mapped[Optional[float]] = mapped_column(
+            DOUBLE(asdecimal=False), nullable=True
+        )
+        finished_at: Mapped[Optional[float]] = mapped_column(
+            DOUBLE(asdecimal=False), nullable=True
+        )
+        updated_at: Mapped[float] = mapped_column(DOUBLE(asdecimal=False))
 
     class Event(Base):
         __tablename__ = event_table

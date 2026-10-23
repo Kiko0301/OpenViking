@@ -11,6 +11,7 @@ import hmac
 import secrets
 import ssl as ssl_module
 from contextlib import asynccontextmanager
+from datetime import timezone
 from typing import AsyncGenerator
 from uuid import uuid4
 
@@ -128,6 +129,12 @@ def _deletion(record) -> DeletionRecord | None:
         owner_account_id=record.deletion_owner_account_id,
         owner_user_id=record.deletion_owner_user_id,
     )
+
+
+def _utc_isoformat(value) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 
 @mysql_runtime_store
@@ -439,7 +446,7 @@ class MySQLAccountStore(AccountStore):
     def _account_summary(account, user_count: int) -> AccountSummary:
         return {
             "account_id": account.account_id,
-            "created_at": account.created_at.isoformat(),
+            "created_at": _utc_isoformat(account.created_at),
             "user_count": user_count,
             "status": "deleting" if account.deletion_task_id else "active",
             **({"task_id": account.deletion_task_id} if account.deletion_task_id else {}),

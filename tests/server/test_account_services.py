@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import threading
+from datetime import datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -62,6 +63,21 @@ def test_mysql_account_schema_defines_management_list_indexes():
         "created_at",
         "user_pk",
     )
+
+
+def test_mysql_account_summary_formats_naive_datetimes_as_utc():
+    from openviking.server.account_stores.mysql import MySQLAccountStore
+
+    summary = MySQLAccountStore._account_summary(
+        SimpleNamespace(
+            account_id="default",
+            created_at=datetime(2026, 10, 24, 1, 2, 3, 456789),
+            deletion_task_id=None,
+        ),
+        0,
+    )
+
+    assert summary["created_at"] == "2026-10-24T01:02:03.456789+00:00"
 
 
 @pytest.mark.parametrize(
