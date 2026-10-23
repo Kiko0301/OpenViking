@@ -122,6 +122,8 @@ claude mcp add --transport http openviking \
 
 以下列出内置 MCP 工具。实际可用工具以所连接服务的 `tools/list` 响应为准：
 
+<div v-pre>
+
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
 | `find_mcp_tools` | 按用户意图语义检索已注册的上游 MCP 工具。返回按相关度排序的候选项，包含 `uri`、`score` 和完整 MCP `tool` 定义（含 `inputSchema` 与 annotations）。可直接将返回的 `uri` 作为 `invoke_mcp_tool.tool_uri`，无需额外调用 `read` | `query`, `limit`（默认 10） |
@@ -150,6 +152,8 @@ claude mcp add --transport http openviking \
 | `list_groups` | 查询当前 account 的组 ID，不返回成员名单 | 无 |
 | `get_acl` | 查看共享资源的直接、继承和有效 ACL；要求该节点的 manage 或账号 ADMIN | `uri` |
 | `set_acl` | 设置共享资源 ACL；按修改前的权限校验 manage | `uri`, `acl` |
+
+</div>
 
 在 MCP 工具中访问自己的工作区，请使用家目录别名 `viking://~`。它在所有控制面
 （REST API、`ov` CLI、SDK 和 MCP）上都会展开为 `viking://user/<当前用户>`，因此

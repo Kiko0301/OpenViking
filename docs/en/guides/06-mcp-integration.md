@@ -126,6 +126,8 @@ Enable `oauth.enabled` on the server and configure HTTPS as described in the OAu
 
 The built-in MCP tools are listed below. Use the connected server's `tools/list` response to determine which tools are available:
 
+<div v-pre>
+
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
 | `find_mcp_tools` | Semantically discover registered upstream MCP tools for an intent. Returns ranked candidates with `uri`, `score`, and the complete MCP `tool` definition, including `inputSchema` and annotations. Use the returned `uri` directly as `invoke_mcp_tool.tool_uri`; no additional `read` is required | `query`, `limit` (default 10) |
@@ -154,6 +156,8 @@ The built-in MCP tools are listed below. Use the connected server's `tools/list`
 | `list_groups` | List group IDs in the caller's account without membership | None |
 | `get_acl` | Read direct, inherited and effective ACL; requires resource manage or account ADMIN | `uri` |
 | `set_acl` | Update a shared resource ACL; authorize against the permissions before the change | `uri`, `acl` |
+
+</div>
 
 To address your own workspace from an MCP tool, use the home alias `viking://~`. It
 expands to `viking://user/<current-user>` on every control plane (REST API, `ov` CLI,
