@@ -443,9 +443,16 @@ class CompileService:
                     "Compile submission prepare duration_ms=%.3f",
                     (time.perf_counter() - started_at) * 1000,
                 )
-        return await self._create_task(
-            payload, submitted, private_payload, normalized, connection, ctx, idempotency_key
-        )
+        started_at = time.perf_counter()
+        try:
+            return await self._create_task(
+                payload, submitted, private_payload, normalized, connection, ctx, idempotency_key
+            )
+        finally:
+            logger.info(
+                "Compile submission _create_task duration_ms=%.3f",
+                (time.perf_counter() - started_at) * 1000,
+            )
 
     async def create_scheduled(
         self,
