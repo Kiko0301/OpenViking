@@ -8,7 +8,7 @@ export type LiveContextMount = {
   mcp: string
   tool: string
   arguments: Record<string, unknown>
-  revision?: string
+  input_revision?: string
   created_at?: string
   title?: string
   description?: string
@@ -59,6 +59,7 @@ export type McpCatalogTool = {
   server: string
   uri: string
   revision: string
+  input_revision: string
   tool: McpToolDefinition
 }
 

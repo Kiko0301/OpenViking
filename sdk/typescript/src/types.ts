@@ -100,8 +100,8 @@ export interface MCPAffectedMount {
   tool_uri: string;
   tool: string;
   status: "REVIEW" | "INVALID" | "REMOVED";
-  mounted_revision: string;
-  current_revision: string | null;
+  mounted_input_revision: string;
+  current_input_revision: string | null;
   reason: string;
 }
 /** MCP tool-name changes reported by a catalog sync. */

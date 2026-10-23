@@ -784,9 +784,9 @@ mod tests {
                     "tool_uri": "viking://agent/tools/weather/current.json",
                     "tool": "current",
                     "status": "INVALID",
-                    "reason": "Tool revision changed; 'unit' is a required property",
-                    "mounted_revision": "old",
-                    "current_revision": "new"
+                    "reason": "Tool input revision changed; 'unit' is a required property",
+                    "mounted_input_revision": "old",
+                    "current_input_revision": "new"
                 }]
             }
         });

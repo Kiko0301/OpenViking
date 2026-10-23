@@ -221,7 +221,7 @@ curl -H "X-API-Key: your-key" \
 }
 ```
 
-The inspect response adds `tools` to the same server object. Each item contains `uri`, `server`, `address`, `revision`, and the upstream MCP `tool` definition.
+The inspect response adds `tools` to the same server object. Each item contains `uri`, `server`, `address`, `revision`, `input_revision`, and the upstream MCP `tool` definition. `revision` tracks the complete Tool definition; `input_revision` tracks the tool name and `inputSchema` for mount compatibility.
 
 **Status response**
 
@@ -241,12 +241,12 @@ On a connection failure, `result` is `{"name":"weather","status":"error","error"
 
 ### Synchronize the tool catalog
 
-`POST /api/v1/mcps/{name}/sync` discovers upstream tools again, rewrites only added or changed tools, and removes tools that disappeared upstream. It does not rewrite or delete existing live context nodes. Instead, `affected_mounts` reports:
+`POST /api/v1/mcps/{name}/sync` discovers upstream tools again, rewrites only added tools or tools whose `revision` changed, and removes tools that disappeared upstream. The `changed` and `unchanged` classifications use `input_revision`, so a description, annotations, or output-schema-only update refreshes the catalog while remaining `unchanged`. Sync does not rewrite or delete existing live context nodes. Instead, `affected_mounts` reports:
 
 | Status | Meaning |
 |--------|---------|
-| `REVIEW` | The tool revision changed and preset arguments still satisfy the new schema; review behavior |
-| `INVALID` | The tool revision changed and preset arguments no longer satisfy the new schema |
+| `REVIEW` | The tool input revision changed and preset arguments still satisfy the new schema; review behavior |
+| `INVALID` | The tool input revision changed and preset arguments no longer satisfy the new schema |
 | `REMOVED` | The upstream server no longer provides the tool |
 
 **Request body**
@@ -294,10 +294,10 @@ ov mcps sync --wait weather
       "node_uri": "viking://resources/weather/current.md",
       "tool_uri": "viking://agent/tools/weather/current.json",
       "tool": "current",
-      "mounted_revision": "old-revision",
-      "current_revision": "new-revision",
+      "mounted_input_revision": "old-input-revision",
+      "current_input_revision": "new-input-revision",
       "status": "REVIEW",
-      "reason": "Tool revision changed; mounted arguments remain valid under the current input schema"
+      "reason": "Tool input revision changed; mounted arguments remain valid under the current input schema"
     }]
   }
 }
@@ -356,6 +356,7 @@ ov mcps find --limit 5 "current weather for a city"
       "name": "current",
       "description": "Get current weather",
       "revision": "sha256-revision",
+      "input_revision": "sha256-input-revision",
       "score": 0.87,
       "tool": {
         "name": "current",
@@ -500,7 +501,7 @@ The current CLI `mount` command has no `--tags` option. Use an SDK or HTTP when 
     "mcp": "weather",
     "tool": "current",
     "tool_uri": "viking://agent/tools/weather/current.json",
-    "revision": "sha256-revision",
+    "input_revision": "sha256-input-revision",
     "title": "Beijing live weather",
     "description": "Query current weather in Beijing",
     "timeout_seconds": 60,
@@ -546,7 +547,7 @@ ov mcps mounts --mcp weather --tool current
       "mcp": "weather",
       "tool": "current",
       "tool_uri": "viking://agent/tools/weather/current.json",
-      "revision": "sha256-revision",
+      "input_revision": "sha256-input-revision",
       "arguments": {"city": "Beijing"},
       "created_at": "2026-10-21T08:30:00+00:00"
     }],

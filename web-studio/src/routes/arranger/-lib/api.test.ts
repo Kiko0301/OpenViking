@@ -129,6 +129,7 @@ describe('MCP response parsing', () => {
       parseMcpTools('demo', {
         tools: [
           {
+            input_revision: 'ir1',
             revision: 'r1',
             tool: {
               description: 'Add two numbers',
@@ -148,6 +149,7 @@ describe('MCP response parsing', () => {
       }),
     ).toEqual([
       expect.objectContaining({
+        input_revision: 'ir1',
         revision: 'r1',
         server: 'demo',
         uri: 'viking://agent/tools/demo/get-sum.json',

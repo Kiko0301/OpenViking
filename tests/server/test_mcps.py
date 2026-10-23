@@ -454,6 +454,7 @@ async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch, includ
         AsyncMock(
             return_value={
                 "revision": "revision-1",
+                "input_revision": "input-revision-1",
                 "tool": definition,
             }
         ),
@@ -481,6 +482,7 @@ async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch, includ
                 "name": "current",
                 "description": "Get current weather conditions",
                 "revision": "revision-1",
+                "input_revision": "input-revision-1",
                 "score": 0.87,
                 **({"tool": definition} if include_definition else {}),
             }
@@ -511,6 +513,7 @@ async def test_show_uses_catalog_instead_of_legacy_registry_tools(monkeypatch):
         "uri": "viking://agent/tools/weather/current.json",
         "server": "weather",
         "revision": "revision-1",
+        "input_revision": "input-revision-1",
         "tool": {"name": "current", "description": "Current weather"},
     }
     monkeypatch.setattr(service, "_catalog", AsyncMock(return_value=[current]))
@@ -552,6 +555,7 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
     tool_document = {
         "server": "weather",
         "revision": "revision-1",
+        "input_revision": "input-revision-1",
         "tool": {
             "name": "current",
             "title": "Current Weather",
@@ -587,13 +591,13 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
 
     assert mounted["mounted"] is True
     assert "idempotent" not in mounted
-    assert mounted["revision"] == "revision-1"
+    assert mounted["input_revision"] == "input-revision-1"
     written = fs.write.await_args.args[1]
     assert "type: OpenViking Live Context" in written
     assert "title: Beijing Weather" in written
     assert "description: Current weather in Beijing" in written
     assert f"definition: {tool_uri}" in written
-    assert "revision: revision-1" in written
+    assert "input_revision: input-revision-1" in written
     assert "timeout_seconds: 60" in written
     assert "city: Beijing" in written
     assert "x-instruction" not in written
@@ -680,6 +684,7 @@ async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkey
         return {
             "server": "weather",
             "revision": f"revision-{tool_name}",
+            "input_revision": f"input-revision-{tool_name}",
             "tool": {
                 "name": tool_name,
                 "inputSchema": {
@@ -780,6 +785,7 @@ async def test_mount_validates_node_uri_and_arguments(monkeypatch):
     tool_document = {
         "server": "weather",
         "revision": "revision-1",
+        "input_revision": "input-revision-1",
         "tool": {
             "name": "current",
             "inputSchema": {
@@ -800,7 +806,7 @@ async def test_mount_validates_node_uri_and_arguments(monkeypatch):
                 mcp_name TEXT,
                 tool_name TEXT,
                 tool_uri TEXT,
-                revision TEXT,
+                input_revision TEXT,
                 args_json TEXT,
                 created_at TEXT
             )
@@ -847,7 +853,7 @@ async def test_mount_validates_node_uri_and_arguments(monkeypatch):
         )
 
 
-async def test_sync_writes_only_added_and_changed_tools(monkeypatch):
+async def test_sync_writes_changed_definitions_without_changing_input_revision(monkeypatch):
     service = MCPService(SimpleNamespace())
     server = {"name": "demo", "url": "https://mcp.example.com/api"}
     discovered = [
@@ -857,6 +863,16 @@ async def test_sync_writes_only_added_and_changed_tools(monkeypatch):
             inputSchema={
                 "type": "object",
                 "properties": {"city": {"type": "string"}},
+            },
+        ),
+        Tool(
+            name="definition-only",
+            description="Updated description",
+            inputSchema={"type": "object"},
+            annotations={"readOnlyHint": True},
+            outputSchema={
+                "type": "object",
+                "properties": {"result": {"type": "string"}},
             },
         ),
         Tool(name="unchanged", inputSchema={"type": "object"}),
@@ -870,6 +886,21 @@ async def test_sync_writes_only_added_and_changed_tools(monkeypatch):
             "uri": "viking://agent/tools/demo/changed.json",
             **current["changed"],
             "revision": "old-changed-revision",
+            "input_revision": "old-changed-input-revision",
+        },
+        {
+            "uri": "viking://agent/tools/demo/definition-only.json",
+            **current["definition-only"],
+            "revision": "old-definition-revision",
+            "tool": {
+                **current["definition-only"]["tool"],
+                "description": "Old description",
+                "annotations": {"readOnlyHint": False},
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {"legacy": {"type": "boolean"}},
+                },
+            },
         },
         {
             "uri": "viking://agent/tools/demo/unchanged.json",
@@ -879,6 +910,7 @@ async def test_sync_writes_only_added_and_changed_tools(monkeypatch):
             "uri": "viking://agent/tools/demo/removed.json",
             "server": "demo",
             "revision": "removed-revision",
+            "input_revision": "removed-input-revision",
             "tool": {"name": "removed", "inputSchema": {"type": "object"}},
         },
     ]
@@ -924,15 +956,21 @@ async def test_sync_writes_only_added_and_changed_tools(monkeypatch):
 
     result = await service.sync("demo", _ctx(), wait=True)
 
+    assert existing[1]["input_revision"] == current["definition-only"]["input_revision"]
+    assert existing[1]["revision"] != current["definition-only"]["revision"]
     assert result["changes"] == {
         "added": ["added"],
         "changed": ["changed"],
-        "unchanged": ["unchanged"],
+        "unchanged": ["definition-only", "unchanged"],
         "removed": ["removed"],
     }
     assert result["affected_mounts"] == affected
     published = publish.await_args.args[1]
-    assert [document["tool"]["name"] for document in published] == ["added", "changed"]
+    assert [document["tool"]["name"] for document in published] == [
+        "added",
+        "changed",
+        "definition-only",
+    ]
     publish.assert_awaited_once_with(
         "demo",
         published,
@@ -955,7 +993,7 @@ async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeyp
                 mcp_name TEXT NOT NULL,
                 tool_name TEXT NOT NULL,
                 tool_uri TEXT NOT NULL,
-                revision TEXT NOT NULL,
+                input_revision TEXT NOT NULL,
                 args_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -983,7 +1021,7 @@ async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeyp
     )
     current_tools = {
         "valid": {
-            "revision": "new-valid",
+            "input_revision": "new-valid",
             "tool": {
                 "name": "valid",
                 "inputSchema": {
@@ -994,7 +1032,7 @@ async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeyp
             },
         },
         "invalid": {
-            "revision": "new-invalid",
+            "input_revision": "new-invalid",
             "tool": {
                 "name": "invalid",
                 "inputSchema": {
@@ -1005,7 +1043,7 @@ async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeyp
             },
         },
         "current": {
-            "revision": "current-revision",
+            "input_revision": "current-revision",
             "tool": {"name": "current", "inputSchema": {"type": "object"}},
         },
     }
@@ -1021,8 +1059,8 @@ async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeyp
     }
     invalid = next(item for item in first if item["tool"] == "invalid")
     assert "required property" in invalid["reason"]
-    assert invalid["mounted_revision"] == "old-invalid"
-    assert invalid["current_revision"] == "new-invalid"
+    assert invalid["mounted_input_revision"] == "old-invalid"
+    assert invalid["current_input_revision"] == "new-invalid"
     assert all(item["tool"] != "current" for item in first)
 
 

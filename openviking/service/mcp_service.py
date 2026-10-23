@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS live_context_nodes (
     mcp_name TEXT NOT NULL,
     tool_name TEXT NOT NULL,
     tool_uri TEXT NOT NULL,
-    revision TEXT NOT NULL,
+    input_revision TEXT NOT NULL,
     args_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -242,13 +242,23 @@ class MCPService:
         }
 
     @staticmethod
-    def _tool_revision(tool: dict[str, Any]) -> str:
+    def _input_revision(tool: dict[str, Any]) -> str:
         revision_input = {
             "name": tool.get("name"),
             "inputSchema": tool.get("inputSchema", {}),
         }
         payload = json.dumps(
             revision_input,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _tool_revision(tool: dict[str, Any]) -> str:
+        payload = json.dumps(
+            tool,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -263,6 +273,7 @@ class MCPService:
             "server": server["name"],
             "address": server["url"],
             "revision": MCPService._tool_revision(raw_tool),
+            "input_revision": MCPService._input_revision(raw_tool),
             "tool": raw_tool,
         }
 
@@ -448,6 +459,7 @@ class MCPService:
             not isinstance(document, dict)
             or document.get("server") != server_name
             or not isinstance(document.get("revision"), str)
+            or not isinstance(document.get("input_revision"), str)
             or not isinstance(tool, dict)
             or tool.get("name") != tool_name
         ):
@@ -496,8 +508,10 @@ class MCPService:
                 "node_uri": row["node_uri"],
                 "tool_uri": row["tool_uri"],
                 "tool": row["tool_name"],
-                "mounted_revision": row["revision"],
-                "current_revision": current["revision"] if current is not None else None,
+                "mounted_input_revision": row["input_revision"],
+                "current_input_revision": (
+                    current["input_revision"] if current is not None else None
+                ),
             }
             if current is None:
                 affected.append(
@@ -508,7 +522,7 @@ class MCPService:
                     }
                 )
                 continue
-            if row["revision"] == current["revision"]:
+            if row["input_revision"] == current["input_revision"]:
                 continue
 
             try:
@@ -521,7 +535,7 @@ class MCPService:
                     {
                         **item,
                         "status": "INVALID",
-                        "reason": f"Tool revision changed; {exc}",
+                        "reason": f"Tool input revision changed; {exc}",
                     }
                 )
             else:
@@ -530,7 +544,7 @@ class MCPService:
                         **item,
                         "status": "REVIEW",
                         "reason": (
-                            "Tool revision changed; mounted arguments remain valid "
+                            "Tool input revision changed; mounted arguments remain valid "
                             "under the current input schema"
                         ),
                     }
@@ -580,7 +594,7 @@ class MCPService:
                     "schema_version": "v1",
                     "type": "mcp",
                     "definition": tool_uri,
-                    "revision": tool_document["revision"],
+                    "input_revision": tool_document["input_revision"],
                     "args": arguments,
                     "timeout_seconds": timeout_seconds,
                     "retry": {
@@ -731,6 +745,7 @@ class MCPService:
                     "name": tool["name"],
                     "description": tool.get("description", ""),
                     "revision": document["revision"],
+                    "input_revision": document["input_revision"],
                     "score": hit.get("score", 0.0),
                 }
             )
@@ -800,12 +815,19 @@ class MCPService:
             changed = sorted(
                 tool_name
                 for tool_name in existing_names & current_names
-                if existing_tools[tool_name]["revision"] != current_tools[tool_name]["revision"]
+                if existing_tools[tool_name]["input_revision"]
+                != current_tools[tool_name]["input_revision"]
             )
             unchanged = sorted((existing_names & current_names) - set(changed))
+            definitions_to_publish = sorted(
+                tool_name
+                for tool_name in current_names
+                if tool_name not in existing_tools
+                or existing_tools[tool_name]["revision"] != current_tools[tool_name]["revision"]
+            )
             await self._publish_catalog(
                 name,
-                [current_tools[tool_name] for tool_name in added + changed],
+                [current_tools[tool_name] for tool_name in definitions_to_publish],
                 set(removed),
                 ctx,
                 wait=wait,
@@ -911,13 +933,14 @@ class MCPService:
                 connection.execute(
                     """
                     INSERT INTO live_context_nodes (
-                        node_uri, mcp_name, tool_name, tool_uri, revision, args_json, created_at
+                        node_uri, mcp_name, tool_name, tool_uri, input_revision, args_json,
+                        created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(node_uri) DO UPDATE SET
                         mcp_name = excluded.mcp_name,
                         tool_name = excluded.tool_name,
                         tool_uri = excluded.tool_uri,
-                        revision = excluded.revision,
+                        input_revision = excluded.input_revision,
                         args_json = excluded.args_json
                     """,
                     (
@@ -925,7 +948,7 @@ class MCPService:
                         server_name,
                         tool_name,
                         tool_uri,
-                        tool_document["revision"],
+                        tool_document["input_revision"],
                         arguments_json,
                         created_at,
                     ),
@@ -939,7 +962,7 @@ class MCPService:
             "mcp": server_name,
             "tool": tool_name,
             "tool_uri": tool_uri,
-            "revision": tool_document["revision"],
+            "input_revision": tool_document["input_revision"],
             "title": title,
             "description": description,
             "timeout_seconds": timeout_seconds,
@@ -1053,14 +1076,14 @@ class MCPService:
                     connection.execute(
                         """
                         INSERT INTO live_context_nodes (
-                            node_uri, mcp_name, tool_name, tool_uri, revision, args_json,
+                            node_uri, mcp_name, tool_name, tool_uri, input_revision, args_json,
                             created_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(node_uri) DO UPDATE SET
                             mcp_name = excluded.mcp_name,
                             tool_name = excluded.tool_name,
                             tool_uri = excluded.tool_uri,
-                            revision = excluded.revision,
+                            input_revision = excluded.input_revision,
                             args_json = excluded.args_json
                         """,
                         (
@@ -1068,7 +1091,7 @@ class MCPService:
                             item["server_name"],
                             item["tool_name"],
                             item["tool_uri"],
-                            item["tool_document"]["revision"],
+                            item["tool_document"]["input_revision"],
                             json.dumps(
                                 item["arguments"],
                                 ensure_ascii=False,
@@ -1087,7 +1110,7 @@ class MCPService:
                 "mcp": item["server_name"],
                 "tool": item["tool_name"],
                 "tool_uri": item["tool_uri"],
-                "revision": item["tool_document"]["revision"],
+                "input_revision": item["tool_document"]["input_revision"],
                 "title": item["title"],
                 "description": item.get("description"),
                 "timeout_seconds": item["timeout_seconds"],
@@ -1267,7 +1290,7 @@ class MCPService:
                 "mcp": row["mcp_name"],
                 "tool": row["tool_name"],
                 "tool_uri": row["tool_uri"],
-                "revision": row["revision"],
+                "input_revision": row["input_revision"],
                 "arguments": json.loads(row["args_json"]),
                 "created_at": row["created_at"],
             }

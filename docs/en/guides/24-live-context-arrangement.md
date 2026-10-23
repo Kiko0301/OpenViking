@@ -15,7 +15,7 @@ The feature separates control-plane operations from data-plane execution:
 | Layer | Responsibility | Main entry points |
 | --- | --- | --- |
 | MCP registration and sync | Store MCP server connection details and synchronize tool definitions | `ov mcps add/validate/sync/status`, REST, SDK |
-| Tool Catalog | Make definitions searchable and readable; retain `inputSchema` and revision | `viking://agent/tools/<server>/<tool>.json` |
+| Tool Catalog | Make definitions searchable and readable; retain definition and input revisions | `viking://agent/tools/<server>/<tool>.json` |
 | Live Context | Bind one tool, preset arguments, and a destination URI | `ov mcps mount/unmount/mounts`, REST, SDK |
 | Agent Gateway | Discover infrequent tools by intent and proxy their execution | MCP `find_mcp_tools`, `invoke_mcp_tool` |
 | Context arrangement | Declare desired nodes, calculate a diff, and converge state | Studio Arranger, Python `ContextArranger` |
@@ -166,13 +166,13 @@ The result classifies tools as `added`, `changed`, `unchanged`, or `removed`, an
 
 | Mount status | Meaning | Recommended action |
 | --- | --- | --- |
-| `REVIEW` | The tool revision changed, but the existing arguments still satisfy the new schema | Review semantic changes, then remount to confirm |
-| `INVALID` | The revision changed and the existing arguments no longer satisfy the schema | Fix arguments and remount |
+| `REVIEW` | The tool input revision changed, but the existing arguments still satisfy the new schema | Review semantic changes, then remount to confirm |
+| `INVALID` | The input revision changed and the existing arguments no longer satisfy the schema | Fix arguments and remount |
 | `REMOVED` | The upstream no longer provides the tool | Bind a replacement or explicitly unmount |
 
 `sync` does not automatically delete affected live nodes. This prevents a temporary upstream change from damaging an arranged resource tree. Operators or CaC `apply --prune` remain responsible for cleanup.
 
-The current tool revision is calculated from the tool name and `inputSchema`; its purpose is to detect argument-contract changes. Changes only to descriptions or annotations do not change a mount revision.
+The current tool `revision` covers the complete upstream Tool definition. `input_revision` is calculated from the tool name and `inputSchema` to detect argument-contract changes. Changes only to descriptions, annotations, or the output schema refresh the Tool Catalog through `revision` without changing `input_revision` or producing a mount review.
 
 ## Live-node data model
 
@@ -187,7 +187,7 @@ x-openviking:
   schema_version: v1
   type: mcp
   definition: viking://agent/tools/weather/current.json
-  revision: <tool-revision>
+  input_revision: <tool-input-revision>
   args:
     city: Beijing
   timeout_seconds: 60
@@ -199,7 +199,7 @@ x-openviking:
 ---
 ```
 
-Do not maintain this as ordinary Markdown. The account-level `live_context_nodes.dat` database also records the mount for listing, revision tracking, and safe unmounting. Editing only the file makes the descriptor and mount record inconsistent.
+Do not maintain this as ordinary Markdown. The account-level `live_context_nodes.dat` database also records the mount for listing, input revision tracking, and safe unmounting. Editing only the file makes the descriptor and mount record inconsistent.
 
 `retry` is reserved policy metadata in the node format. The current execution path does not automatically retry tool calls from this block, avoiding duplicate external side effects when an outcome is unknown.
 
@@ -380,7 +380,7 @@ Requests use the current OpenViking user's account context. Server registrations
 | Mount rejects arguments | Arguments do not satisfy the current `inputSchema` | Rebuild them from `show` or `find` output |
 | `read` returns the descriptor | The read is paginated or uses `raw=true` | Use the default complete read |
 | `read` fails and outcome is unknown | The upstream timed out or disconnected during execution | Verify the upstream outcome first; OpenViking does not retry a potentially side-effecting call |
-| `sync` reports `REVIEW` | Revision changed but arguments remain valid | Review semantics and remount |
+| `sync` reports `REVIEW` | Tool input revision changed but arguments remain valid | Review Tool semantics and remount |
 | `sync` reports `INVALID` | The new schema rejects preset arguments | Fix arguments and remount |
 | `sync` reports `REMOVED` | The tool disappeared upstream | Bind a replacement or explicitly unmount |
 | CaC reports `CONFLICT` | The target exists but is not owned by this arrangement | Choose another URI or deliberately migrate the existing node |

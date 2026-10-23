@@ -220,7 +220,7 @@ curl -H "X-API-Key: your-key" \
 }
 ```
 
-查看响应在同一 Server 对象中增加 `tools`。每项包含 `uri`、`server`、`address`、`revision` 和上游 MCP `tool` 定义。
+查看响应在同一 Server 对象中增加 `tools`。每项包含 `uri`、`server`、`address`、`revision`、`input_revision` 和上游 MCP `tool` 定义。`revision` 跟踪完整 Tool 定义；`input_revision` 根据工具名称和 `inputSchema` 跟踪挂载兼容性。
 
 **状态响应**
 
@@ -240,12 +240,12 @@ curl -H "X-API-Key: your-key" \
 
 ### 同步工具目录
 
-`POST /api/v1/mcps/{name}/sync` 重新发现上游工具，只重写新增或变更的工具，并删除目录中上游已移除的工具。它不会自动改写或删除已有实时上下文节点，而是在 `affected_mounts` 中报告：
+`POST /api/v1/mcps/{name}/sync` 重新发现上游工具，只重写新增或 `revision` 变化的工具，并删除目录中上游已移除的工具。`changed` 和 `unchanged` 分类使用 `input_revision`，因此仅描述、annotations 或输出 schema 变化时会刷新目录，但仍归类为 `unchanged`。同步不会自动改写或删除已有实时上下文节点，而是在 `affected_mounts` 中报告：
 
 | 状态 | 含义 |
 |------|------|
-| `REVIEW` | 工具 revision 已变化，现有预设参数仍符合新 schema，需要人工确认行为 |
-| `INVALID` | 工具 revision 已变化，现有预设参数不再符合新 schema |
+| `REVIEW` | 工具 input revision 已变化，现有预设参数仍符合新 schema，需要人工确认行为 |
+| `INVALID` | 工具 input revision 已变化，现有预设参数不再符合新 schema |
 | `REMOVED` | 上游不再提供该工具 |
 
 **请求体**
@@ -293,10 +293,10 @@ ov mcps sync --wait weather
       "node_uri": "viking://resources/weather/current.md",
       "tool_uri": "viking://agent/tools/weather/current.json",
       "tool": "current",
-      "mounted_revision": "old-revision",
-      "current_revision": "new-revision",
+      "mounted_input_revision": "old-input-revision",
+      "current_input_revision": "new-input-revision",
       "status": "REVIEW",
-      "reason": "Tool revision changed; mounted arguments remain valid under the current input schema"
+      "reason": "Tool input revision changed; mounted arguments remain valid under the current input schema"
     }]
   }
 }
@@ -355,6 +355,7 @@ ov mcps find --limit 5 "查询城市当前天气"
       "name": "current",
       "description": "Get current weather",
       "revision": "sha256-revision",
+      "input_revision": "sha256-input-revision",
       "score": 0.87,
       "tool": {
         "name": "current",
@@ -499,7 +500,7 @@ ov mcps mount \
     "mcp": "weather",
     "tool": "current",
     "tool_uri": "viking://agent/tools/weather/current.json",
-    "revision": "sha256-revision",
+    "input_revision": "sha256-input-revision",
     "title": "北京实时天气",
     "description": "查询北京当前天气",
     "timeout_seconds": 60,
@@ -545,7 +546,7 @@ ov mcps mounts --mcp weather --tool current
       "mcp": "weather",
       "tool": "current",
       "tool_uri": "viking://agent/tools/weather/current.json",
-      "revision": "sha256-revision",
+      "input_revision": "sha256-input-revision",
       "arguments": {"city": "Beijing"},
       "created_at": "2026-10-21T08:30:00+00:00"
     }],

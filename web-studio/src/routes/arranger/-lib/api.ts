@@ -139,6 +139,11 @@ export function parseMcpTools(
     const tool = document.tool as Record<string, unknown>
     const name = tool.name as string
     return {
+      input_revision:
+        'input_revision' in document &&
+        typeof document.input_revision === 'string'
+          ? document.input_revision
+          : '',
       revision:
         'revision' in document && typeof document.revision === 'string'
           ? document.revision

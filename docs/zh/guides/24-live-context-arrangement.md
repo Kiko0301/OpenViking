@@ -15,7 +15,7 @@ description: 接入远程 MCP Server，将工具挂载为实时上下文，并�
 | 层次 | 职责 | 主要入口 |
 | --- | --- | --- |
 | MCP 注册与同步 | 保存 MCP Server 连接信息，将 Tool 定义同步进 OpenViking | `ov mcps add/validate/sync/status`、REST、SDK |
-| Tool Catalog | 让 Tool 定义可检索、可读取，并保存 `inputSchema` 和 revision | `viking://agent/tools/<server>/<tool>.json` |
+| Tool Catalog | 让 Tool 定义可检索、可读取，并保存完整定义和输入版本 | `viking://agent/tools/<server>/<tool>.json` |
 | 实时上下文 | 将一个 Tool、固定参数和目标 URI 绑定为可读节点 | `ov mcps mount/unmount/mounts`、REST、SDK |
 | Agent Gateway | 按意图发现低频 Tool，并安全代理调用 | MCP `find_mcp_tools`、`invoke_mcp_tool` |
 | 上下文编排 | 声明一组期望节点，计算差异并持续收敛 | Studio Arranger、Python `ContextArranger` |
@@ -166,13 +166,13 @@ ov mcps sync weather --wait
 
 | 挂载状态 | 含义 | 建议处理 |
 | --- | --- | --- |
-| `REVIEW` | Tool revision 已变化，但现有参数仍符合新 schema | 检查语义变化后重新挂载确认 |
-| `INVALID` | Tool revision 已变化，现有参数不再符合新 schema | 修正参数并重新挂载 |
+| `REVIEW` | Tool input revision 已变化，但现有参数仍符合新 schema | 检查语义变化后重新挂载确认 |
+| `INVALID` | Tool input revision 已变化，现有参数不再符合新 schema | 修正参数并重新挂载 |
 | `REMOVED` | 上游不再提供该 Tool | 改绑其他 Tool，或显式 unmount |
 
 `sync` 不会自动删除受影响的实时节点。这样可以避免上游一次临时变更直接破坏已编排的目录；节点的清理仍由操作者或 CaC 的 `apply --prune` 决定。
 
-当前 Tool revision 根据 Tool 名称和 `inputSchema` 计算，主要用于判断参数契约是否变化。只修改描述或 annotations 不会触发挂载 revision 变化。
+当前 Tool 的 `revision` 覆盖完整的上游 Tool 定义；`input_revision` 根据 Tool 名称和 `inputSchema` 计算，用于判断参数契约是否变化。只修改描述、annotations 或输出 schema 时，Tool Catalog 会通过 `revision` 刷新，但不会改变 `input_revision`，也不会触发挂载检查。
 
 ## 实时节点的数据模型
 
@@ -187,7 +187,7 @@ x-openviking:
   schema_version: v1
   type: mcp
   definition: viking://agent/tools/weather/current.json
-  revision: <tool-revision>
+  input_revision: <tool-input-revision>
   args:
     city: Beijing
   timeout_seconds: 60
@@ -199,7 +199,7 @@ x-openviking:
 ---
 ```
 
-不要把这个文件当作普通 Markdown 手工维护。挂载关系还记录在账号级 `live_context_nodes.dat` 中，用于列举挂载、跟踪 revision 和安全卸载；只修改文件会让描述文件与挂载记录失去一致性。
+不要把这个文件当作普通 Markdown 手工维护。挂载关系还记录在账号级 `live_context_nodes.dat` 中，用于列举挂载、跟踪 input revision 和安全卸载；只修改文件会让描述文件与挂载记录失去一致性。
 
 `retry` 是节点格式中的预留策略元数据。当前执行链路不会据此自动重试 Tool 调用，避免在结果未知时重复产生外部副作用。
 
@@ -380,7 +380,7 @@ SDK 和 Studio 使用以下接口：
 | 挂载提示参数不合法 | 参数不符合当前 `inputSchema` | 从 `show` 或 `find` 结果重新生成参数 |
 | `read` 返回描述文件 | 使用了分页读取或 `raw=true` | 使用默认完整读取 |
 | `read` 调用失败且结果未知 | 上游超时或连接在调用中断开 | 先确认上游实际状态；OpenViking 不会自动重试可能有副作用的调用 |
-| `sync` 返回 `REVIEW` | Tool revision 改变但参数仍合法 | 检查 Tool 语义后重新挂载 |
+| `sync` 返回 `REVIEW` | Tool input revision 改变但参数仍合法 | 检查 Tool 语义后重新挂载 |
 | `sync` 返回 `INVALID` | 新 schema 不再接受已绑定参数 | 修改参数并重新挂载 |
 | `sync` 返回 `REMOVED` | Tool 已从上游删除 | 绑定替代 Tool，或显式 unmount |
 | CaC 返回 `CONFLICT` | 目标已存在但不归当前 arrangement 所有 | 更换 URI，或先确认并迁移现有节点 |
