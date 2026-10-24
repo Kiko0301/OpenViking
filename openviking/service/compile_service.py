@@ -435,6 +435,7 @@ class CompileService:
         normalized = await self._normalize_request(request, ctx)
         submitted, private_payload = self._split_payload(normalized)
         payload = submitted
+        preparation = None
         if self._lifecycle is not None:
             control, runtime_args = split_control_args(submitted.get("args"))
             if "auto_update" in control or "update_schedule" in control:
@@ -455,11 +456,18 @@ class CompileService:
                 "mode": control.get("mode", "incremental"),
                 "trigger": "manual",
             }
-            asyncio.create_task(
+            preparation = asyncio.create_task(
                 self._lifecycle.prepare(submitted, ctx, instruction_set=request._instruction_sent)
             )
         return await self._create_task(
-            payload, submitted, private_payload, normalized, connection, ctx, idempotency_key
+            payload,
+            submitted,
+            private_payload,
+            normalized,
+            connection,
+            ctx,
+            idempotency_key,
+            preparation=preparation,
         )
 
     async def create_scheduled(
@@ -508,6 +516,7 @@ class CompileService:
         idempotency_key: str | None,
         *,
         locked_record: dict[str, Any] | None = None,
+        preparation: asyncio.Task[Any] | None = None,
     ) -> TaskRecord:
         """Enqueue work, recording scheduled history before releasing its caller-owned state lock."""
         task = await self._tasks.create(
@@ -526,17 +535,21 @@ class CompileService:
         if locked_record is not None:
             await self._lifecycle.record_queued(task, locked_record=locked_record)
         else:
-            self._schedule_history(task)
+            self._schedule_history(task, preparation=preparation)
         return task
 
-    def _schedule_history(self, task: TaskRecord) -> None:
-        """Write queued history and first-task metadata asynchronously, logging storage failures."""
+    def _schedule_history(
+        self, task: TaskRecord, *, preparation: asyncio.Task[Any] | None = None
+    ) -> None:
+        """Record history after optional preparation, logging background failures."""
         lifecycle = self._lifecycle
         if lifecycle is None:
             return
 
         async def record_history() -> None:
             try:
+                if preparation is not None:
+                    await preparation
                 await lifecycle.record_queued(task)
             except Exception:
                 logger.exception(
