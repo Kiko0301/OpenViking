@@ -29,18 +29,18 @@ from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "config_data,expected_ranges",
+    "config_data,padding,expected_ranges",
     [
-        ({}, "1-3"),
-        ({"memory": {}}, "1-3"),
-        ({"memory": {"minimal_mode": False, "event_range_padding": 0}}, "2"),
-        ({"memory": {"minimal_mode": False, "event_range_padding": 1}}, "1-3"),
-        ({"memory": {"minimal_mode": False, "event_range_padding": 2}}, "0-4"),
+        ({}, None, "1-3"),
+        ({"memory": {}}, None, "1-3"),
+        ({"memory": {"minimal_mode": False}}, 0, "2"),
+        ({"memory": {"minimal_mode": False}}, 1, "1-3"),
+        ({"memory": {"minimal_mode": False}}, 2, "0-4"),
     ],
     ids=["memory-omitted", "mode-omitted", "padding-zero", "padding-one", "padding-two"],
 )
 async def test_normal_mode_pads_events_and_preserves_standard_extraction(
-    monkeypatch, config_data, expected_ranges
+    monkeypatch, config_data, padding, expected_ranges
 ):
     import openviking.session.compressor_v3 as module
     from openviking.session.memory import account_templates
@@ -58,6 +58,12 @@ async def test_normal_mode_pads_events_and_preserves_standard_extraction(
     registry = MemoryTypeRegistry(load_schemas=False)
     for name in ("events", "profile"):
         registry.load_from_yaml(str(resolve_memory_templates_dir() / f"{name}.yaml"))
+    if padding is not None:
+        schema = registry.get("events")
+        schema.content_template = schema.content_template.replace(
+            "get_event_content(ranges, summary, 0, 1)",
+            f"get_event_content(ranges, summary, 0, {padding})",
+        )
     registry.initialize_memory_files = AsyncMock()
     original_schemas = [schema.model_dump() for schema in registry.list_all()]
     monkeypatch.setattr(module, "get_default_registry", lambda: registry)
@@ -128,7 +134,7 @@ async def test_normal_mode_pads_events_and_preserves_standard_extraction(
     assert type(provider) is SessionExtractContextProvider
     assert request.memory_registry is registry
     assert request.isolation_options["allowed_memory_types"] is None
-    assert operation.memory_fields["ranges"] == expected_ranges
+    assert operation.memory_fields["ranges"] == "2"
     assert operation.memory_fields["event_name"] == "move_to_paris"
     assert operation.memory_fields["summary"] == "Alice moved to Paris."
     assert [schema.model_dump() for schema in registry.list_all()] == original_schemas
@@ -148,67 +154,12 @@ async def test_normal_mode_pads_events_and_preserves_standard_extraction(
     compressor.extract_session_skills.assert_not_awaited()
     vlm.get_completion_async.assert_awaited_once()
     uri, raw = rendered[0]
-    body = MemoryFileUtils.read(raw, uri=uri).content
+    restored = MemoryFileUtils.read(raw, uri=uri)
+    assert restored.extra_fields["ranges"] == "2"
+    body = restored.content
     assert body.startswith("# Summary\nAlice moved to Paris.\n")
     assert "I moved to Paris." in body
     assert ("Hello." in body) is (expected_ranges != "2")
     assert ("Thanks." in body) is (expected_ranges != "2")
     assert ("First context." in body) is (expected_ranges == "0-4")
     assert ("Last context." in body) is (expected_ranges == "0-4")
-
-
-def test_padding_skips_other_types_unresolved_and_summary_only_events(monkeypatch):
-    from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
-
-    config = OpenVikingConfig.from_dict({})
-    monkeypatch.setattr(
-        "openviking.session.memory.session_extract_context_provider.get_openviking_config",
-        lambda: config,
-    )
-    messages = [Message(id="m0", role="user", parts=[TextPart(text="A fact.")])]
-    provider = SessionExtractContextProvider(messages=messages)
-    operations = ResolvedOperations(
-        upsert_operations=[
-            ResolvedOperation(
-                memory_type="profile",
-                memory_fields={"ranges": "99"},
-                uris=["viking://user/alice/memories/profile.md"],
-            ),
-            ResolvedOperation(memory_type="events", memory_fields={"ranges": "99"}, uris=[]),
-            ResolvedOperation(
-                memory_type="events",
-                memory_fields={"summary": "A fact."},
-                uris=["viking://user/alice/memories/events/fact.md"],
-            ),
-        ],
-        delete_file_contents=[],
-        errors=[],
-    )
-    before = operations.model_dump()
-    provider.expand_ranges(operations, 1)
-    assert operations.model_dump() == before
-
-
-def test_padding_zero_does_not_normalize_range_strings(monkeypatch):
-    from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
-
-    config = OpenVikingConfig.from_dict({})
-    monkeypatch.setattr(
-        "openviking.session.memory.session_extract_context_provider.get_openviking_config",
-        lambda: config,
-    )
-    provider = SessionExtractContextProvider(messages=[])
-    operations = ResolvedOperations(
-        upsert_operations=[
-            ResolvedOperation(
-                memory_type="events",
-                memory_fields={"ranges": "1,2", "summary": "Unchanged"},
-                uris=["viking://user/alice/memories/events/fact.md"],
-            )
-        ],
-        delete_file_contents=[],
-        errors=[],
-    )
-    before = operations.model_dump()
-    provider.expand_ranges(operations, 0)
-    assert operations.model_dump() == before

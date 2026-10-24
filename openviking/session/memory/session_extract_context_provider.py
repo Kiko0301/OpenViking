@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from openviking.message.part import TextPart, ToolPart
 from openviking.server.identity import RequestContext, ToolContext
 from openviking.session.memory.core import ExtractContextProvider
-from openviking.session.memory.dataclass import MemoryFile, ResolvedOperations
+from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.memory_isolation_handler import (
     MemoryIsolationHandler,
     RoleScope,
@@ -126,42 +126,6 @@ class SessionExtractContextProvider(ExtractContextProvider):
                 split_long_text_messages=self.split_long_text_messages_for_extraction,
             )
         return self._extract_context
-
-    def expand_ranges(self, operations: ResolvedOperations, padding: int) -> None:
-        """Pad validated ranges without changing event identities or broadening ownership."""
-        from openviking.session.memory.range_padding import (
-            EventRangePaddingError,
-            expand_event_ranges,
-            parse_ranges,
-        )
-
-        if padding == 0:
-            return  # Preserve original range strings and all other fields exactly.
-        context = self.get_extract_context()
-        for operation in operations.upsert_operations:
-            # Other memory types and unresolved/summary-only events are not padded.
-            if operation.memory_type != "events" or not operation.uris:
-                continue
-            ranges = operation.memory_fields.get("ranges")
-            if not ranges:
-                continue
-            expanded = expand_event_ranges(context, self.messages, ranges, padding=padding)
-            selected = parse_ranges(ranges, len(context.messages))
-            padded = parse_ranges(expanded, len(context.messages))
-            owners = {
-                message.peer_id or "__self"
-                for i in selected
-                if (message := context.messages[i]).role == "user" or message.peer_id
-            }
-            if any(
-                (message.peer_id or "__self") not in owners
-                for i in padded - selected
-                if (message := context.messages[i]).role == "user" or message.peer_id
-            ):
-                raise EventRangePaddingError(
-                    "Event range padding must not cross memory-owner boundaries"
-                )
-            operation.memory_fields["ranges"] = expanded
 
     async def prepare_extraction_messages(self) -> None:
         """Prepare extraction-only messages before ranges and prompts are built."""

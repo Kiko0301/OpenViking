@@ -137,11 +137,14 @@ async def test_existing_loop_selects_interleaved_ranges_without_prose(setup, out
         )
         restored = MemoryFileUtils.read(raw, uri=uri)
         assert "summary" not in restored.extra_fields
-        assert "# Summary" not in restored.content and "Haha!" not in restored.content
+        assert "# Summary" not in restored.content
+        assert restored.extra_fields["ranges"] == operation.memory_fields["ranges"]
         assert restored.content.startswith("# 2024-02-03 (Saturday) ChatLog:")
         bodies.append(restored.content)
-    assert "Hangzhou" in bodies[0] and "product launch" not in bodies[0]
-    assert "product launch" in bodies[1] and "Hangzhou" not in bodies[1]
+    # Default padding may include adjacent noise/other events, but selections stay separate.
+    assert "Hangzhou" in bodies[0] and "Friday" in bodies[0] and "Monday" not in bodies[0]
+    assert "product launch" in bodies[1] and "Monday" in bodies[1]
+    assert all("Haha!" in body for body in bodies)
 
 
 @pytest.mark.asyncio
@@ -205,15 +208,25 @@ def test_server_names_are_stable_and_model_prose_is_not_preserved(setup):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("padding,expected", [(0, "2"), (1, "1-3"), (2, "0-4")])
+@pytest.mark.parametrize("padding", [None, 0, 1, 2])
 @pytest.mark.parametrize("prepared", [False, True])
 async def test_compressor_uses_llm_and_skips_other_memory_learning(
-    setup, monkeypatch, padding, expected, prepared
+    setup, monkeypatch, padding, prepared
 ):
     import openviking.session.compressor_v3 as module
     from openviking.session.memory import account_templates
 
-    setup.config.memory.event_range_padding = padding
+    if padding is not None:
+        from openviking.session.memory import minimal_mode_context_provider as minimal
+
+        monkeypatch.setattr(
+            minimal,
+            "_EVENT_CONTENT_TEMPLATE",
+            minimal._EVENT_CONTENT_TEMPLATE.replace(
+                "get_event_content(ranges, '', 0, 1)",
+                f"get_event_content(ranges, '', 0, {padding})",
+            ),
+        )
     messages = make_messages(*(f"Fact {i}." for i in range(5)))
     if prepared:
         from dataclasses import replace
@@ -276,7 +289,7 @@ async def test_compressor_uses_llm_and_skips_other_memory_learning(
 
     request = submitted[0]
     operation = request.operations.upsert_operations[0]
-    assert operation.memory_fields["ranges"] == expected
+    assert operation.memory_fields["ranges"] == "2"
     from openviking.session.memory.memory_updater import ExtractContext
 
     updater = MemoryUpdater(registry=request.memory_registry)
@@ -289,7 +302,7 @@ async def test_compressor_uses_llm_and_skips_other_memory_learning(
     assert ("Prepared Fact 2." in body) is prepared
     assert all("Prepared" not in message.parts[0].text for message in messages)
     assert ("Fact 0." in body) is (padding == 2)
-    assert ("Fact 1." in body) is (padding > 0)
+    assert ("Fact 1." in body) is (padding != 0)
     compressor.extract_session_skills.assert_not_awaited()
     compressor.train_from_extracted_cases.assert_not_awaited()
 
@@ -379,8 +392,13 @@ async def test_padding_preserves_separate_event_names_and_uris(setup, padding, e
     identities = [
         (op.memory_fields["event_name"], list(op.uris)) for op in operations.upsert_operations
     ]
-    provider.expand_ranges(operations, padding)
-    assert [op.memory_fields["ranges"] for op in operations.upsert_operations] == expected
+    before = operations.model_dump()
+    context = provider.get_extract_context()
+    for operation, expanded in zip(operations.upsert_operations, expected, strict=True):
+        assert context.get_event_content(operation.memory_fields["ranges"], "", 0, padding) == (
+            context.read_message_ranges(expanded).pretty_print()
+        )
+    assert operations.model_dump() == before
     assert [
         (op.memory_fields["event_name"], op.uris) for op in operations.upsert_operations
     ] == identities
@@ -400,7 +418,7 @@ async def test_padding_cannot_copy_another_peers_private_messages(setup, selecte
     )
     operations, _, _, _ = await run_loop(setup, provider, [response_for("python", "0")])
     with pytest.raises(ValueError, match="memory-owner boundaries"):
-        provider.expand_ranges(operations, 2)
+        provider.get_extract_context().get_event_content("0", "", 0, 2)
     assert operations.upsert_operations[0].memory_fields["ranges"] == "0"
 
 
@@ -411,8 +429,9 @@ async def test_padding_keeps_assistant_context_for_the_same_peer(setup):
     messages[1].role = "assistant"
     provider = make_provider(setup, messages, allowed_peer_ids={"alice-peer"})
     operations, _, _, _ = await run_loop(setup, provider, [response_for("python", "0")])
-    provider.expand_ranges(operations, 2)
-    assert operations.upsert_operations[0].memory_fields["ranges"] == "0-1"
+    body = provider.get_extract_context().get_event_content("0", "", 0, 2)
+    assert "Your hotel is confirmed." in body
+    assert operations.upsert_operations[0].memory_fields["ranges"] == "0"
 
 
 @pytest.mark.asyncio
@@ -430,8 +449,6 @@ async def test_disabled_or_omitted_mode_uses_standard_provider_and_learning(
     )
 
     setup.config.memory = MemoryConfig(**({"minimal_mode": False} if explicit_false else {}))
-    # Padding is independent of selecting the standard provider and learning pipeline.
-    setup.config.memory.event_range_padding = 100
     setup.registry.initialize_memory_files = AsyncMock()
     monkeypatch.setattr(module, "get_viking_fs", lambda: SimpleNamespace())
     monkeypatch.setattr(
@@ -498,7 +515,7 @@ async def test_mode_specific_error_handling_preserves_standard_behavior(
 @pytest.mark.asyncio
 async def test_padding_errors_propagate_in_normal_mode(setup, monkeypatch):
     import openviking.session.compressor_v3 as module
-    from openviking.session.memory.range_padding import EventRangePaddingError
+    from openviking.session.memory.memory_updater import EventRangePaddingError
 
     setup.config.memory.minimal_mode = False
     monkeypatch.setattr(module, "get_viking_fs", lambda: SimpleNamespace())

@@ -45,7 +45,7 @@ from openviking.session.memory.experience.dag import MAX_EVIDENCE_SUMMARY_CHARS
 from openviking.session.memory.experience.rubric import parse_case_rubric
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import get_default_registry
-from openviking.session.memory.range_padding import EventRangePaddingError
+from openviking.session.memory.memory_updater import EventRangePaddingError
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
 )
@@ -735,12 +735,8 @@ class SessionCompressorV3:
             thinking=extract_thinking,
         )
         operations, _tools_used = await orchestrator.run()
-        if operations is not None:
-            # Both modes pad only resolved events after extraction/validation.
-            context_provider.expand_ranges(operations, memory_config.event_range_padding)
-            if minimal_mode or memory_config.event_range_padding > 0:
-                # Keep rendering aligned with preprocessing, including vision descriptions.
-                messages = context_provider.messages
+        # Keep template ranges aligned with preprocessing, including vision descriptions.
+        messages = context_provider.messages
         if operations is None:
             tracer.info("[v3_patch_merge] No memory operations generated")
             return _V3ExtractionResult()

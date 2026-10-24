@@ -29,7 +29,7 @@ _EVENT_METHODS = {
     "get_resource_event_content": (2,),
     "get_first_message_time_from_ranges": (1,),
     "get_first_message_time_with_weekday_from_ranges": (1,),
-    "get_event_content": (2, 3),
+    "get_event_content": (2, 3, 4),
     "get_year": (1,),
     "get_month": (1,),
     "get_day": (1,),
@@ -251,7 +251,7 @@ def _validate_call(node: nodes.Call, memory_type: str) -> None:
         raise ContentTemplateError("invalid_arguments", node.lineno)
     # Range expressions follow the same syntax rules as other expressions.
     # Their evaluated values are checked before calling an extraction helper.
-    if len(node.args) == 3:
+    if len(node.args) >= 3:
         ratio = node.args[2]
         if (
             not isinstance(ratio, nodes.Const)
@@ -259,6 +259,15 @@ def _validate_call(node: nodes.Call, memory_type: str) -> None:
             or not 0 <= ratio.value <= 1
         ):
             raise ContentTemplateError("invalid_ratio", node.lineno)
+
+    if len(node.args) == 4:
+        padding = node.args[3]
+        if (
+            not isinstance(padding, nodes.Const)
+            or type(padding.value) is not int
+            or padding.value < 0
+        ):
+            raise ContentTemplateError("invalid_padding", node.lineno)
 
 
 def _call_event_helper(

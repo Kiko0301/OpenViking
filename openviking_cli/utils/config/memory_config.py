@@ -99,20 +99,9 @@ class MemoryConfig(BaseModel):
         description=(
             "Opt in to events-only memory: an LLM selects source ranges and code writes "
             "the original conversation, without event summaries or other memory learning. "
-            "When disabled, use normal extraction and learning; event_range_padding applies "
-            "in both modes."
+            "When disabled, use normal extraction and learning."
         ),
     )
-    event_range_padding: int = Field(
-        default=1,
-        ge=0,
-        strict=True,
-        description=(
-            "Original messages added before and after each selected event range in both "
-            "normal and minimal mode, clipped to the session. Zero disables expansion."
-        ),
-    )
-
     extraction_output_format: Literal["json", "python"] = Field(
         default="python",
         description=(
