@@ -197,7 +197,7 @@ class TestMemoryUpdater:
         )
 
         assert context.get_event_content("0-3", "Summary", 0) == expected
-        assert context.get_event_content("0,3", "Summary", 0, 0) == expected.replace(
+        assert context.get_event_content("0,3", "Summary", 0, range_padding=0) == expected.replace(
             "\n", "\n...\n"
         )
         assert context.read_message_ranges("1-2").elements == [messages[1:3]]

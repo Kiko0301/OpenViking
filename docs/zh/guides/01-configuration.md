@@ -1702,12 +1702,12 @@ openviking-server --config /path/to/ov.conf
 - `minimal_mode` 默认关闭；设为 `false` 或省略，保留常规抽取、摘要、记忆类型、Agent evolution 和 Skill 开关语义。普通和极简模式的 event ChatLog 均在模板渲染时默认前后各扩 1 条原始消息；这会改变新 event 正文，但不改写 LLM 选择的 `ranges` 元数据。
 - 开启后，使用现有 LLM/ExtractLoop 分事件并选择可不连续的 ranges；只写 events，文件名由代码生成，不让模型生成事件标题、goal 或 summary。暂停此 session commit 的 Case、Trajectory、Experience、Skill 及其他类型的记忆学习，不修改相关全局开关。
 - 扩展属于共享 `ExtractContext` 的正文渲染能力，不依赖某个 Context Provider，也不在 `ov.conf` 中配置。校验原始 ranges 后按**原始消息**而非拆分 chunk 扩展，截断于当前提交的消息边界，同一事件内合并范围，不合并不同事件。保留原 ranges、文件名、URI 和事件时间；扩展若引入其他记忆所有者的消息则报错。无效 ranges 不会因扩展而变合法。
-- 普通 `events.yaml` 和极简模板均调用 `get_event_content(ranges, summary, ratio_threshold, padding)`。第三个参数仍是摘要/原选区正文的字符数比例阈值（默认 `0.2`）；第四个参数 `padding` 是前后各扩展的消息数（默认 `1`，`0` 不扩展）。正文为空时仍回退 summary；资源事件的专用正文不扩展。
+- 普通 `events.yaml` 和极简模板均调用 `get_event_content(ranges, summary, ratio_threshold, range_padding=1)`。第三个参数仍是摘要/原选区正文的字符数比例阈值（默认 `0.2`）；可选具名参数 `range_padding` 是前后各扩展的消息数（默认 `1`，`0` 不扩展）。正文为空时仍回退 summary；资源事件的专用正文不扩展。
 
 ```jinja2
 {{ extract_context.get_event_content(ranges, summary, 0) }}     {# 默认前后各扩 1 条 #}
-{{ extract_context.get_event_content(ranges, summary, 0, 0) }}  {# 不扩展 #}
-{{ extract_context.get_event_content(ranges, summary, 0, 2) }}  {# 前后各扩 2 条 #}
+{{ extract_context.get_event_content(ranges, summary, 0, range_padding=0) }}  {# 不扩展 #}
+{{ extract_context.get_event_content(ranges, summary, 0, range_padding=2) }}  {# 前后各扩 2 条 #}
 ```
 
 - 极简模式使用服务端专用模板，传空 summary；账户自定义 event 模板不会覆盖它。扩展不额外调用 LLM，但最初分段仍调用 LLM，embedding 仍有成本。历史评测使用写入前改写 ranges 的实验版本，不能当作当前仅扩展正文版本的新测量结果。

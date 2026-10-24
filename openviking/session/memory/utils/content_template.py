@@ -29,7 +29,7 @@ _EVENT_METHODS = {
     "get_resource_event_content": (2,),
     "get_first_message_time_from_ranges": (1,),
     "get_first_message_time_with_weekday_from_ranges": (1,),
-    "get_event_content": (2, 3, 4),
+    "get_event_content": (2, 3),
     "get_year": (1,),
     "get_month": (1,),
     "get_day": (1,),
@@ -52,6 +52,7 @@ _NODES = (
     nodes.Tuple,
     nodes.Getattr,
     nodes.Call,
+    nodes.Keyword,
     nodes.Filter,
     nodes.Test,
     nodes.Compare,
@@ -242,12 +243,7 @@ def _validate_call(node: nodes.Call, memory_type: str) -> None:
         or target.attr not in _EVENT_METHODS
     ):
         raise ContentTemplateError("unsupported_call", node.lineno)
-    if (
-        node.kwargs
-        or node.dyn_args
-        or node.dyn_kwargs
-        or len(node.args) not in _EVENT_METHODS[target.attr]
-    ):
+    if node.dyn_args or node.dyn_kwargs or len(node.args) not in _EVENT_METHODS[target.attr]:
         raise ContentTemplateError("invalid_arguments", node.lineno)
     # Range expressions follow the same syntax rules as other expressions.
     # Their evaluated values are checked before calling an extraction helper.
@@ -260,8 +256,14 @@ def _validate_call(node: nodes.Call, memory_type: str) -> None:
         ):
             raise ContentTemplateError("invalid_ratio", node.lineno)
 
-    if len(node.args) == 4:
-        padding = node.args[3]
+    if node.kwargs:
+        if (
+            target.attr != "get_event_content"
+            or len(node.kwargs) != 1
+            or node.kwargs[0].key != "range_padding"
+        ):
+            raise ContentTemplateError("invalid_arguments", node.lineno)
+        padding = node.kwargs[0].value
         if (
             not isinstance(padding, nodes.Const)
             or type(padding.value) is not int
@@ -276,6 +278,7 @@ def _call_event_helper(
     original_ranges: str,
     ranges: Any,
     *args: Any,
+    **kwargs: Any,
 ) -> Any:
     # Validate values, not a particular AST shape: aliases, conditions and
     # filters are fine, but cannot change which source messages a helper reads.
@@ -289,7 +292,7 @@ def _call_event_helper(
     # Wrapping a helper must not bypass its original sandbox callable flags.
     if not env.is_safe_callable(helper):
         raise TemplateError("Unsafe event helper")
-    return helper(ranges, *args)
+    return helper(ranges, *args, **kwargs)
 
 
 def validate_content_template(template: str, memory_type: str) -> None:

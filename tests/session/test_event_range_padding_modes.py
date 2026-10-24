@@ -61,8 +61,8 @@ async def test_normal_mode_pads_events_and_preserves_standard_extraction(
     if padding is not None:
         schema = registry.get("events")
         schema.content_template = schema.content_template.replace(
-            "get_event_content(ranges, summary, 0, 1)",
-            f"get_event_content(ranges, summary, 0, {padding})",
+            "get_event_content(ranges, summary, 0, range_padding=1)",
+            f"get_event_content(ranges, summary, 0, range_padding={padding})",
         )
     registry.initialize_memory_files = AsyncMock()
     original_schemas = [schema.model_dump() for schema in registry.list_all()]

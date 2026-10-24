@@ -531,7 +531,8 @@ class ExtractContext:
         ranges_str: str,
         summary: str | None,
         ratio_threshold: float = 0.2,
-        padding: int = 1,
+        *,
+        range_padding: int = 1,
     ) -> str:
         """Choose source text or summary, padding only the rendered source text.
 
@@ -541,7 +542,7 @@ class ExtractContext:
         """
         if not ranges_str:
             return summary or ""
-        expanded = self.expand_message_ranges(ranges_str, padding)
+        expanded = self.expand_message_ranges(ranges_str, range_padding)
         original = self.read_message_ranges(ranges_str).pretty_print()
         if not original:
             return summary if summary and summary.strip() else ""

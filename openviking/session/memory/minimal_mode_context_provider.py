@@ -38,7 +38,7 @@ update existing memories or delete memories. No tools or external context are ne
 
 
 _EVENT_CONTENT_TEMPLATE = """# {{ extract_context.get_first_message_time_with_weekday_from_ranges(ranges)|default('N/A') }} ChatLog:
-{{ extract_context.get_event_content(ranges, '', 0, 1) }}"""
+{{ extract_context.get_event_content(ranges, '', 0, range_padding=1) }}"""
 
 
 def make_minimal_mode_registry(registry: MemoryTypeRegistry) -> MemoryTypeRegistry:

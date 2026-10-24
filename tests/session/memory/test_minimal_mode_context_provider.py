@@ -223,8 +223,8 @@ async def test_compressor_uses_llm_and_skips_other_memory_learning(
             minimal,
             "_EVENT_CONTENT_TEMPLATE",
             minimal._EVENT_CONTENT_TEMPLATE.replace(
-                "get_event_content(ranges, '', 0, 1)",
-                f"get_event_content(ranges, '', 0, {padding})",
+                "get_event_content(ranges, '', 0, range_padding=1)",
+                f"get_event_content(ranges, '', 0, range_padding={padding})",
             ),
         )
     messages = make_messages(*(f"Fact {i}." for i in range(5)))
@@ -395,9 +395,9 @@ async def test_padding_preserves_separate_event_names_and_uris(setup, padding, e
     before = operations.model_dump()
     context = provider.get_extract_context()
     for operation, expanded in zip(operations.upsert_operations, expected, strict=True):
-        assert context.get_event_content(operation.memory_fields["ranges"], "", 0, padding) == (
-            context.read_message_ranges(expanded).pretty_print()
-        )
+        assert context.get_event_content(
+            operation.memory_fields["ranges"], "", 0, range_padding=padding
+        ) == (context.read_message_ranges(expanded).pretty_print())
     assert operations.model_dump() == before
     assert [
         (op.memory_fields["event_name"], op.uris) for op in operations.upsert_operations
@@ -418,7 +418,7 @@ async def test_padding_cannot_copy_another_peers_private_messages(setup, selecte
     )
     operations, _, _, _ = await run_loop(setup, provider, [response_for("python", "0")])
     with pytest.raises(ValueError, match="memory-owner boundaries"):
-        provider.get_extract_context().get_event_content("0", "", 0, 2)
+        provider.get_extract_context().get_event_content("0", "", 0, range_padding=2)
     assert operations.upsert_operations[0].memory_fields["ranges"] == "0"
 
 
@@ -429,7 +429,7 @@ async def test_padding_keeps_assistant_context_for_the_same_peer(setup):
     messages[1].role = "assistant"
     provider = make_provider(setup, messages, allowed_peer_ids={"alice-peer"})
     operations, _, _, _ = await run_loop(setup, provider, [response_for("python", "0")])
-    body = provider.get_extract_context().get_event_content("0", "", 0, 2)
+    body = provider.get_extract_context().get_event_content("0", "", 0, range_padding=2)
     assert "Your hotel is confirmed." in body
     assert operations.upsert_operations[0].memory_fields["ranges"] == "0"
 

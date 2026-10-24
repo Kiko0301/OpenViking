@@ -120,8 +120,8 @@ def test_event_content_pads_only_body_and_preserves_inputs(padding, expected):
     source = messages(5)
     before = deepcopy(source)
     context = ExtractContext(source)
-    args = () if padding is None else (padding,)
-    assert context.get_event_content("2", "Summary", 0, *args) == (
+    kwargs = {} if padding is None else {"range_padding": padding}
+    assert context.get_event_content("2", "Summary", 0, **kwargs) == (
         context.read_message_ranges(expected).pretty_print()
     )
     assert source == before
@@ -162,7 +162,7 @@ def test_event_rendering_rejects_invalid_original_ranges(ranges, padding):
     from openviking.session.memory.memory_updater import EventRangePaddingError
 
     with pytest.raises(EventRangePaddingError):
-        ExtractContext(messages(3)).get_event_content(ranges, "Summary", 0, padding)
+        ExtractContext(messages(3)).get_event_content(ranges, "Summary", 0, range_padding=padding)
 
 
 def test_explicit_chunk_context_pads_original_messages():
@@ -207,7 +207,9 @@ async def test_padding_error_propagates_before_any_write_or_delete(account_templ
     registry = MemoryTypeRegistry()
     schema = registry.get("events")
     if account_template:
-        schema.content_template = "{{ extract_context.get_event_content(ranges, summary, 0, 1) }}"
+        schema.content_template = (
+            "{{ extract_context.get_event_content(ranges, summary, 0, range_padding=1) }}"
+        )
         schema._account_content_template = True
     source = messages(4)
     source[-1].peer_id = "other-peer"
@@ -240,3 +242,11 @@ async def test_padding_error_propagates_before_any_write_or_delete(account_templ
     fs.write_file.assert_not_awaited()
     updater._apply_delete.assert_not_awaited()
     assert operations.model_dump() == before
+
+
+def test_range_padding_is_optional_and_keyword_only():
+    from inspect import Parameter, signature
+
+    parameter = signature(ExtractContext.get_event_content).parameters["range_padding"]
+    assert parameter.kind is Parameter.KEYWORD_ONLY
+    assert parameter.default == 1

@@ -659,7 +659,8 @@ async def test_account_content_template_initialization(monkeypatch):
         ("get_first_message_time_with_weekday_from_ranges", "ranges"),
         ("get_event_content", "ranges, summary"),
         ("get_event_content", "ranges, summary, 0"),
-        ("get_event_content", "ranges, summary, 0, 2"),
+        ("get_event_content", "ranges, summary, 0, range_padding=2"),
+        ("get_event_content", "ranges, summary, range_padding=2"),
         ("get_year", "ranges"),
         ("get_month", "ranges"),
         ("get_day", "ranges"),
@@ -685,9 +686,8 @@ def test_content_template_all_documented_helpers(method, args, expression):
         expected_args += ("summary",)
     if ", 0" in args:
         expected_args += (0,)
-    if args.endswith(", 2"):
-        expected_args += (2,)
-    helper.assert_called_once_with(*expected_args)
+    expected_kwargs = {"range_padding": 2} if "range_padding=" in args else {}
+    helper.assert_called_once_with(*expected_args, **expected_kwargs)
     helper.reset_mock()
     changed_args = args.replace("ranges", "'0-999'", 1)
     with pytest.raises(ContentTemplateError, match="invalid_ranges"):
@@ -706,11 +706,11 @@ def test_account_event_template_accepts_padding_without_changing_ranges(padding)
         [Message(id=f"m{i}", role="user", parts=[TextPart(f"Fact {i}.")]) for i in range(5)]
     )
     values = {"ranges": "2", "summary": "Summary"}
-    suffix = "" if padding is None else f", {padding}"
+    suffix = "" if padding is None else f", range_padding={padding}"
     template = "{{ extract_context.get_event_content(ranges, summary, 0" + suffix + ") }}"
     rendered = render_content_template(template, "events", values, context)
     assert rendered == context.get_event_content(
-        "2", "Summary", 0, 1 if padding is None else padding
+        "2", "Summary", 0, range_padding=1 if padding is None else padding
     )
     assert values == {"ranges": "2", "summary": "Summary"}
     assert ("Fact 1." in rendered) is (padding != 0)
@@ -721,7 +721,9 @@ def test_account_event_template_accepts_padding_without_changing_ranges(padding)
     "padding", ["-1", "true", "false", "1.5", "'2'", "none", "summary", "100, 1"]
 )
 def test_account_event_template_rejects_invalid_padding(padding):
-    template = "{{ extract_context.get_event_content(ranges, summary, 0, " + padding + ") }}"
+    template = (
+        "{{ extract_context.get_event_content(ranges, summary, 0, range_padding=" + padding + ") }}"
+    )
     with pytest.raises(ContentTemplateError):
         validate_content_template(template, "events")
 
@@ -738,21 +740,42 @@ def test_account_event_padding_cannot_bypass_range_or_owner_checks():
     values = {"ranges": "0", "summary": "Summary"}
     with pytest.raises(ContentTemplateError, match="invalid_ranges"):
         render_content_template(
-            "{{ extract_context.get_event_content('0-1', summary, 0, 0) }}",
+            "{{ extract_context.get_event_content('0-1', summary, 0, range_padding=0) }}",
             "events",
             values,
             context,
         )
     with pytest.raises(EventRangePaddingError, match="memory-owner boundaries"):
         render_content_template(
-            "{{ extract_context.get_event_content(ranges, summary, 0, 1) }}",
+            "{{ extract_context.get_event_content(ranges, summary, 0, range_padding=1) }}",
             "events",
             values,
             context,
         )
     assert "Bob" not in render_content_template(
-        "{{ extract_context.get_event_content(ranges, summary, 0, 0) }}",
+        "{{ extract_context.get_event_content(ranges, summary, 0, range_padding=0) }}",
         "events",
         values,
         context,
     )
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "get_event_content(ranges, summary, 0, 1)",
+        "get_event_content(ranges, summary, padding=1)",
+        "get_event_content(ranges, summary, ratio_threshold=0)",
+        "get_event_content(ranges, summary, range_padding=1, range_padding=2)",
+        "get_event_content(ranges, summary, range_padding=1, other=2)",
+        "get_event_content(ranges, summary, **{'range_padding': 1})",
+        "get_event_content(ranges, summary, *[0], range_padding=1)",
+        "get_year(ranges, range_padding=1)",
+        "get_resource_event_content(ranges, summary, range_padding=1)",
+        "get_event_content(ranges, summary, 2, range_padding=1)",
+        "get_event_content(ranges, summary, summary, range_padding=1)",
+    ],
+)
+def test_range_padding_keyword_does_not_enable_other_call_forms(call):
+    with pytest.raises(ContentTemplateError):
+        validate_content_template("{{ extract_context." + call + " }}", "events")
