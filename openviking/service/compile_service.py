@@ -26,6 +26,7 @@ from openviking.service.fs_service import FSService
 from openviking.service.memory_compile import MemoryCompileRunner
 from openviking.service.task_tracker import SENSITIVE_TASK_KEYS, TaskRecord
 from openviking.session.memory.utils.memory_fields import strip_memory_fields_trailer
+from openviking.storage.acl import AclAction
 from openviking_cli.exceptions import (
     ConflictError,
     InvalidArgumentError,
@@ -623,11 +624,17 @@ class CompileService:
         return self._lifecycle
 
     async def _target(
-        self, to: str, ctx: RequestContext, *, include_deleted: bool = False
+        self,
+        to: str,
+        ctx: RequestContext,
+        *,
+        include_deleted: bool = False,
+        action: AclAction = AclAction.READ,
     ) -> dict[str, Any]:
+        """Resolve an account's registered target after checking the requested ACL action."""
         lifecycle = self._require_lifecycle()
         target = validate_request_viking_uri(resolve_path_variables(to), ctx, field_name="to")
-        await self._fs.ensure_write_access(target.rstrip("/"), ctx)
+        await lifecycle._fs._ensure_access(target.rstrip("/"), ctx, action=action)
         record = await lifecycle.store.get_by_to(
             ctx.account_id, target.rstrip("/"), include_deleted=include_deleted
         )
@@ -662,7 +669,7 @@ class CompileService:
 
     async def update_config(self, body: "CompileConfigUpdate", ctx: RequestContext) -> dict:
         lifecycle = self._require_lifecycle()
-        record = await self._target(body.to, ctx)
+        record = await self._target(body.to, ctx, action=AclAction.WRITE)
         identity = (record["to"], record["deleted_at"])
         request = await self._normalize_request(
             self._normalize_request_uris(
@@ -711,7 +718,7 @@ class CompileService:
     async def list_configs(
         self, ctx: RequestContext, *, limit: int, cursor: str | None
     ) -> dict[str, Any]:
-        """Page accessible targets by URI, checking one extra visible item for continuation."""
+        """Page readable active targets by URI, checking one extra item for continuation."""
         from openviking.service.compile_scheduler import next_run_at
 
         lifecycle = self._require_lifecycle()
@@ -720,6 +727,8 @@ class CompileService:
             await lifecycle.store.list_summaries(ctx.account_id), key=lambda item: item["to"]
         )
         for item in summaries:
+            if item["status"] == "deleted":
+                continue
             if cursor and item["to"] <= cursor:
                 continue
             try:

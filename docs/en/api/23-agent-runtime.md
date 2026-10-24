@@ -112,13 +112,13 @@ task, err := client.Compile(
 
 ### Target settings and operation history
 
-These endpoints use the current account and authentication context. `to` is the registered target's `viking://` URI. Reading or updating one target requires write access; listing targets returns only accessible targets.
+These endpoints use the current account and authentication context. `to` is the registered target's `viking://` URI. Reading settings, operation history, operation details or outputs requires read access; updating settings requires write access. Listing targets returns only accessible targets.
 
 | HTTP API | Description and result (`status: "ok"`) |
 |----------|------------------------|
 | `GET /api/v1/compile/config?to={to}` | `result` contains target settings and run status |
 | `POST /api/v1/compile/config/update` | Required JSON body field `to` identifies the registered Compile output directory to configure; `result` contains the updated settings and run status |
-| `GET /api/v1/compile/configs` | Optional query parameters: `limit` (1–100, default 20) and `cursor`; `result.targets` contains this page of visible target summaries ordered by `to` ascending; `result.next_cursor` is the last returned target URI; pass it unchanged as the next page's `cursor`; null marks the last page |
+| `GET /api/v1/compile/configs` | Optional query parameters: `limit` (1–100, default 20) and `cursor`; `result.targets` contains this page of readable active target summaries ordered by `to` ascending, excluding deleted targets before pagination; `result.next_cursor` is the last returned target URI; pass it unchanged as the next page's `cursor`; null marks the last page |
 | `POST /api/v1/compile/configs/query` | JSON body `{"to": ["viking://resources/wiki"]}` queries 1–50 exact target URIs. Each URI is at most 2048 UTF-8 bytes; the JSON body is at most 128 KiB. `result` maps each input URI to a boolean: true for an active Compile target, false for an unregistered or deleted target. Read permission is required for every URI; the query does not paginate, scan the registry or modify state |
 | `GET /api/v1/compile/operations?to={to}` | `result.operations` contains operations, newest first; `result.next_cursor` continues pagination |
 | `GET /api/v1/compile/operations/{operation_id}?to={to}` | `result` contains one operation with the same fields as a history item, including `params` and public `meta`, excluding private execution checkpoints |

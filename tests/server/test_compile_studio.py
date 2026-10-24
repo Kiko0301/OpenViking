@@ -354,6 +354,10 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     with monkeypatch.context() as patch:
         summary = (await store.list_summaries(ctx.account_id))[0]
         summaries = [{**summary, "to": f"{target}_{i}"} for i in (1, 0)]
+        summaries.extend(
+            {**summary, "to": f"{target}_{suffix}", "status": "deleted"}
+            for suffix in ("-1", "0a", "2")
+        )
         patch.setattr(store, "list_summaries", AsyncMock(return_value=summaries))
         p = (await client.get("/api/v1/compile/configs?limit=1")).json()["result"]
         assert [item["to"] for item in p["targets"]] == [f"{target}_0"]
@@ -366,6 +370,9 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
         ).json()["result"]
         assert [item["to"] for item in p["targets"]] == [f"{target}_1"]
         assert p["next_cursor"] is None
+        summaries[:] = [item for item in summaries if item["status"] == "deleted"]
+        p = (await client.get("/api/v1/compile/configs?limit=1")).json()["result"]
+        assert p == {"targets": [], "next_cursor": None}
     operation = await store.get_operation(ctx.account_id, target, first)
     checkpoint = dict(operation["meta"])
     assert checkpoint["snapshot_committed"] and checkpoint["target_head"]
@@ -609,6 +616,24 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     with pytest.raises(PermissionDeniedError):
         await scheduler.trigger_if_due(ctx.account_id, target, now + timedelta(days=1))
 
+    # Metadata is readable with read access; changing settings requires write access.
+    await service.fs.set_acl(
+        target,
+        [{"principal": f"user:{ctx.user.user_id}", "level": "read"}],
+        ctx=admin,
+        acl_mode=AclMode.RESTRICTED,
+    )
+    queries = (
+        "/api/v1/compile/config",
+        "/api/v1/compile/operations",
+        f"/api/v1/compile/operations/{scheduled}",
+        f"/api/v1/compile/operations/{scheduled}/outputs",
+    )
+    for path in queries:
+        response = await client.get(path, params={"to": target})
+        assert response.status_code == 200, response.text
+    assert (await client.post("/api/v1/compile/config/update", json=settings)).status_code == 403
+
     # Submission recovery remains available after inputs disappear or the backend is disabled.
     with monkeypatch.context() as patch:
         patch.setattr(service.fs, "stat", AsyncMock(side_effect=NotFoundError(source)))
@@ -624,6 +649,8 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     assert (await client.get("/api/v1/tasks", params={"pagination": "cursor"})).json()["result"][
         "items"
     ] == []
+    for path in queries:
+        assert (await client.get(path, params={"to": target})).status_code == 403
 
 
 async def _seed_compile_target(service, target, ctx):
