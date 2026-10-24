@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -185,11 +186,11 @@ class CompileScheduler:
                     if item.get("auto_update") and is_due(
                         item, current_slot(item["update_schedule"], now)
                     ):
-                        await self.trigger_if_due(account_id, item["id"], item["to"], now)
+                        await self.trigger_if_due(account_id, item["to"], now)
                     elif item.get("auto_update"):
                         await self.reschedule(account_id, item)
                 except Exception:
-                    logger.exception("Compile schedule check failed for %s", item.get("id"))
+                    logger.exception("Compile schedule check failed for %s", item.get("to"))
 
     async def reschedule(
         self,
@@ -199,7 +200,10 @@ class CompileScheduler:
         previous_to: Optional[str] = None,
         raise_on_error: bool = False,
     ) -> None:
-        """Mirror a schedule, removing a moved locator; optionally propagate Redis errors."""
+        """Mirror the URI's schedule and remove ``previous_to`` after a move.
+
+        Redis failures propagate only when ``raise_on_error`` is true.
+        """
         if self._expiry is None:
             return
         from openviking.scheduling.expiry import ExpiryMode, ExpiryRegistration, ItemIdentity
@@ -208,7 +212,7 @@ class CompileScheduler:
             COMPILE_TARGET_ITEM_TYPE,
             account_id,
             "_system",
-            json.dumps([record["id"], record["to"]], separators=(",", ":")),
+            record["to"],
         )
         try:
             if previous_to is not None and previous_to != record["to"]:
@@ -217,7 +221,7 @@ class CompileScheduler:
                         COMPILE_TARGET_ITEM_TYPE,
                         account_id,
                         "_system",
-                        json.dumps([record["id"], previous_to], separators=(",", ":")),
+                        previous_to,
                     )
                 )
             if (
@@ -239,26 +243,29 @@ class CompileScheduler:
                 await self._expiry.unregister(identity)
         except Exception:
             # The compensation scan repairs a missing or stale registration.
-            logger.warning("Compile reschedule failed for %s", record["id"], exc_info=True)
+            logger.warning("Compile reschedule failed for %s", record["to"], exc_info=True)
             if raise_on_error:
                 raise
 
     # ---------- decision and submission ----------
 
-    async def trigger_if_due(
-        self, account_id: str, target_id: str, to: str, now: Optional[datetime] = None
-    ) -> str:
-        """Submit a slot once, rejecting locators whose stable target identity no longer matches."""
+    async def trigger_if_due(self, account_id: str, to: str, now: Optional[datetime] = None) -> str:
+        """Submit the URI's due slot once under its state lock.
+
+        ``now`` defaults to Beijing time. Return submitted, disabled or not_due;
+        missing or moved targets raise LookupError. The saved slot follows moves.
+        """
+        to = to.rstrip("/")
         now = now or datetime.now(TZ)
         async with self._store.edit(account_id, to) as record:
-            if record["id"] != target_id or record["to"] != to:
-                raise LookupError(f"Compile target not found: {target_id}")
+            if record["to"] != to:
+                raise LookupError(f"Compile target not found: {to}")
             slot = current_slot(record["update_schedule"], now) if record["auto_update"] else None
             if slot is None or not is_due(record, slot):
                 await self.reschedule(account_id, record, raise_on_error=True)
                 return "not_due"
             slot_iso = slot.isoformat()
-            key = f"compile-schedule:{target_id}:{slot_iso}"
+            key = f"compile-schedule:{hashlib.sha256(to.encode('utf-8')).hexdigest()}:{slot_iso}"
             outcome = "submitted"
             try:
                 ctx, connection = await self._executor(record)
@@ -340,22 +347,15 @@ class _ExpiryHandler:
         self._scheduler = scheduler
 
     async def handle(self, request: Any) -> Any:
+        """Trigger the callback's target URI; missing targets complete and failures retry."""
         from openviking.scheduling.expiry import CallbackResult, CallbackStatus
 
         identity = request.identity
-        try:
-            locator = json.loads(identity.local_id)
-            if (
-                not isinstance(locator, list)
-                or len(locator) != 2
-                or any(not isinstance(value, str) or not value for value in locator)
-            ):
-                return CallbackResult(CallbackStatus.COMPLETED, "not_found")
-        except (TypeError, ValueError):
+        to = identity.local_id
+        if not isinstance(to, str) or not to:
             return CallbackResult(CallbackStatus.COMPLETED, "not_found")
         try:
-            target_id, to = locator
-            outcome = await self._scheduler.trigger_if_due(identity.account_id, target_id, to)
+            outcome = await self._scheduler.trigger_if_due(identity.account_id, to)
         except LookupError:
             return CallbackResult(CallbackStatus.COMPLETED, "not_found")
         except Exception:

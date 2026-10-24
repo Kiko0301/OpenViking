@@ -436,6 +436,17 @@ class CompileService:
         payload = submitted
         if self._lifecycle is not None:
             control, runtime_args = split_control_args(submitted.get("args"))
+            if "auto_update" in control or "update_schedule" in control:
+                record = (
+                    await self._lifecycle.store.get_by_to(ctx.account_id, submitted["to"]) or {}
+                )
+                # Omitted rules reuse active settings; explicit null clears the supplied rule.
+                if control.get("auto_update", record.get("auto_update", False)) and (
+                    control.get("update_schedule", record.get("update_schedule")) is None
+                ):
+                    raise InvalidArgumentError(
+                        "update_schedule is required when auto_update is true"
+                    )
             payload = {key: value for key, value in submitted.items() if key != "args"}
             if runtime_args:
                 payload["args"] = runtime_args
@@ -624,31 +635,11 @@ class CompileService:
             raise NotFoundError(to, "compile target")
         return record
 
-    async def _operation_target_id(
-        self,
-        to: str,
-        ctx: RequestContext,
-        *,
-        target_id: str | None,
-        include_deleted: bool = False,
-    ) -> str:
-        """Validate a supplied ID or resolve it from the authorized target configuration.
-
-        Callers authorize to and guarantee its association with a supplied ID.
-        """
-        if target_id is not None:
-            if not re.fullmatch(r"target_[0-9a-f]{16}", target_id):
-                raise InvalidArgumentError("Invalid target_id")
-            return target_id
-        record = await self._target(to, ctx, include_deleted=include_deleted)
-        return record["id"]
-
     @staticmethod
     def _config_view(record: Mapping[str, Any]) -> dict[str, Any]:
         from openviking.service.compile_scheduler import next_run_at
 
         return {
-            "target_id": record["id"],
             "status": record["status"],
             "to": record["to"],
             "initialized": record["initialized"],
@@ -672,7 +663,7 @@ class CompileService:
     async def update_config(self, body: "CompileConfigUpdate", ctx: RequestContext) -> dict:
         lifecycle = self._require_lifecycle()
         record = await self._target(body.to, ctx)
-        identity = (record["id"], record["deleted_at"])
+        identity = (record["to"], record["deleted_at"])
         request = await self._normalize_request(
             self._normalize_request_uris(
                 CompileRequest.model_validate(
@@ -684,7 +675,7 @@ class CompileService:
         )
         lifecycle.validate_layout(record["to"], request.from_)
         async with lifecycle.store.edit(ctx.account_id, record["to"]) as record:
-            if record["status"] != "active" or (record["id"], record["deleted_at"]) != identity:
+            if record["status"] != "active" or (record["to"], record["deleted_at"]) != identity:
                 raise ConflictError(
                     "Compile target changed during configuration", resource="COMPILE_TARGET"
                 )
@@ -720,16 +711,16 @@ class CompileService:
     async def list_configs(
         self, ctx: RequestContext, *, limit: int, cursor: str | None
     ) -> dict[str, Any]:
-        """Page accessible targets by immutable ID, checking one extra visible item for continuation."""
+        """Page accessible targets by URI, checking one extra visible item for continuation."""
         from openviking.service.compile_scheduler import next_run_at
 
         lifecycle = self._require_lifecycle()
         items = []
         summaries = sorted(
-            await lifecycle.store.list_summaries(ctx.account_id), key=lambda item: item["id"]
+            await lifecycle.store.list_summaries(ctx.account_id), key=lambda item: item["to"]
         )
         for item in summaries:
-            if cursor and item["id"] <= cursor:
+            if cursor and item["to"] <= cursor:
                 continue
             try:
                 await lifecycle._fs._ensure_access(item["to"], ctx)
@@ -737,7 +728,6 @@ class CompileService:
                 continue
             items.append(
                 {
-                    "target_id": item["id"],
                     "status": item["status"],
                     "to": item["to"],
                     "initialized": item["initialized"],
@@ -756,7 +746,7 @@ class CompileService:
         page = items[:limit]
         return {
             "targets": page,
-            "next_cursor": page[-1]["target_id"] if len(items) > limit else None,
+            "next_cursor": page[-1]["to"] if len(items) > limit else None,
         }
 
     async def list_operations(
@@ -769,7 +759,7 @@ class CompileService:
         """
         record = await self._target(to, ctx, include_deleted=True)
         operations = await self._require_lifecycle().store.list_operations(
-            ctx.account_id, record["id"], limit=limit + 1, cursor=cursor
+            ctx.account_id, record["to"], limit=limit + 1, cursor=cursor
         )
         page = operations[:limit]
         public = [self._operation_view(operation) for operation in page]
@@ -816,20 +806,13 @@ class CompileService:
         to: str,
         operation_id: str,
         ctx: RequestContext,
-        *,
-        target_id: str | None = None,
     ) -> dict[str, Any]:
         """Read one authorized operation, including deleted targets and public metadata only."""
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}", operation_id):
             raise InvalidArgumentError("Invalid operation_id")
-        if target_id is not None:
-            target = validate_request_viking_uri(resolve_path_variables(to), ctx, field_name="to")
-            await self._fs.ensure_write_access(target.rstrip("/"), ctx)
-        target_id = await self._operation_target_id(
-            to, ctx, include_deleted=True, target_id=target_id
-        )
+        record = await self._target(to, ctx, include_deleted=True)
         operation = await self._require_lifecycle().store.get_operation(
-            ctx.account_id, target_id, operation_id
+            ctx.account_id, record["to"], operation_id
         )
         if operation is None:
             raise NotFoundError(operation_id, "operation")
@@ -843,19 +826,15 @@ class CompileService:
         *,
         limit: int,
         cursor: str | None,
-        target_id: str | None = None,
     ) -> dict[str, Any]:
         """Read one authorized operation's immutable-path version references, ordered by URI."""
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}", operation_id):
             raise InvalidArgumentError("Invalid operation_id")
-        if target_id is not None:
-            target = validate_request_viking_uri(resolve_path_variables(to), ctx, field_name="to")
-            await self._fs.ensure_write_access(target.rstrip("/"), ctx)
-        target_id = await self._operation_target_id(to, ctx, target_id=target_id)
+        record = await self._target(to, ctx)
         store = self._require_lifecycle().store
-        if await store.get_operation(ctx.account_id, target_id, operation_id) is None:
+        if await store.get_operation(ctx.account_id, record["to"], operation_id) is None:
             raise NotFoundError(operation_id, "operation")
-        manifest = await store.get_outputs(ctx.account_id, target_id, operation_id)
+        manifest = await store.get_outputs(ctx.account_id, record["to"], operation_id)
         if manifest is None:
             raise NotFoundError(operation_id, "operation outputs not recorded")
         outputs = sorted(manifest["outputs"], key=lambda item: item["uri"])

@@ -4,9 +4,9 @@
 
 State lives under ``/local/{account}/_system/compile/``:
 ``target_folders/{sha256(to)}/state.json`` (source of truth, enumerated for summaries),
-``target_folders/{id}/operations/{operation_id}.json`` (one record per directory operation),
-``target_folders/{id}/operation_outputs/{operation_id}.json`` (immutable-path version references), and
-``target_folders/{id}/file_versions/{sha256(uri)}.json`` (one version index per output
+``target_folders/{sha256(to)}/operations/{operation_id}.json`` (one record per directory operation),
+``target_folders/{sha256(to)}/operation_outputs/{operation_id}.json`` (immutable-path version references), and
+``target_folders/{sha256(to)}/file_versions/{sha256(uri)}.json`` (one version index per output
 file). Each JSON's read-modify-write takes its own PathLock, so the layout stays
 consistent across instances when PathLock uses the cache provider.
 
@@ -76,6 +76,8 @@ logger = get_logger(__name__)
 
 # Per-call immutable output references are published under the content lease.
 _operation_outputs: ContextVar[Optional[dict]] = ContextVar("operation_outputs", default=None)
+# A target move reuses its covering metadata leases for nested JSON writes.
+_metadata_move: ContextVar[Optional[dict]] = ContextVar("compile_metadata_move", default=None)
 
 
 # ==========================================================================
@@ -86,7 +88,6 @@ _operation_outputs: ContextVar[Optional[dict]] = ContextVar("operation_outputs",
 LOCK_TIMEOUT_SECONDS = 30.0
 HISTORY_RETENTION_SECONDS = 7 * 24 * 3600
 SUMMARY_FIELDS = (
-    "id",
     "to",
     "status",
     "deleted_at",
@@ -102,9 +103,9 @@ SUMMARY_FIELDS = (
 )
 
 
-def new_record(target_id: str, to: str) -> Dict[str, Any]:
+def new_record(to: str) -> Dict[str, Any]:
+    """Build execution settings for a canonical target URI without claiming a task."""
     return {
-        "id": target_id,
         "to": to,
         "compile_type": "compile",  # Compile category for this target.
         "conflicts_num": 0,  # Number of conflicting files under this target.
@@ -155,9 +156,6 @@ class CompileStore(Protocol):
     scopes; lock tokens are opaque and belong to the selected implementation.
     """
 
-    async def find_id(
-        self, account_id: str, to: str, *, include_deleted: bool = False
-    ) -> Optional[str]: ...
     async def get(self, account_id: str, to: str) -> Optional[Dict[str, Any]]: ...
     async def get_by_to(
         self, account_id: str, to: str, *, include_deleted: bool = False
@@ -165,9 +163,11 @@ class CompileStore(Protocol):
     def edit(
         self, account_id: str, to: str, *, create: bool = False
     ) -> AsyncContextManager[Dict[str, Any]]: ...
-    def move_state(
-        self, account_id: str, to: str, destination: str
-    ) -> AsyncContextManager[Dict[str, Any]]: ...
+    async def move_state(self, account_id: str, to: str, destination: str) -> None: ...
+    def lock_targets(self, account_id: str, targets: List[str]) -> AsyncContextManager[None]: ...
+    async def prepare_move(
+        self, account_id: str, to: str, destination: str, source_path: str
+    ) -> None: ...
     async def list_summaries(
         self, account_id: str, inherited_lease: Any = None
     ) -> List[Dict[str, Any]]: ...
@@ -175,18 +175,18 @@ class CompileStore(Protocol):
     async def mark_content_updated(self, account_id: str, to: str) -> None: ...
 
     async def get_operation(
-        self, account_id: str, target_id: str, operation_id: str
+        self, account_id: str, target_to: str, operation_id: str
     ) -> Optional[Dict[str, Any]]: ...
     async def put_operation(
-        self, account_id: str, target_id: str, operation: Dict[str, Any]
+        self, account_id: str, target_to: str, operation: Dict[str, Any]
     ) -> None: ...
     async def mark_content_changed(
-        self, account_id: str, target_id: str, operation_id: str
+        self, account_id: str, target_to: str, operation_id: str
     ) -> None: ...
     async def list_operations(
         self,
         account_id: str,
-        target_id: str,
+        target_to: str,
         *,
         limit: Optional[int] = None,
         cursor: Optional[str] = None,
@@ -194,17 +194,17 @@ class CompileStore(Protocol):
     def lock_operation(
         self,
         account_id: str,
-        target_id: str,
+        target_to: str,
         operation_id: str,
         phase: Literal["create", "finish"],
     ) -> AsyncContextManager[None]: ...
     async def get_outputs(
-        self, account_id: str, target_id: str, operation_id: str
+        self, account_id: str, target_to: str, operation_id: str
     ) -> Optional[dict]: ...
     async def merge_outputs(
         self,
         account_id: str,
-        target_id: str,
+        target_to: str,
         operation_id: str,
         outputs: List[dict],
         *,
@@ -214,18 +214,18 @@ class CompileStore(Protocol):
     ) -> None: ...
 
     async def get_version_index(
-        self, account_id: str, target_id: str, uri: str
+        self, account_id: str, target_to: str, uri: str
     ) -> Optional[Dict[str, Any]]: ...
     async def list_version_indexes(
-        self, account_id: str, target_id: str
+        self, account_id: str, target_to: str
     ) -> List[Dict[str, Any]]: ...
     async def put_version_index(
-        self, account_id: str, target_id: str, index: Dict[str, Any], lock_token: Any = None
+        self, account_id: str, target_to: str, index: Dict[str, Any], lock_token: Any = None
     ) -> None: ...
-    async def delete_version_index(self, account_id: str, target_id: str, uri: str) -> None: ...
-    async def clear_output_data(self, account_id: str, target_id: str) -> None: ...
+    async def delete_version_index(self, account_id: str, target_to: str, uri: str) -> None: ...
+    async def clear_output_data(self, account_id: str, target_to: str) -> None: ...
     def lock_version_index(
-        self, account_id: str, target_id: str, uri: str, inherited_lock: Any = None
+        self, account_id: str, target_to: str, uri: str, inherited_lock: Any = None
     ) -> AsyncContextManager[Any]: ...
 
 
@@ -235,7 +235,7 @@ class CompileStateStore:
     def __init__(self, agfs: Any) -> None:
         self._agfs = agfs if isinstance(agfs, AsyncAGFSClient) else AsyncAGFSClient(agfs)
         self._cleanup_locks = KeyedAsyncLockPool()
-        self._cleanup_scan: Optional[AsyncIterator[Optional[tuple[str, str, str, str]]]] = None
+        self._cleanup_scan: Optional[AsyncIterator[Optional[tuple[str, str, str]]]] = None
 
     # ---------- paths ----------
 
@@ -243,15 +243,15 @@ class CompileStateStore:
     def root(account_id: str) -> str:
         return f"/local/{account_id}/_system/compile"
 
-    def _target_dir(self, account_id: str, target_id: str) -> str:
-        return f"{self.root(account_id)}/target_folders/{target_id}"
+    def _target_dir(self, account_id: str, to: str) -> str:
+        key = hashlib.sha256(to.rstrip("/").encode("utf-8")).hexdigest()
+        return f"{self.root(account_id)}/target_folders/{key}"
 
     def _record_path(self, account_id: str, to: str) -> str:
-        key = hashlib.sha256(to.rstrip("/").encode("utf-8")).hexdigest()
-        return f"{self.root(account_id)}/target_folders/{key}/state.json"
+        return f"{self._target_dir(account_id, to)}/state.json"
 
-    def _operation_path(self, account_id: str, target_id: str, operation_id: str) -> str:
-        return f"{self._target_dir(account_id, target_id)}/operations/{operation_id}.json"
+    def _operation_path(self, account_id: str, target_to: str, operation_id: str) -> str:
+        return f"{self._target_dir(account_id, target_to)}/operations/{operation_id}.json"
 
     # ---------- primitives ----------
 
@@ -270,6 +270,7 @@ class CompileStateStore:
 
     async def write_json(self, path: str, value: Any, lease: Any = None) -> None:
         """Write JSON; pass the held lease when ``path`` is already locked by the caller."""
+        lease = lease or self._move_lease(path)
         fs_ctx = fs_ctx_from_agfs_path(path)
         if lease is not None:
             fs_ctx["lease_ref"] = lease["lease_ref"]
@@ -280,6 +281,7 @@ class CompileStateStore:
     @asynccontextmanager
     async def locked(self, path: str, inherited_lease: Any = None) -> AsyncIterator[Any]:
         """Lock a JSON path, or reuse a caller-owned tree lease covering that path."""
+        inherited_lease = inherited_lease or self._move_lease(path)
         if inherited_lease is not None:
             yield inherited_lease
             return
@@ -289,12 +291,41 @@ class CompileStateStore:
         finally:
             await self._agfs.pathlock_release(lease)
 
+    def _move_lease(self, path: str) -> Any:
+        """Return this call's move lease only when it covers the requested metadata path."""
+        scope = _metadata_move.get()
+        if (
+            scope
+            and scope["store"] is self
+            and any(path == root or path.startswith(root + "/") for root in scope["roots"])
+        ):
+            return scope["lease"]
+        return None
+
+    @asynccontextmanager
+    async def lock_targets(self, account_id: str, targets: List[str]) -> AsyncIterator[None]:
+        """Exclude metadata writers during a move; busy targets fail without waiting on content."""
+        roots = sorted({self._target_dir(account_id, to) for to in targets})
+        if not roots or all(self._move_lease(root) is not None for root in roots):
+            yield
+            return
+        try:
+            lease = await self._agfs.pathlock_acquire_tree_batch(roots)
+        except LockAcquisitionError as exc:
+            raise ResourceBusyError("Compile target metadata is being processed") from exc
+        token = _metadata_move.set({"store": self, "roots": roots, "lease": lease})
+        try:
+            yield
+        finally:
+            _metadata_move.reset(token)
+            await self._agfs.pathlock_release(lease)
+
     # ---------- target discovery ----------
 
     async def list_summaries(
         self, account_id: str, inherited_lease: Any = None
     ) -> List[Dict[str, Any]]:
-        """Summarize states without locks, relying on atomic whole-file publication.
+        """Summarize atomically published states, recovering interrupted target moves.
 
         The list is not a point-in-time snapshot. Missing states are skipped;
         other I/O and JSON errors propagate instead of hiding registered targets.
@@ -310,21 +341,24 @@ class CompileStateStore:
             if len(name) != 64 or not entry.get("isDir", entry.get("is_dir", False)):
                 continue
             record = await self.read_json(f"{directory}/{name}/state.json")
+            if record is not None and record.get("move"):
+                record = await self.get(account_id, record["to"])
             if record is not None:
                 summaries.append(summarize(_normalize_schedule(record)))
         return summaries
 
-    async def find_id(
-        self, account_id: str, to: str, *, include_deleted: bool = False
-    ) -> Optional[str]:
-        record = await self.get_by_to(account_id, to, include_deleted=include_deleted)
-        return record["id"] if record is not None else None
-
     # ---------- state.json ----------
 
     async def get(self, account_id: str, to: str) -> Optional[Dict[str, Any]]:
-        """Read target state by URI without locking; return None when the state is missing."""
+        """Read state by canonical URI, recovering interrupted moves; missing states return None."""
         record = await self.read_json(self._record_path(account_id, to))
+        if record is not None and record.get("move"):
+            move = record["move"]
+            source, destination = (
+                (record["to"], move["to"]) if "to" in move else (move["from"], record["to"])
+            )
+            await self.move_state(account_id, source, destination)
+            record = await self.read_json(self._record_path(account_id, to))
         return _normalize_schedule(record) if record is not None else None
 
     async def get_by_to(
@@ -343,18 +377,28 @@ class CompileStateStore:
         """Edit under the target lock and save on clean exit.
 
         Missing states raise LookupError unless ``create`` also creates or revives them.
-        Revival preserves the stable identity and deletion boundary.
+        Revival preserves the operation history and deletion boundary.
         """
         to = to.rstrip("/")
+        existing = await self.get(account_id, to)
+        if not create and existing is None:
+            raise LookupError(f"Compile target not found: {to}")
         path = self._record_path(account_id, to)
         async with self.locked(path) as lease:
-            record = await self.get(account_id, to)
+            record = await self.read_json(path)
+            if record is not None and record.get("move"):
+                raise ResourceBusyError("Compile target is moving", uri=to)
             if record is None:
                 if not create:
                     raise LookupError(f"Compile target not found: {to}")
-                record = new_record(f"target_{uuid4().hex[:16]}", to)
+                # An interrupted move can leave JSON without its source state.
+                for folder in ("operations", "operation_outputs", "file_versions"):
+                    await self.remove(
+                        f"{self._target_dir(account_id, to)}/{folder}", recursive=True
+                    )
+                record = new_record(to)
             elif create and record["status"] != "active":
-                defaults = new_record(record["id"], to)
+                defaults = new_record(to)
                 for key in (
                     "status",
                     "initialized",
@@ -376,27 +420,91 @@ class CompileStateStore:
             yield _normalize_schedule(record)
             await self.write_json(path, _normalize_schedule(record), lease)
 
-    @asynccontextmanager
-    async def move_state(
-        self, account_id: str, to: str, destination: str
-    ) -> AsyncIterator[Dict[str, Any]]:
-        """Yield relocated state under ordered source/destination locks; publish on clean exit."""
-        source = self._record_path(account_id, to)
-        target = self._record_path(account_id, destination)
-        first_path, second_path = sorted((source, target))
-        async with self.locked(first_path) as first, self.locked(second_path) as second:
-            record = await self.get(account_id, to)
-            existing = await self.get(account_id, destination)
-            if record is None:
-                raise LookupError(f"Compile target not found: {to}")
-            if existing is not None and existing["id"] != record["id"]:
-                raise ConflictError(
-                    "Compile destination is already registered", resource="COMPILE_TARGET"
-                )
-            moved = existing or {**record, "to": destination}
-            yield moved
-            await self.write_json(target, moved, first if target == first_path else second)
-            await self.remove(source, lease=first if source == first_path else second)
+    async def prepare_move(
+        self, account_id: str, to: str, destination: str, source_path: str
+    ) -> None:
+        """Reserve both target URIs before content moves under their covering tree leases.
+
+        The source business path lets recovery distinguish a completed move from
+        a failed transfer. Every target in a moved parent is reserved before I/O.
+        """
+        record = await self.get(account_id, to)
+        if record is None or await self.get(account_id, destination) is not None:
+            raise ConflictError("Compile move target changed", resource="COMPILE_TARGET")
+        await self.write_json(
+            self._record_path(account_id, to),
+            record | {"move": {"to": destination, "source_path": source_path}},
+        )
+        await self.write_json(
+            self._record_path(account_id, destination),
+            record
+            | {
+                "to": destination,
+                "move": {"from": to, "phase": "transfer", "source_path": source_path},
+            },
+        )
+
+    async def move_state(self, account_id: str, to: str, destination: str) -> None:
+        """Recover a content move using pending state, without assuming atomic directory rename.
+
+        ``transfer`` reserves URIs before content moves; ``copying`` keeps the
+        complete source; ``cleanup`` never recopies history.
+        Pending destinations reject ordinary publication until source cleanup finishes.
+        Missing or replaced destination reservations raise ConflictError.
+        """
+        to, destination = to.rstrip("/"), destination.rstrip("/")
+        async with self.lock_targets(account_id, [to, destination]):
+            source = self._target_dir(account_id, to)
+            target = self._target_dir(account_id, destination)
+            original = await self.read_json(self._record_path(account_id, to))
+            record = await self.read_json(self._record_path(account_id, destination))
+            source_move = (original or {}).get("move", {})
+            transfer_path = source_move.get("source_path") or (record or {}).get("move", {}).get(
+                "source_path"
+            )
+            if transfer_path and (
+                record is None or record.get("move", {}).get("phase") == "transfer"
+            ):
+                try:
+                    await self._agfs.stat(transfer_path)
+                except (AGFSNotFoundError, FileNotFoundError):
+                    pass
+                else:
+                    # Content remains at the source, so its Compile registration stays there.
+                    if source_move.get("to") == destination:
+                        original.pop("move")
+                        await self.write_json(self._record_path(account_id, to), original)
+                    if record is not None and record.get("move", {}).get("from") == to:
+                        await self.remove(target, recursive=True)
+                    return
+            if record is not None and not record.get("move"):
+                # Another reader can finish recovery before this reader obtains the lease.
+                return
+            if record is None or record.get("move", {}).get("from") != to:
+                raise ConflictError("Compile move destination changed", resource="COMPILE_TARGET")
+            if record["move"]["phase"] == "transfer":
+                record["content_updated_at"] = time.time()
+                record["move"] = {"from": to, "phase": "copying"}
+                await self.write_json(self._record_path(account_id, destination), record)
+            if record["move"]["phase"] == "copying":
+                if source_move.get("to") != destination:
+                    raise ConflictError("Compile move source changed", resource="COMPILE_TARGET")
+                for folder in ("operations", "operation_outputs", "file_versions"):
+                    for name in await self.list_dir(f"{source}/{folder}"):
+                        value = await self.read_json(f"{source}/{folder}/{name}")
+                        if folder == "file_versions" and uri_matches_prefix(value["uri"], to):
+                            value["uri"] = destination + value["uri"][len(to) :]
+                            name = (
+                                hashlib.sha256(value["uri"].encode("utf-8")).hexdigest() + ".json"
+                            )
+                        await self.write_json(f"{target}/{folder}/{name}", value)
+                record["move"]["phase"] = "cleanup"
+                await self.write_json(self._record_path(account_id, destination), record)
+            # A recreated source is a different target and cannot be cleaned by this move.
+            if original is None or source_move.get("to") == destination:
+                await self.remove(source, recursive=True)
+            record.pop("move")
+            await self.write_json(self._record_path(account_id, destination), record)
 
     async def mark_content_updated(self, account_id: str, to: str) -> None:
         """Save the observed business-file change time in Unix seconds."""
@@ -406,19 +514,19 @@ class CompileStateStore:
     # ---------- operations ----------
 
     async def get_operation(
-        self, account_id: str, target_id: str, operation_id: str
+        self, account_id: str, target_to: str, operation_id: str
     ) -> Optional[Dict[str, Any]]:
-        return await self.read_json(self._operation_path(account_id, target_id, operation_id))
+        return await self.read_json(self._operation_path(account_id, target_to, operation_id))
 
     async def put_operation(
-        self, account_id: str, target_id: str, operation: Dict[str, Any]
+        self, account_id: str, target_to: str, operation: Dict[str, Any]
     ) -> None:
         """Save operation state without clearing a concurrently recorded content change.
 
         The merged marker also updates the caller's metadata so finalization uses
         the same durable value when publishing the target's content update time.
         """
-        path = self._operation_path(account_id, target_id, operation["operation_id"])
+        path = self._operation_path(account_id, target_to, operation["operation_id"])
         async with self.locked(path) as lease:
             stored = await self.read_json(path)
             if stored and stored["meta"].get("content_changed"):
@@ -426,10 +534,10 @@ class CompileStateStore:
             await self.write_json(path, operation, lease)
 
     async def mark_content_changed(
-        self, account_id: str, target_id: str, operation_id: str
+        self, account_id: str, target_to: str, operation_id: str
     ) -> None:
         """Persist an actual Compile write once; raise NotFoundError for a missing operation."""
-        path = self._operation_path(account_id, target_id, operation_id)
+        path = self._operation_path(account_id, target_to, operation_id)
         async with self.locked(path) as lease:
             operation = await self.read_json(path)
             if operation is None:
@@ -442,29 +550,29 @@ class CompileStateStore:
     async def lock_operation(
         self,
         account_id: str,
-        target_id: str,
+        target_to: str,
         operation_id: str,
         phase: Literal["create", "finish"],
     ) -> AsyncIterator[None]:
         """Serialize one operation phase; creation and finalization use separate locks."""
         async with self.locked(
-            f"{self._operation_path(account_id, target_id, operation_id)}.{phase}"
+            f"{self._operation_path(account_id, target_to, operation_id)}.{phase}"
         ):
             yield
 
-    def _outputs_path(self, account_id: str, target_id: str, operation_id: str) -> str:
-        return f"{self._target_dir(account_id, target_id)}/operation_outputs/{operation_id}.json"
+    def _outputs_path(self, account_id: str, target_to: str, operation_id: str) -> str:
+        return f"{self._target_dir(account_id, target_to)}/operation_outputs/{operation_id}.json"
 
     async def get_outputs(
-        self, account_id: str, target_id: str, operation_id: str
+        self, account_id: str, target_to: str, operation_id: str
     ) -> Optional[dict]:
         """Read atomically published outputs without locking; return None when absent."""
-        return await self.read_json(self._outputs_path(account_id, target_id, operation_id))
+        return await self.read_json(self._outputs_path(account_id, target_to, operation_id))
 
     async def merge_outputs(
         self,
         account_id: str,
-        target_id: str,
+        target_to: str,
         operation_id: str,
         outputs: List[dict],
         *,
@@ -479,7 +587,7 @@ class CompileStateStore:
         Path effects and task references retain content-commit order independently
         of the operation's later refresh and terminal history updates.
         """
-        path = self._outputs_path(account_id, target_id, operation_id)
+        path = self._outputs_path(account_id, target_to, operation_id)
         async with self.locked(path, metadata_lease) as lease:
             data = await self.read_json(path) or {"outputs": []}
             merged = {item["uri"]: item for item in data["outputs"]}
@@ -508,6 +616,7 @@ class CompileStateStore:
 
     async def remove(self, path: str, *, recursive: bool = False, lease: Any = None) -> None:
         """Remove a path idempotently, reusing the caller's covering lease when supplied."""
+        lease = lease or self._move_lease(path)
         fs_ctx = fs_ctx_from_agfs_path(path)
         if lease is not None:
             fs_ctx["lease_ref"] = lease["lease_ref"]
@@ -516,7 +625,7 @@ class CompileStateStore:
         except (AGFSNotFoundError, FileNotFoundError):
             pass
 
-    async def _iter_history(self) -> AsyncIterator[Optional[tuple[str, str, str, str]]]:
+    async def _iter_history(self) -> AsyncIterator[Optional[tuple[str, str, str]]]:
         """Yield history IDs without locks; account and target visits also consume the batch."""
         for account_id in await self.list_accounts():
             yield None
@@ -527,19 +636,19 @@ class CompileStateStore:
                 continue
             for target in targets:
                 yield None
-                target_id = target["id"]
+                target_to = target["to"]
                 try:
                     record = await self.get(account_id, target["to"])
                     if record is None or record.get("active_task_id"):
                         continue
                     names = await self.list_dir(
-                        f"{self._target_dir(account_id, target_id)}/operations"
+                        f"{self._target_dir(account_id, target_to)}/operations"
                     )
                 except Exception:
-                    logger.exception("Cannot scan Compile history for %s/%s", account_id, target_id)
+                    logger.exception("Cannot scan Compile history for %s/%s", account_id, target_to)
                     continue
                 for name in names:
-                    yield account_id, target_id, name[:-5], target["to"]
+                    yield account_id, target_to, name[:-5]
 
     async def delete_expired(self, *, now: float, limit: int) -> int:
         """Scan at most ``limit`` visits and return the number of expired operations removed.
@@ -570,21 +679,21 @@ class CompileStateStore:
                         *candidate, cutoff=now - HISTORY_RETENTION_SECONDS
                     )
                 except Exception:
-                    logger.exception("Cannot clean Compile history %s/%s/%s at %s", *candidate)
+                    logger.exception("Cannot clean Compile history %s/%s/%s", *candidate)
         return deleted
 
     async def _delete_expired_operation(
-        self, account_id: str, target_id: str, operation_id: str, to: str, *, cutoff: float
+        self, account_id: str, target_to: str, operation_id: str, *, cutoff: float
     ) -> bool:
         """Return whether a terminal history pair older than Unix ``cutoff`` is removed."""
-        operation_path = self._operation_path(account_id, target_id, operation_id)
-        async with self.lock_operation(account_id, target_id, operation_id, "finish"):
-            async with self.locked(self._record_path(account_id, to)):
-                record = await self.get(account_id, to)
-                if record is None or record["id"] != target_id or record.get("active_task_id"):
+        operation_path = self._operation_path(account_id, target_to, operation_id)
+        async with self.lock_operation(account_id, target_to, operation_id, "finish"):
+            async with self.locked(self._record_path(account_id, target_to)):
+                record = await self.get(account_id, target_to)
+                if record is None or record["to"] != target_to or record.get("active_task_id"):
                     return False
                 async with self.locked(operation_path) as operation_lease:
-                    operation = await self.get_operation(account_id, target_id, operation_id)
+                    operation = await self.get_operation(account_id, target_to, operation_id)
                     finished_at = (operation or {}).get("finished_at")
                     if (
                         not operation
@@ -597,7 +706,7 @@ class CompileStateStore:
                         or finished_at >= cutoff
                     ):
                         return False
-                    outputs_path = self._outputs_path(account_id, target_id, operation_id)
+                    outputs_path = self._outputs_path(account_id, target_to, operation_id)
                     async with self.locked(outputs_path) as outputs_lease:
                         await self.remove(outputs_path, lease=outputs_lease)
                     await self.remove(operation_path, lease=operation_lease)
@@ -606,7 +715,7 @@ class CompileStateStore:
     async def list_operations(
         self,
         account_id: str,
-        target_id: str,
+        target_to: str,
         *,
         limit: Optional[int] = None,
         cursor: Optional[str] = None,
@@ -614,7 +723,7 @@ class CompileStateStore:
         """Return newest records after cursor; limit bounds memory, not JSON reads."""
         if limit is not None and limit <= 0:
             return []
-        directory = f"{self._target_dir(account_id, target_id)}/operations"
+        directory = f"{self._target_dir(account_id, target_to)}/operations"
         names = await self.list_dir(directory)
         before = None
         cursor_name = f"{cursor}.json" if cursor else None
@@ -657,22 +766,22 @@ class CompileStateStore:
 
     # ---------- file version indexes ----------
 
-    def _versions_dir(self, account_id: str, target_id: str) -> str:
-        return f"{self._target_dir(account_id, target_id)}/file_versions"
+    def _versions_dir(self, account_id: str, target_to: str) -> str:
+        return f"{self._target_dir(account_id, target_to)}/file_versions"
 
-    def _version_path(self, account_id: str, target_id: str, uri: str) -> str:
+    def _version_path(self, account_id: str, target_to: str, uri: str) -> str:
         name = hashlib.sha256(uri.encode("utf-8")).hexdigest()
-        return f"{self._versions_dir(account_id, target_id)}/{name}.json"
+        return f"{self._versions_dir(account_id, target_to)}/{name}.json"
 
     async def get_version_index(
-        self, account_id: str, target_id: str, uri: str
+        self, account_id: str, target_to: str, uri: str
     ) -> Optional[Dict[str, Any]]:
         """Read the stored index for an output URI, or None if it is absent."""
-        return await self.read_json(self._version_path(account_id, target_id, uri))
+        return await self.read_json(self._version_path(account_id, target_to, uri))
 
-    async def list_version_indexes(self, account_id: str, target_id: str) -> List[Dict[str, Any]]:
+    async def list_version_indexes(self, account_id: str, target_to: str) -> List[Dict[str, Any]]:
         """Read the target's existing indexes, ignoring files removed during enumeration."""
-        directory = self._versions_dir(account_id, target_id)
+        directory = self._versions_dir(account_id, target_to)
         indexes = []
         for name in await self.list_dir(directory):
             index = await self.read_json(f"{directory}/{name}")
@@ -681,34 +790,34 @@ class CompileStateStore:
         return indexes
 
     async def put_version_index(
-        self, account_id: str, target_id: str, index: Dict[str, Any], lock_token: Any = None
+        self, account_id: str, target_to: str, index: Dict[str, Any], lock_token: Any = None
     ) -> None:
         """Save the index at its URI, using the caller's version lock when supplied."""
         await self.write_json(
-            self._version_path(account_id, target_id, index["uri"]), index, lock_token
+            self._version_path(account_id, target_to, index["uri"]), index, lock_token
         )
 
-    async def delete_version_index(self, account_id: str, target_id: str, uri: str) -> None:
+    async def delete_version_index(self, account_id: str, target_to: str, uri: str) -> None:
         """Remove an output's index; a missing index is already deleted."""
-        await self.remove(self._version_path(account_id, target_id, uri))
+        await self.remove(self._version_path(account_id, target_to, uri))
 
-    async def clear_output_data(self, account_id: str, target_id: str) -> None:
+    async def clear_output_data(self, account_id: str, target_to: str) -> None:
         """Remove output manifests and version indexes, retaining operation history."""
-        await self.remove(self._versions_dir(account_id, target_id), recursive=True)
+        await self.remove(self._versions_dir(account_id, target_to), recursive=True)
         await self.remove(
-            f"{self._target_dir(account_id, target_id)}/operation_outputs", recursive=True
+            f"{self._target_dir(account_id, target_to)}/operation_outputs", recursive=True
         )
 
     @asynccontextmanager
     async def lock_version_index(
-        self, account_id: str, target_id: str, uri: str, inherited_lock: Any = None
+        self, account_id: str, target_to: str, uri: str, inherited_lock: Any = None
     ) -> AsyncIterator[Any]:
         """Lock an index, reusing a covering content lock during whole-account restore.
 
         Pass the yielded opaque token to put_version_index while this scope is held.
         """
         async with self.locked(
-            self._version_path(account_id, target_id, uri), inherited_lock
+            self._version_path(account_id, target_to, uri), inherited_lock
         ) as token:
             yield token
 
@@ -982,15 +1091,15 @@ class CompileLifecycle:
             return
         if not self._task_is_current(locked_record, task):
             return
-        target_id = locked_record["id"]
-        async with self._store.lock_operation(task.account_id, target_id, task.task_id, "create"):
-            run = await self._store.get_operation(task.account_id, target_id, task.task_id)
+        target_to = locked_record["to"]
+        async with self._store.lock_operation(task.account_id, target_to, task.task_id, "create"):
+            run = await self._store.get_operation(task.account_id, target_to, task.task_id)
             self._record_identity(task, locked_record)
             if run is None:
-                await self._store.merge_outputs(task.account_id, target_id, task.task_id, [])
+                await self._store.merge_outputs(task.account_id, target_to, task.task_id, [])
                 await self._store.put_operation(
                     task.account_id,
-                    target_id,
+                    target_to,
                     new_compile_operation(task, locked_record),
                 )
 
@@ -1043,8 +1152,8 @@ class CompileLifecycle:
                     return ExternalTaskSnapshot(
                         status="cancelled", error_message="Compile target was deleted"
                     )
-                target_id = record["id"]
-                run = await self._store.get_operation(account_id, target_id, task.task_id)
+                target_to = record["to"]
+                run = await self._store.get_operation(account_id, target_to, task.task_id)
                 if run and run["status"] in TERMINAL and run["finished_at"] is not None:
                     # Replayed completions must not claim the target and restore an older baseline.
                     return ExternalTaskSnapshot(
@@ -1052,7 +1161,7 @@ class CompileLifecycle:
                     )
                 owner = record["active_task_id"]
                 if owner and owner != task.task_id:
-                    other = await self._store.get_operation(account_id, target_id, owner)
+                    other = await self._store.get_operation(account_id, target_to, owner)
                     if other is not None and other["status"] not in TERMINAL:
                         return "busy"
                 record["active_task_id"] = task.task_id
@@ -1061,7 +1170,7 @@ class CompileLifecycle:
             return ExternalTaskSnapshot(
                 status="cancelled", error_message="Compile target was moved or deleted"
             )
-        run = await self._store.get_operation(account_id, target_id, task.task_id)
+        run = await self._store.get_operation(account_id, target_to, task.task_id)
         if run is None or run["status"] == "queued":
             try:
                 run = await self._begin_run(task, record, run)
@@ -1145,7 +1254,7 @@ class CompileLifecycle:
             )
             if mode == "incremental" and not run_meta["changed_roots"] and record["initialized"]:
                 run["status"] = "completed"
-            await self._store.put_operation(task.account_id, record["id"], run)
+            await self._store.put_operation(task.account_id, record["to"], run)
         return run
 
     async def _plan(
@@ -1186,7 +1295,7 @@ class CompileLifecycle:
         record = await self._store.get(account_id, payload["to"])
         if record is None:
             return None
-        run = await self._store.get_operation(account_id, record["id"], task_id)
+        run = await self._store.get_operation(account_id, record["to"], task_id)
         if run is None or run["meta"].get("changes") is None:
             return None
         run_meta = run["meta"]
@@ -1216,9 +1325,9 @@ class CompileLifecycle:
             return ExternalTaskSnapshot(
                 status="cancelled", error_message="Compile target was moved or deleted"
             )
-        target_id = record["id"]
-        async with self._store.lock_operation(account_id, target_id, task.task_id, "finish"):
-            run = await self._store.get_operation(account_id, target_id, task.task_id)
+        target_to = record["to"]
+        async with self._store.lock_operation(account_id, target_to, task.task_id, "finish"):
+            run = await self._store.get_operation(account_id, target_to, task.task_id)
             if run is not None and run["finished_at"] is None:
                 run_meta = run["meta"]
                 ctx = task_ctx(task.account_id, task.user_id)
@@ -1238,7 +1347,7 @@ class CompileLifecycle:
 
                     if run["status"] != "committing":
                         run["status"] = "committing"
-                        await self._store.put_operation(account_id, target_id, run)
+                        await self._store.put_operation(account_id, target_to, run)
                     # Reindex can own content locks once versions are durable.
                     if not run_meta.get("reindex_task_id"):
                         async with self._locked_output(request["to"], ctx) as lease:
@@ -1250,7 +1359,7 @@ class CompileLifecycle:
                                     lease_ref=lease,
                                 )
                                 run_meta["snapshot_committed"] = True
-                                await self._store.put_operation(account_id, target_id, run)
+                                await self._store.put_operation(account_id, target_to, run)
                             head = run_meta["target_head"]
                             changes = (
                                 await self._fs.diff_paths(
@@ -1286,7 +1395,7 @@ class CompileLifecycle:
                         previous is not None and previous.error == REINDEX_ENQUEUE_ERROR
                     ):
                         run_meta["reindex_task_id"] = str(uuid4())
-                        await self._store.put_operation(account_id, target_id, run)
+                        await self._store.put_operation(account_id, target_to, run)
                     await get_service().reindex(
                         uri=request["to"],
                         mode="semantic_and_vectors",
@@ -1302,12 +1411,12 @@ class CompileLifecycle:
                     run["error"] = snapshot.error_message or snapshot.status
                 run["status"] = snapshot.status
                 run["finished_at"] = time.time()
-                await self._store.put_operation(account_id, target_id, run)
-            await self._release(account_id, target_id, task, run)
+                await self._store.put_operation(account_id, target_to, run)
+            await self._release(account_id, target_to, task, run)
             return snapshot
 
     async def _release(
-        self, account_id: str, target_id: str, task: Any, run: Optional[Dict[str, Any]]
+        self, account_id: str, target_to: str, task: Any, run: Optional[Dict[str, Any]]
     ) -> None:
         first_success = False
         try:
@@ -1323,7 +1432,7 @@ class CompileLifecycle:
                     )
                 ) and run is not None:
                     # Write hooks can publish their marker after final operation state is saved.
-                    run = await self._store.get_operation(account_id, target_id, task_id) or run
+                    run = await self._store.get_operation(account_id, target_to, task_id) or run
                     run_meta = run["meta"]
                     record["last_run"] = {
                         "task_id": task_id,
@@ -1369,16 +1478,13 @@ class CompileLifecycle:
         completion marker closes association before new content can acquire a lease.
         """
         run_meta = run["meta"]
-        target_id = await self._store.find_id(ctx.account_id, to)
         restored, deleted = [], []
         try:
             async with self._locked_output(to, ctx) as lease:
                 if run_meta.get("rollback_head"):
                     run_meta["target_head"] = run_meta["rollback_head"]
                     return
-                manifest = await self._store.get_outputs(
-                    ctx.account_id, target_id, run_meta["task_id"]
-                )
+                manifest = await self._store.get_outputs(ctx.account_id, to, run_meta["task_id"])
                 head = await self._commit(
                     [to], f"compile {run_meta['task_id']} rollback point", ctx, lease_ref=lease
                 )
@@ -1399,9 +1505,7 @@ class CompileLifecycle:
                 }
                 directories, scopes, protected_scopes = set(), set(), set()
                 for operation_id in (manifest or {}).get("ordinary_operations", []):
-                    operation = await self._store.get_outputs(
-                        ctx.account_id, target_id, operation_id
-                    )
+                    operation = await self._store.get_outputs(ctx.account_id, to, operation_id)
                     if operation is None:
                         raise FailedPreconditionError("Compile operation effects are unavailable")
                     for effect in operation.get("effects", []):
@@ -1481,7 +1585,7 @@ class CompileLifecycle:
                 )
                 indexes = {
                     index["uri"]: index
-                    for index in await self.versions._indexes(ctx.account_id, target_id)
+                    for index in await self.versions._indexes(ctx.account_id, to)
                 }
                 changed = False
                 ordinary_files = {
@@ -1553,7 +1657,7 @@ class CompileLifecycle:
                     await self._store.mark_content_updated(ctx.account_id, to)
                 for uri, index in indexes.items():
                     if not await self._fs.exists(uri, ctx=ctx):
-                        await self._store.delete_version_index(ctx.account_id, target_id, uri)
+                        await self._store.delete_version_index(ctx.account_id, to, uri)
                         continue
                     retained = [
                         v
@@ -1566,14 +1670,14 @@ class CompileLifecycle:
                         continue
                     if retained:
                         index["versions"] = retained
-                        await self._store.put_version_index(ctx.account_id, target_id, index)
+                        await self._store.put_version_index(ctx.account_id, to, index)
                     else:
-                        await self._store.delete_version_index(ctx.account_id, target_id, uri)
+                        await self._store.delete_version_index(ctx.account_id, to, uri)
                 run_meta["target_head"] = await self._commit(
                     [to], f"compile {run_meta['task_id']} rollback", ctx, lease_ref=lease
                 )
                 run_meta["rollback_head"] = run_meta["target_head"]
-                await self._store.put_operation(ctx.account_id, target_id, run)
+                await self._store.put_operation(ctx.account_id, to, run)
         finally:
             if restored or deleted:
                 try:
@@ -1680,9 +1784,9 @@ class CompileVersions:
 
     # ---------- index storage ----------
 
-    async def load(self, account_id: str, target_id: str, uri: str) -> Optional[Dict[str, Any]]:
+    async def load(self, account_id: str, target_to: str, uri: str) -> Optional[Dict[str, Any]]:
         return self._normalize_index(
-            await self._store.get_version_index(account_id, target_id, uri)
+            await self._store.get_version_index(account_id, target_to, uri)
         )
 
     @staticmethod
@@ -1698,16 +1802,16 @@ class CompileVersions:
                 version["meta"] = {**meta, **(version.get("meta") or {})}
         return index
 
-    async def _indexes(self, account_id: str, target_id: str) -> List[Dict[str, Any]]:
+    async def _indexes(self, account_id: str, target_to: str) -> List[Dict[str, Any]]:
         return [
             self._normalize_index(index)
-            for index in await self._store.list_version_indexes(account_id, target_id)
+            for index in await self._store.list_version_indexes(account_id, target_to)
         ]
 
     async def append(
         self,
         account_id: str,
-        target_id: str,
+        target_to: str,
         uri: str,
         snapshot_id: str,
         entry: Dict[str, Any],
@@ -1722,13 +1826,13 @@ class CompileVersions:
         """
         context = _operation_outputs.get()
         collecting = (
-            context and context["account_id"] == account_id and target_id in context["outputs"]
+            context and context["account_id"] == account_id and target_to in context["outputs"]
         )
         operation_id = operation_id or (context["operation_id"] if collecting else None)
         async with self._store.lock_version_index(
-            account_id, target_id, uri, metadata_lease
+            account_id, target_to, uri, metadata_lease
         ) as token:
-            index = await self.load(account_id, target_id, uri) or {
+            index = await self.load(account_id, target_to, uri) or {
                 "uri": uri,
                 "next": 1,
                 "versions": [],
@@ -1759,9 +1863,9 @@ class CompileVersions:
                 index["versions"] = (index["versions"] + [version])[-MAX_VERSIONS:]
 
             async def persist():
-                await self._store.put_version_index(account_id, target_id, index, token)
+                await self._store.put_version_index(account_id, target_to, index, token)
                 if collecting and operation_id == context["operation_id"]:
-                    context["outputs"][target_id][uri] = {
+                    context["outputs"][target_to][uri] = {
                         "uri": uri,
                         "version_id": version["version_id"],
                         "snapshot_id": version["snapshot_id"],
@@ -1843,8 +1947,8 @@ class CompileVersions:
         context = {
             "account_id": ctx.account_id,
             "operation_id": operation_id,
-            "outputs": {target["id"]: {} for target, _ in entries},
-            "targets": {target["id"]: target for target, _ in entries},
+            "outputs": {target["to"]: {} for target, _ in entries},
+            "targets": {target["to"]: target for target, _ in entries},
             "changed": set(),
             "batch": params.get("batch", False),
         }
@@ -1854,15 +1958,15 @@ class CompileVersions:
         try:
             for target, entry in entries:
                 async with self._store.edit(ctx.account_id, target["to"]) as record:
-                    if record["id"] != target["id"]:
+                    if record["deleted_at"] != target.get("deleted_at"):
                         raise ConflictError("Compile target changed", resource="COMPILE_TARGET")
                     if record["status"] == "active" and record["deleted_at"] == target.get(
                         "deleted_at"
                     ):
                         await self._store.merge_outputs(
-                            ctx.account_id, target["id"], operation_id, []
+                            ctx.account_id, target["to"], operation_id, []
                         )
-                await self._store.put_operation(ctx.account_id, target["id"], entry)
+                    await self._store.put_operation(ctx.account_id, target["to"], entry)
             result = await operation()
         except BaseException as exc:
             operation_error = exc
@@ -1885,6 +1989,7 @@ class CompileVersions:
         finally:
             _operation_outputs.reset(token)
 
+            # shortcut: history uses the captured URI; coordinate finalization if moves overlap writes.
             async def finish():
                 for target, entry in entries:
                     entry["finished_at"] = time.time()
@@ -1912,17 +2017,22 @@ class CompileVersions:
                                 if (self._fs._tree_path_to_uri(path).startswith(f"{target['to']}/"))
                             ]
                     async with self._store.edit(ctx.account_id, target["to"]) as record:
-                        current = (
-                            record["id"] == target["id"]
-                            and record["status"] == "active"
-                            and record["deleted_at"] == target.get("deleted_at")
-                        )
+                        if (
+                            await self._store.get_operation(
+                                ctx.account_id, target["to"], operation_id
+                            )
+                            is None
+                        ):
+                            continue
+                        current = record["status"] == "active" and record[
+                            "deleted_at"
+                        ] == target.get("deleted_at")
                         if current:
                             await self._store.merge_outputs(
                                 ctx.account_id,
-                                target["id"],
+                                target["to"],
                                 operation_id,
-                                list(context["outputs"][target["id"]].values()),
+                                list(context["outputs"][target["to"]].values()),
                             )
                         if (
                             current
@@ -1934,7 +2044,7 @@ class CompileVersions:
                             )
                         ):
                             record["content_updated_at"] = time.time()
-                    await self._store.put_operation(ctx.account_id, target["id"], entry)
+                        await self._store.put_operation(ctx.account_id, target["to"], entry)
 
             try:
                 await run_to_completion(finish)
@@ -1946,7 +2056,13 @@ class CompileVersions:
                         )
                     entry["finished_at"] = time.time()
                     try:
-                        await self._store.put_operation(ctx.account_id, target["id"], entry)
+                        if (
+                            await self._store.get_operation(
+                                ctx.account_id, target["to"], operation_id
+                            )
+                            is not None
+                        ):
+                            await self._store.put_operation(ctx.account_id, target["to"], entry)
                     except Exception:
                         logger.exception("Failed to persist operation failure %s", operation_id)
                 raise exc from operation_error
@@ -1962,11 +2078,11 @@ class CompileVersions:
         context = _operation_outputs.get()
         if context is None or context["account_id"] != ctx.account_id:
             return
-        for target_id, original in context["targets"].items():
+        for target_to, original in context["targets"].items():
             record = await self._store.get(ctx.account_id, original["to"])
             if (
                 record is None
-                or record["id"] != target_id
+                or record["to"] != target_to
                 or record["status"] != "active"
                 or record["deleted_at"] != original.get("deleted_at")
             ):
@@ -1981,16 +2097,16 @@ class CompileVersions:
                     record["to"], uri
                 ):
                     scoped.append({**effect, "uri": record["to"]})
-            outputs = list(context["outputs"][target_id].values())
+            outputs = list(context["outputs"][target_to].values())
             if not scoped and not outputs:
                 continue
 
-            async def persist(target_id=target_id, scoped=scoped, outputs=outputs, record=record):
+            async def persist(target_to=target_to, scoped=scoped, outputs=outputs, record=record):
                 owner = (await self._write_meta(ctx.account_id, record)).get("task_id")
                 if outputs or owner:
                     await self._store.merge_outputs(
                         ctx.account_id,
-                        target_id,
+                        target_to,
                         context["operation_id"],
                         outputs,
                         effects=scoped if owner and scoped else None,
@@ -1999,7 +2115,7 @@ class CompileVersions:
                 if owner:
                     await self._store.merge_outputs(
                         ctx.account_id,
-                        target_id,
+                        target_to,
                         owner,
                         [],
                         ordinary_operation=context["operation_id"],
@@ -2044,7 +2160,7 @@ class CompileVersions:
             if record is None:
                 continue
             sources = set(record["from"])
-            for run in await self._store.list_operations(ctx.account_id, target["id"]):
+            for run in await self._store.list_operations(ctx.account_id, target["to"]):
                 run_meta = run["meta"]
                 if (
                     run_meta.get("task_id")
@@ -2079,17 +2195,23 @@ class CompileVersions:
         Moves retain the final source state and re-key indexes only after source removal.
         """
         context = _operation_outputs.get()
-        if context is None or context["account_id"] != ctx.account_id:
+        scope = _metadata_move.get()
+        collecting = context is not None and context["account_id"] == ctx.account_id
+        if not collecting and not (scope and scope.get("moves")):
             return
         source_root, destination = from_uri.rstrip("/"), to_uri.rstrip("/")
-        if move and not await self._fs.exists(source_root, ctx=ctx):
+        if move and (
+            (scope and scope.get("moves")) or not await self._fs.exists(source_root, ctx=ctx)
+        ):
             await self.after_move(source_root, destination, ctx)
+        if not collecting:
+            return
         targets = []
-        for target_id in context["targets"]:
+        for target_to in context["targets"]:
             await self._store.mark_content_updated(
-                ctx.account_id, context["targets"][target_id]["to"]
+                ctx.account_id, context["targets"][target_to]["to"]
             )
-            record = await self._store.get(ctx.account_id, context["targets"][target_id]["to"])
+            record = await self._store.get(ctx.account_id, context["targets"][target_to]["to"])
             if record and (await self._write_meta(ctx.account_id, record)).get("task_id"):
                 targets.append(record["to"])
         if not targets:
@@ -2134,7 +2256,7 @@ class CompileVersions:
         owner = record["active_task_id"]
         if not owner:
             return False
-        run = await self._store.get_operation(account_id, record["id"], owner)
+        run = await self._store.get_operation(account_id, record["to"], owner)
         return run is not None and run["status"] not in TERMINAL
 
     # ---------- write hooks ----------
@@ -2154,10 +2276,10 @@ class CompileVersions:
         incremental runs extend the latest version's provenance with changed roots.
         """
         if not head:
-            await self._store.merge_outputs(account_id, record["id"], run["operation_id"], [])
+            await self._store.merge_outputs(account_id, record["to"], run["operation_id"], [])
             return
         run_meta = run["meta"]
-        indexes = {index["uri"]: index for index in await self._indexes(account_id, record["id"])}
+        indexes = {index["uri"]: index for index in await self._indexes(account_id, record["to"])}
         ordinary = {
             uri: version
             for uri, index in indexes.items()
@@ -2168,7 +2290,7 @@ class CompileVersions:
             run_meta.get("execution", {}).get("mode") == "full"
             or run["params"]["args"]["mode"] == "full"
         )
-        manifest = await self._store.get_outputs(account_id, record["id"], run["operation_id"])
+        manifest = await self._store.get_outputs(account_id, record["to"], run["operation_id"])
         outputs = list((manifest or {}).get("outputs", [])) + [
             {
                 "uri": version["snapshot_path"],
@@ -2194,13 +2316,13 @@ class CompileVersions:
                         continue
                     if change_type != "deleted":
                         try:
-                            if not await self._changed(ctx, record["id"], uri, head):
+                            if not await self._changed(ctx, record["to"], uri, head):
                                 continue
                         except (AGFSNotFoundError, NotFoundError):
                             change_type = "deleted"
                 if change_type == "deleted":
                     if version is None:
-                        await self._store.delete_version_index(account_id, record["id"], uri)
+                        await self._store.delete_version_index(account_id, record["to"], uri)
                     continue
                 if index and any(
                     v["meta"]["task_id"] == run_meta["task_id"] and v["source"] == "compile"
@@ -2216,7 +2338,7 @@ class CompileVersions:
                     roots = sorted(set(previous_roots) | set(run_meta["changed_roots"]))
                 created = await self.append(
                     account_id,
-                    record["id"],
+                    record["to"],
                     uri,
                     head,
                     {
@@ -2243,7 +2365,7 @@ class CompileVersions:
             try:
                 await run_to_completion(
                     lambda: self._store.merge_outputs(
-                        account_id, record["id"], run["operation_id"], outputs
+                        account_id, record["to"], run["operation_id"], outputs
                     )
                 )
             except BaseException:
@@ -2288,13 +2410,13 @@ class CompileVersions:
             if not is_versioned(uri):
                 continue
             if change["change_type"] == "deleted":
-                changed = changed or await self.load(account_id, record["id"], uri) is not None
-                await self._store.delete_version_index(account_id, record["id"], uri)
-            elif await self._changed(ctx, record["id"], uri, target_base):
+                changed = changed or await self.load(account_id, record["to"], uri) is not None
+                await self._store.delete_version_index(account_id, record["to"], uri)
+            elif await self._changed(ctx, record["to"], uri, target_base):
                 changed = True
                 await self.append(
                     account_id,
-                    record["id"],
+                    record["to"],
                     uri,
                     target_base,
                     {"source": "external", "actor": None, "provenance": {}},
@@ -2327,8 +2449,8 @@ class CompileVersions:
             record = await self.owning_target(ctx.account_id, uri)
             if record is None or not is_versioned(uri):
                 continue
-            grouped.setdefault(record["id"], []).append(uri)
-            records[record["id"]] = record
+            grouped.setdefault(record["to"], []).append(uri)
+            records[record["to"]] = record
             # Working bytes can differ from the latest version during Compile.
             if write is not None:
                 previous[uri] = (
@@ -2339,7 +2461,7 @@ class CompileVersions:
         written = await write() if write is not None else None
         changed = {}
         context = _operation_outputs.get()
-        for target_id, targets in grouped.items():
+        for target_to, targets in grouped.items():
             targets = [
                 uri
                 for uri in targets
@@ -2347,25 +2469,25 @@ class CompileVersions:
             ]
             if not targets:
                 continue
-            changed[target_id] = targets
+            changed[target_to] = targets
             run = None
             if edit_source == "compile":
-                record = await self._store.get(ctx.account_id, records[target_id]["to"])
+                record = await self._store.get(ctx.account_id, records[target_to]["to"])
                 run = (
                     await self._store.get_operation(
-                        ctx.account_id, target_id, record["active_task_id"]
+                        ctx.account_id, target_to, record["active_task_id"]
                     )
                     if record["active_task_id"]
                     else None
                 )
                 if run and run["started_at"] is not None and run["finished_at"] is None:
                     await self._store.mark_content_changed(
-                        ctx.account_id, target_id, run["operation_id"]
+                        ctx.account_id, target_to, run["operation_id"]
                     )
                     if run["meta"]["target_base"] is None:
                         await self._store.merge_outputs(
                             ctx.account_id,
-                            target_id,
+                            target_to,
                             run["operation_id"],
                             [
                                 {"uri": uri, "version_id": None, "snapshot_id": None}
@@ -2378,17 +2500,17 @@ class CompileVersions:
                 context is not None
                 and context["account_id"] == ctx.account_id
                 and context.get("batch", False)
-                and target_id in context["outputs"]
+                and target_to in context["outputs"]
             )
             if run is None and (
                 (write is not None and not is_batch) or (write is None and is_batch)
             ):
-                await self._store.mark_content_updated(ctx.account_id, records[target_id]["to"])
+                await self._store.mark_content_updated(ctx.account_id, records[target_to]["to"])
             if context and context["account_id"] == ctx.account_id:
                 context["changed"].update(targets)
-                if target_id in context["outputs"]:
+                if target_to in context["outputs"]:
                     for uri in targets:
-                        context["outputs"][target_id][uri] = {
+                        context["outputs"][target_to][uri] = {
                             "uri": uri,
                             "version_id": None,
                             "snapshot_id": None,
@@ -2405,18 +2527,18 @@ class CompileVersions:
                 lease_ref=lease_ref,
             )
             if context and context["account_id"] == ctx.account_id:
-                for target_id, targets in changed.items():
-                    if target_id in context["outputs"]:
+                for target_to, targets in changed.items():
+                    if target_to in context["outputs"]:
                         for uri in targets:
-                            context["outputs"][target_id][uri]["snapshot_id"] = snapshot
-            for target_id, targets in changed.items():
-                record = await self._store.get(ctx.account_id, records[target_id]["to"])
+                            context["outputs"][target_to][uri]["snapshot_id"] = snapshot
+            for target_to, targets in changed.items():
+                record = await self._store.get(ctx.account_id, records[target_to]["to"])
                 run_entry = await self._write_meta(ctx.account_id, record)
                 for uri in targets:
                     if snapshot:
                         await self.append(
                             ctx.account_id,
-                            target_id,
+                            target_to,
                             uri,
                             snapshot,
                             {
@@ -2434,7 +2556,7 @@ class CompileVersions:
     async def _write_meta(self, account_id: str, record: dict) -> dict:
         """Associate ordinary versions and operations with an unfinished Compile."""
         run = (
-            await self._store.get_operation(account_id, record["id"], record["active_task_id"])
+            await self._store.get_operation(account_id, record["to"], record["active_task_id"])
             if record["active_task_id"]
             else None
         )
@@ -2488,8 +2610,8 @@ class CompileVersions:
             uri = self._fs._tree_path_to_uri(path)
             record = await self.owning_target(ctx.account_id, uri, metadata_lease=metadata_lease)
             if record is not None and is_versioned(uri):
-                if record["id"] in context["outputs"]:
-                    context["outputs"][record["id"]][uri] = {
+                if record["to"] in context["outputs"]:
+                    context["outputs"][record["to"]][uri] = {
                         "uri": uri,
                         "version_id": None,
                         "snapshot_id": snapshot,
@@ -2501,7 +2623,7 @@ class CompileVersions:
                     continue
                 await self.append(
                     ctx.account_id,
-                    record["id"],
+                    record["to"],
                     uri,
                     snapshot,
                     {
@@ -2515,12 +2637,12 @@ class CompileVersions:
         finally:
             await self.record_effects(effects, ctx, metadata_lease=metadata_lease)
 
-    async def _changed(self, ctx: RequestContext, target_id: str, uri: str, snapshot: str) -> bool:
+    async def _changed(self, ctx: RequestContext, target_to: str, uri: str, snapshot: str) -> bool:
         """Compare blob IDs at their recorded paths using the caller's identity.
 
         Missing history counts as changed; other read errors propagate.
         """
-        index = await self.load(ctx.account_id, target_id, uri)
+        index = await self.load(ctx.account_id, target_to, uri)
         if index is None or not index["versions"]:
             return True
         latest = index["versions"][-1]
@@ -2539,17 +2661,17 @@ class CompileVersions:
         if source is None:
             return
         target = await self.owning_target(account_id, to_uri)
-        for index in await self._indexes(account_id, source["id"]):
+        for index in await self._indexes(account_id, source["to"]):
             uri = index["uri"]
             if uri != from_uri and not uri.startswith(f"{from_uri}/"):
                 continue
-            await self._store.delete_version_index(account_id, source["id"], uri)
-            if target is not None and target["id"] == source["id"]:
+            await self._store.delete_version_index(account_id, source["to"], uri)
+            if target is not None and target["to"] == source["to"]:
                 index["uri"] = to_uri + uri[len(from_uri) :]
-                await self._store.put_version_index(account_id, source["id"], index)
+                await self._store.put_version_index(account_id, source["to"], index)
 
-    async def drop_all(self, account_id: str, target_id: str) -> None:
-        await self._store.clear_output_data(account_id, target_id)
+    async def drop_all(self, account_id: str, target_to: str) -> None:
+        await self._store.clear_output_data(account_id, target_to)
 
     # ---------- fs/rm and fs/mv ----------
 
@@ -2562,13 +2684,16 @@ class CompileVersions:
             and (item["to"] == uri or item["to"].startswith(f"{uri}/"))
         ]
 
-    async def _reject_running(self, account_id: str, uri: str) -> None:
-        for item in await self._targets_under(account_id, uri):
+    async def _reject_running(self, account_id: str, uri: str) -> List[Dict[str, Any]]:
+        """Return targets under URI, rejecting any with an active Compile operation."""
+        targets = await self._targets_under(account_id, uri)
+        for item in targets:
             record = await self._store.get(account_id, item["to"])
             if record is not None and await self._running(account_id, record):
                 raise ConflictError(
                     f"Compile is running on {item['to']}", resource="COMPILE_RUNNING"
                 )
+        return targets
 
     @asynccontextmanager
     async def before_remove(self, uri: str, ctx: RequestContext) -> AsyncIterator[Any]:
@@ -2605,55 +2730,93 @@ class CompileVersions:
                 record["auto_update"] = False
                 record["active_task_id"] = None
                 record["execution_context"]["credential"] = None
-                await self.drop_all(ctx.account_id, item["id"])
+                await self.drop_all(ctx.account_id, item["to"])
             if self.reschedule is not None:
                 await self.reschedule(ctx.account_id, record)
         if not removed:
             record = await self.owning_target(ctx.account_id, uri)
             if record is not None:
-                for index in await self._indexes(ctx.account_id, record["id"]):
+                for index in await self._indexes(ctx.account_id, record["to"]):
                     if index["uri"] == uri or index["uri"].startswith(f"{uri}/"):
                         await self._store.delete_version_index(
-                            ctx.account_id, record["id"], index["uri"]
+                            ctx.account_id, record["to"], index["uri"]
                         )
                 if is_versioned(uri):
                     async with self._store.edit(ctx.account_id, record["to"]) as record:
                         record["content_updated_at"] = time.time()
 
-    async def before_move(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
-        await self._reject_running(ctx.account_id, from_uri)
-        for item in await self._targets_under(ctx.account_id, from_uri):
+    async def before_move(
+        self, from_uri: str, to_uri: str, ctx: RequestContext
+    ) -> List[Dict[str, Any]]:
+        """Validate target destinations and sources; return the targets whose metadata moves."""
+        targets = await self._reject_running(ctx.account_id, from_uri)
+        for item in targets:
             record = await self._store.get(ctx.account_id, item["to"])
             moved_to = to_uri + item["to"][len(from_uri) :]
             existing = await self._store.get(ctx.account_id, moved_to)
-            if existing is not None and existing["id"] != item["id"]:
+            if existing is not None:
                 raise ConflictError(
                     "Compile destination is already registered", resource="COMPILE_TARGET"
                 )
             if any(overlaps(source, moved_to) for source in record["from"]):
                 raise InvalidArgumentError("Compile target would overlap its sources")
+        return targets
+
+    @asynccontextmanager
+    async def lock_move(
+        self, from_uri: str, to_uri: str, ctx: RequestContext
+    ) -> AsyncIterator[None]:
+        """Cover target relocation with metadata leases inside the transfer's content lease.
+
+        Busy metadata fails immediately because Compile finalization can hold an
+        operation lock while waiting for content. Target layout is validated before locking.
+        """
+        from_uri, to_uri = from_uri.rstrip("/"), to_uri.rstrip("/")
+        targets = await self.before_move(from_uri, to_uri, ctx)
+        paths = [
+            uri
+            for target in targets
+            for uri in (target["to"], to_uri + target["to"][len(from_uri) :])
+        ]
+        async with self._store.lock_targets(ctx.account_id, paths):
+            if targets:
+                scope = _metadata_move.get()
+                scope["moves"] = targets
+                for target in targets:
+                    source_uri = (
+                        target["to"] if await self._fs.exists(target["to"], ctx=ctx) else from_uri
+                    )
+                    await self._store.prepare_move(
+                        ctx.account_id,
+                        target["to"],
+                        to_uri + target["to"][len(from_uri) :],
+                        self._fs._uri_to_path(source_uri, ctx=ctx),
+                    )
+            yield
 
     async def after_move(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
-        """Relocate target state and indexes without changing stable identities."""
+        """Relocate all target metadata and update this operation's destination routing."""
         if from_uri == to_uri:
             return
-        moved = await self._targets_under(ctx.account_id, from_uri)
+        scope = _metadata_move.get()
+        moved = (
+            scope["moves"]
+            if scope and scope.get("moves") is not None
+            else await self._targets_under(ctx.account_id, from_uri)
+        )
         for item in moved:
             destination = to_uri + item["to"][len(from_uri) :]
-            async with self._store.move_state(ctx.account_id, item["to"], destination) as record:
-                for index in await self._indexes(ctx.account_id, item["id"]):
-                    previous_uri = index["uri"]
-                    if not uri_matches_prefix(previous_uri, item["to"]):
-                        continue
-                    index["uri"] = destination + previous_uri[len(item["to"]) :]
-                    await self._store.put_version_index(ctx.account_id, item["id"], index)
-                    await self._store.delete_version_index(ctx.account_id, item["id"], previous_uri)
-                record["content_updated_at"] = time.time()
+            await self._store.move_state(ctx.account_id, item["to"], destination)
+            record = await self._store.get(ctx.account_id, destination)
+            if record is None:
+                continue
             context = _operation_outputs.get()
             if context is not None and context["account_id"] == ctx.account_id:
-                target = context["targets"].get(item["id"])
+                target = context["targets"].pop(item["to"], None)
                 if target is not None:
                     target["to"] = destination
+                    context["targets"][destination] = target
+                    context["outputs"][destination] = context["outputs"].pop(item["to"])
             if self.reschedule is not None:
                 await self.reschedule(ctx.account_id, record, previous_to=item["to"])
         if not moved:
@@ -2671,7 +2834,7 @@ class CompileVersions:
         """Return newest-first versions and the retained count before pagination."""
         await self._fs._ensure_access(uri, ctx)
         record = await self._managed(uri, ctx)
-        index = await self.load(ctx.account_id, record["id"], uri)
+        index = await self.load(ctx.account_id, record["to"], uri)
         entries = list(reversed((index or {}).get("versions", [])))
         total = len(entries)
         current = entries[0]["version_id"] if entries else None
@@ -2702,7 +2865,7 @@ class CompileVersions:
         """
         await self._fs._ensure_access(uri, ctx, action=AclAction.WRITE)
         record = await self._managed(uri, ctx)
-        index = await self.load(ctx.account_id, record["id"], uri) or {"versions": []}
+        index = await self.load(ctx.account_id, record["to"], uri) or {"versions": []}
         source = next((v for v in index["versions"] if v["version_id"] == restore_version), None)
         if source is None:
             raise NotFoundError(restore_version, "file version")
@@ -2711,13 +2874,13 @@ class CompileVersions:
 
         async def commit_restore(uris, *, lease_ref, write):
             """Check, write and version under the content lease before refresh."""
-            async with self._store.lock_version_index(ctx.account_id, target_id, uri):
+            async with self._store.lock_version_index(ctx.account_id, target_to, uri):
                 record = await self._store.get(ctx.account_id, target_to)
-                if record is None or record["id"] != target_id:
+                if record is None or record["to"] != target_to:
                     raise ConflictError("Compile target changed", resource="COMPILE_TARGET")
                 if await self._running(ctx.account_id, record):
                     raise ConflictError("Compile is running", resource="COMPILE_RUNNING")
-                index = await self.load(ctx.account_id, target_id, uri) or {"versions": []}
+                index = await self.load(ctx.account_id, target_to, uri) or {"versions": []}
                 current = index["versions"][-1]["version_id"] if index["versions"] else None
                 if current != current_version:
                     raise ConflictError(
@@ -2730,14 +2893,14 @@ class CompileVersions:
                 snapshot = await self._commit(
                     uris, f"restore {uri} to {restore_version}", ctx, lease_ref=lease_ref
                 )
-            if not snapshot or not await self._changed(ctx, target_id, uri, snapshot):
+            if not snapshot or not await self._changed(ctx, target_to, uri, snapshot):
                 result.update(
                     uri=uri, version_id=current, meta=dict(_VERSION_META_DEFAULTS), result="noop"
                 )
             else:
                 version = await self.append(
                     ctx.account_id,
-                    target_id,
+                    target_to,
                     uri,
                     snapshot,
                     {
@@ -2750,7 +2913,7 @@ class CompileVersions:
                 result.update(uri=uri, version_id=version["version_id"], meta=dict(version["meta"]))
             return written
 
-        target_id, target_to = record["id"], record["to"]
+        target_to = record["to"]
 
         async def restore_content():
             await write(content, commit_restore)

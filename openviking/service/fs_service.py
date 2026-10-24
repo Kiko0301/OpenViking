@@ -8,7 +8,7 @@ Provides file system operations: ls, mkdir, rm, mv, tree, stat, read, abstract, 
 
 import asyncio
 from collections.abc import Coroutine
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
@@ -1204,7 +1204,6 @@ class FSService:
             yield None
             return
         if move:
-            await versions.before_move(from_uri.rstrip("/"), to_uri.rstrip("/"), ctx)
             await viking_fs._ensure_access(from_uri, ctx, action=AclAction.WRITE)
         else:
             await viking_fs._ensure_copy_source_access(from_uri, recursive=recursive, ctx=ctx)
@@ -1238,16 +1237,17 @@ class FSService:
             requests = [{"path": path, "kind": "exact"} for path in (source_path, target_path)]
         lease = await viking_fs._async_agfs.pathlock_acquire_batch(requests)
         try:
-            yield lease
-        finally:
-            try:
-                await run_to_completion(
-                    lambda: versions.register_transfer(
-                        from_uri, to_uri, ctx, lease_ref=lease, move=move
+            async with versions.lock_move(from_uri, to_uri, ctx) if move else nullcontext():
+                try:
+                    yield lease
+                finally:
+                    await run_to_completion(
+                        lambda: versions.register_transfer(
+                            from_uri, to_uri, ctx, lease_ref=lease, move=move
+                        )
                     )
-                )
-            finally:
-                await viking_fs._async_agfs.pathlock_release(lease)
+        finally:
+            await viking_fs._async_agfs.pathlock_release(lease)
 
     async def _finish_transfer_after_caller_cancel(
         self,
