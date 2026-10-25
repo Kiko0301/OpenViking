@@ -1472,8 +1472,17 @@ class ReindexExecutor:
     ) -> None:
         for directory_uri in directory_uris:
             counters.scanned_records += 1
-            abstract = await self._read_directory_abstract(directory_uri, ctx=ctx)
-            overview = await self._read_directory_overview(directory_uri, ctx=ctx)
+            # Fail per directory like the upserts below, instead of silently
+            # skipping a directory whose markers could not be read.
+            try:
+                abstract = await self._read_directory_abstract(directory_uri, ctx=ctx)
+                overview = await self._read_directory_overview(directory_uri, ctx=ctx)
+            except Exception as exc:
+                counters.failed_records += 1
+                counters.warnings.append(
+                    f"Failed to read directory markers for {directory_uri}: {exc}"
+                )
+                continue
             if not abstract and not overview:
                 continue
 
@@ -1532,14 +1541,17 @@ class ReindexExecutor:
     async def _read_directory_abstract(self, uri: str, *, ctx: RequestContext) -> str:
         try:
             value = await get_viking_fs().abstract(uri, ctx=ctx)
-        except Exception:
+        except NotFoundError:
+            # A missing directory/marker genuinely has no L0 content. Every
+            # other fault must surface: callers treat "" as "no abstract" and
+            # the marker path deletes the vector for it.
             return ""
         return "" if _is_not_ready_sentinel(value, _ABSTRACT_NOT_READY_SUFFIX) else value
 
     async def _read_directory_overview(self, uri: str, *, ctx: RequestContext) -> str:
         try:
             value = await get_viking_fs().overview(uri, ctx=ctx)
-        except Exception:
+        except NotFoundError:
             return ""
         return "" if _is_not_ready_sentinel(value, _OVERVIEW_NOT_READY_SUFFIX) else value
 
