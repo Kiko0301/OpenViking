@@ -44,7 +44,7 @@ from openviking.session.memory.utils import (
 )
 from openviking.storage.abstract_overview import parse_abstract_overview
 from openviking.system_assets import builtin_memory_templates_dir
-from openviking_cli.exceptions import ConflictError, NotFoundError
+from openviking_cli.exceptions import ConflictError, NotFoundError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -2590,3 +2590,115 @@ class TestConsecutivePatchesSameURI:
         assert "gamma" in parsed["content"]
         assert mock_viking_fs.read_file.await_count == 2 + int(read_timeout)
         assert mock_viking_fs.write_file.await_count == 2
+
+
+class TestApplyLinksFailureReporting:
+    """Link endpoint rewrites must be reported (edit or error), not dropped."""
+
+    def _make_updater(self, mock_viking_fs):
+        schema = MemoryTypeSchema(
+            memory_type="experiences",
+            description="experience memory",
+            directory="viking://user/{{ user_space }}/memories/experiences",
+            filename_template="{{ experience_name }}.md",
+            fields=[],
+            overview_template="overview",
+        )
+        registry = MagicMock()
+        registry.get.return_value = schema
+
+        updater = MemoryUpdater(registry=registry)
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        return updater
+
+    def _make_operations(self, written_uri, endpoint_uri):
+        return ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    memory_fields={"experience_name": "new"},
+                    memory_type="experiences",
+                    uris=[written_uri],
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+            resolved_links=[StoredLink(from_uri=endpoint_uri, to_uri=written_uri)],
+        )
+
+    async def _apply(self, updater, resolved):
+        ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+        async def mock_apply_upsert(resolved_op, ctx, extract_context=None, **kwargs):
+            return None
+
+        updater._apply_upsert = AsyncMock(side_effect=mock_apply_upsert)
+        updater._apply_delete = AsyncMock()
+        return await updater.apply_operations(operations=resolved, ctx=ctx)
+
+    @pytest.mark.asyncio
+    async def test_link_write_failure_is_reported_as_error(self):
+        written_uri = "viking://user/user_sample_3/memories/experiences/new.md"
+        endpoint_uri = "viking://user/user_sample_3/memories/experiences/old.md"
+
+        mock_viking_fs = MagicMock()
+
+        async def mock_read_file(uri, **kwargs):
+            return MemoryFileUtils.write(MemoryFile(uri=uri, content="endpoint content"))
+
+        mock_viking_fs.read_file = AsyncMock(side_effect=mock_read_file)
+        mock_viking_fs.write_file = AsyncMock(
+            side_effect=PermissionDeniedError("storage hiccup")
+        )
+
+        updater = self._make_updater(mock_viking_fs)
+        result = await self._apply(updater, self._make_operations(written_uri, endpoint_uri))
+
+        # The endpoint rewrite failed transiently: it must surface as an
+        # error (strict mode then fails the update) instead of being dropped.
+        assert result.errors and result.errors[0][0] == endpoint_uri
+        assert isinstance(result.errors[0][1], PermissionDeniedError)
+        assert endpoint_uri not in result.edited_uris
+
+    @pytest.mark.asyncio
+    async def test_link_write_success_is_reported_as_edit(self):
+        written_uri = "viking://user/user_sample_3/memories/experiences/new.md"
+        endpoint_uri = "viking://user/user_sample_3/memories/experiences/old.md"
+
+        mock_viking_fs = MagicMock()
+
+        async def mock_read_file(uri, **kwargs):
+            return MemoryFileUtils.write(MemoryFile(uri=uri, content="endpoint content"))
+
+        mock_viking_fs.read_file = AsyncMock(side_effect=mock_read_file)
+        mock_viking_fs.write_file = AsyncMock()
+
+        updater = self._make_updater(mock_viking_fs)
+        result = await self._apply(updater, self._make_operations(written_uri, endpoint_uri))
+
+        # The endpoint file was rewritten for the link: report it as an
+        # edited URI, like the streaming updater already does.
+        assert endpoint_uri in result.edited_uris
+        assert result.errors == []
+
+    @pytest.mark.asyncio
+    async def test_link_write_missing_endpoint_is_not_an_error(self):
+        written_uri = "viking://user/user_sample_3/memories/experiences/new.md"
+        endpoint_uri = "viking://user/user_sample_3/memories/experiences/old.md"
+
+        mock_viking_fs = MagicMock()
+
+        async def mock_read_file(uri, **kwargs):
+            raise NotFoundError(uri, "memory")
+
+        mock_viking_fs.read_file = AsyncMock(side_effect=mock_read_file)
+        mock_viking_fs.write_file = AsyncMock()
+
+        updater = self._make_updater(mock_viking_fs)
+        result = await self._apply(updater, self._make_operations(written_uri, endpoint_uri))
+
+        # A genuinely missing endpoint file stays benign, matching the
+        # link-inheritance handling of deleted neighbors.
+        assert result.errors == []
+        assert endpoint_uri not in result.edited_uris

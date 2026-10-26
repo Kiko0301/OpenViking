@@ -13,7 +13,7 @@ import errno
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
@@ -112,6 +112,7 @@ async def write_stored_links(
     viking_fs: Any,
     skip_uris: Optional[set] = None,
     lease_ref: Any = None,
+    on_error: Optional[Callable[[str, Exception], None]] = None,
 ) -> List[str]:
     """Write StoredLinks to their endpoint files' links/backlinks fields.
 
@@ -120,7 +121,9 @@ async def write_stored_links(
     Files listed in skip_uris are skipped (caller handles them in the same write).
     Returns the endpoint URIs that were successfully rewritten.  Callers can
     use this to avoid reporting link-only edits for files that failed the
-    read/modify/write step.
+    read/modify/write step.  ``on_error`` (if given) is invoked with the URI
+    and exception whenever a rewrite fails with something other than a
+    missing endpoint file, so callers can surface the failure.
     """
     from openviking.session.memory.merge_op.link_merge import merge_links
 
@@ -158,8 +161,14 @@ async def write_stored_links(
                 lease_ref=lease_ref,
             )
             updated_uris.append(uri)
+        except (NotFoundError, FileNotFoundError) as e:
+            # Benign: the endpoint file is gone (it may have been deleted in
+            # the same batch), so there is nothing to merge links into.
+            logger.warning(f"Skipping link update; endpoint file missing {uri}: {e}")
         except Exception as e:
             tracer.error(f"Failed to apply links to {uri}: {e}")
+            if on_error is not None:
+                on_error(uri, e)
     return updated_uris
 
 
@@ -1630,13 +1639,16 @@ class MemoryUpdater:
             if context_type_for_uri(uri) != "memory"
         }
         skip = upserted_uris | (deleted_uris or set()) | non_memory_endpoints
-        await write_stored_links(
+        updated_uris = await write_stored_links(
             resolved_links,
             ctx,
             viking_fs,
             skip_uris=skip,
             lease_ref=lease_ref,
+            on_error=lambda uri, error: result.add_error(uri, error),
         )
+        for uri in updated_uris:
+            result.add_edited(uri)
 
     async def _inherit_deleted_link_relations(
         self,

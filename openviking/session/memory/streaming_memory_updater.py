@@ -269,6 +269,7 @@ class StreamingMemoryUpdater:
                         request.ctx,
                         viking_fs,
                         lease_ref=lease,
+                        on_error=lambda uri, error: result.apply_result.add_error(uri, error),
                     )
                     for uri in dict.fromkeys(updated_uris):
                         result.apply_result.add_edited(uri)
