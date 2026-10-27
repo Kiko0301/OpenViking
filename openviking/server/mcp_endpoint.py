@@ -1451,8 +1451,16 @@ async def edit(
         current = await service.fs.read_visible(uri, ctx=ctx)
     except (InvalidArgumentError, PermissionDeniedError, UnauthenticatedError):
         raise
-    except Exception as exc:
+    except AGFSNotFoundError as exc:
         raise NotFoundError(uri, "file") from exc
+    except AGFSClientError as exc:
+        # Transient backend faults must reach the caller as what they are:
+        # mapping them to NotFoundError tells the agent an existing file is
+        # gone. Classify like the download tool does.
+        mapped = map_exception(exc, resource=uri, resource_type="file")
+        if mapped is not None:
+            raise mapped from exc
+        raise
     occurrences = current.count(old_string)
     if occurrences == 0:
         hint = ""
