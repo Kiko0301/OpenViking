@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from openviking.pyagfs import AsyncAGFSClient
+from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.vector_migration import (
     VectorMigrationResult,
@@ -394,8 +395,10 @@ class LegacyDataMigration:
     async def _read_json_file(self, path: str) -> Any:
         try:
             raw = await self._agfs.read(path)
-        except Exception:
-            return None
+        except Exception as exc:
+            if is_not_found_error(exc):
+                return None
+            raise
         if isinstance(raw, bytes):
             text = raw.decode("utf-8")
         elif hasattr(raw, "content"):
@@ -419,8 +422,10 @@ class LegacyDataMigration:
     async def _ls(self, path: str) -> list[dict[str, Any]]:
         try:
             entries = await self._agfs.ls(path)
-        except Exception:
-            return []
+        except Exception as exc:
+            if is_not_found_error(exc):
+                return []
+            raise
         normalized = []
         for entry in entries:
             name = entry.get("name", "")
@@ -437,8 +442,10 @@ class LegacyDataMigration:
     async def _stat(self, path: str) -> dict[str, Any] | None:
         try:
             stat = await self._agfs.stat(path)
-        except Exception:
-            return None
+        except Exception as exc:
+            if is_not_found_error(exc):
+                return None
+            raise
         return {"is_dir": bool(stat.get("isDir", stat.get("is_dir", False)))}
 
     async def _exists(self, path: str) -> bool:
