@@ -103,6 +103,38 @@ test("queue-only turns keep their order when the clock has the same millisecond"
   });
 });
 
+test("queue-only capture keeps distinct Pi entries with identical content", async () => {
+  await withPendingDir(async () => {
+    const sync = new SyncManager(client(), config({ takeoverEnabled: false }));
+    await sync.ensureSession("pi-same-content");
+    const first = { id: "u-1", type: "message", message: { role: "user", content: "continue" } };
+    const second = { id: "u-2", type: "message", message: { role: "user", content: "continue" } };
+
+    assert.equal((await sync.syncBranch([first, second], { queueOnly: true })).queued, 2);
+    assert.equal((await listPending()).length, 2);
+
+    sync.restoreWatermark(0, []);
+    assert.equal((await sync.syncBranch([first, second], { queueOnly: true })).queued, 2);
+    assert.equal((await listPending()).length, 2, "retrying the same Pi entries must deduplicate");
+  });
+});
+
+test("retryable HTTP failure queues distinct Pi entries with identical content", async () => {
+  await withPendingDir(async () => {
+    const c = client({ fetchJSON: async () => ({ ok: false, status: 503, error: { message: "offline" } }) });
+    const sync = new SyncManager(c, config());
+    await sync.ensureSession("pi-identical-offline");
+    const branch = ["u-1", "u-2"].map((id) => ({
+      id, type: "message", message: { role: "user", content: "continue" },
+    }));
+
+    const result = await sync.syncBranch(branch);
+    assert.equal(result.queued, 2);
+    assert.equal(result.permanentFailures, 0);
+    assert.equal((await listPending()).length, 2);
+  });
+});
+
 async function readLastRecord(path) {
   const lines = (await readFile(path, "utf8")).trim().split("\n");
   return JSON.parse(lines[lines.length - 1]);

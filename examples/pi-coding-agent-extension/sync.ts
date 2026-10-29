@@ -1,4 +1,5 @@
 import type { OVClient } from "./client.js";
+import { randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -89,10 +90,11 @@ export class SyncManager {
 
   async replayPending(): Promise<void> {
     if (!this.client.connected) return;
-    if (this.config.takeoverEnabled) {
+    if (this.ovSessionId) {
       // The generic replay path intentionally drops 4xx and exhausted entries
-      // without reporting which session lost them. Takeover needs that fact to
-      // block trimming, so its current session always uses the tracked drainer.
+      // without reporting which session lost them. Track this session's losses
+      // in every mode so neither takeover nor an ordinary commit can hide an
+      // incomplete archive.
       await this.drainSessionBacklog();
       // Other sessions' backlog still goes through the generic replay, but only
       // once none of this session's entries are left for it to drop untracked;
@@ -207,7 +209,7 @@ export class SyncManager {
 
   private fetchJSON = (path: string, init?: any) => this.client.fetchJSON(path, init);
 
-  async syncBranch(branch: any[], opts: { queueOnly?: boolean } = {}): Promise<SyncBranchResult> {
+  async syncBranch(branch: any[], opts: { queueOnly?: boolean; autoCommit?: boolean } = {}): Promise<SyncBranchResult> {
     if (!this.ovSessionId) {
       return { added: 0, tokens: 0, allDelivered: true, queued: 0, permanentFailures: 0 };
     }
@@ -223,8 +225,8 @@ export class SyncManager {
       this.syncedEntryId = "";
     }
     const sent = opts.queueOnly
-      ? await this.queuePayloads(extracted.payloads)
-      : await this.sendPayloads(extracted.payloads);
+      ? await this.queuePayloads(extracted.payloads, extracted.payloadEntryIds)
+      : await this.sendPayloads(extracted.payloads, extracted.payloadEntryIds);
     const added = sent.accepted;
     let tokens = 0;
     for (const payload of extracted.payloads.slice(0, added)) {
@@ -235,7 +237,7 @@ export class SyncManager {
       this.syncedEntryCount = extracted.nextEntryCount;
       this.syncedEntryId = extracted.nextEntryId;
     }
-    if (added > 0 && !this.config.takeoverEnabled && !opts.queueOnly) {
+    if (added > 0 && !this.config.takeoverEnabled && !opts.queueOnly && opts.autoCommit !== false && this.droppedForever === 0) {
       await this.commitIfNeeded();
     }
     return {
@@ -252,8 +254,16 @@ export class SyncManager {
     return { accepted: sent.accepted === 1, delivered: sent.delivered === 1 };
   }
 
+  private sourceDedupSalts(entryIds: (string | null)[]): string[] {
+    return entryIds.map((entryId) => entryId
+      ? `pi-entry:${entryId}`
+      // A host without stable entry IDs must still preserve repeated turns.
+      // It cannot deduplicate retries of an unidentified entry safely.
+      : `pi-unidentified:${randomUUID()}`);
+  }
+
   /** Persist a completed turn without sending it ahead of startup replay. */
-  private async queuePayloads(payloads: any[]): Promise<{
+  private async queuePayloads(payloads: any[], entryIds: (string | null)[]): Promise<{
     accepted: number;
     delivered: number;
     queued: number;
@@ -263,11 +273,13 @@ export class SyncManager {
       return { accepted: 0, delivered: 0, queued: 0, permanentFailures: 0 };
     }
     const createdAt = Math.max(Date.now(), this.lastQueuedAt + 1);
+    const dedupSalts = this.sourceDedupSalts(entryIds);
     let queued = 0;
-    for (const payload of payloads) {
+    for (const [index, payload] of payloads.entries()) {
       const entryTime = createdAt + queued;
       const result = await enqueue("addMessage", this.ovSessionId, payload, {
         createdAt: entryTime,
+        dedupSalt: dedupSalts[index],
       });
       if (!result.ok) break;
       this.lastQueuedAt = entryTime;
@@ -296,7 +308,7 @@ export class SyncManager {
    * Returns how many payloads were accepted (sent or queued, always a prefix)
    * and how many of those were delivered to the server.
    */
-  private async sendPayloads(payloads: any[]): Promise<{
+  private async sendPayloads(payloads: any[], entryIds?: (string | null)[]): Promise<{
     accepted: number;
     delivered: number;
     queued: number;
@@ -307,6 +319,7 @@ export class SyncManager {
     }
     const res = await sendSessionMessages(this.fetchJSON, this.ovSessionId, payloads, {
       enqueueOnRetryable: true,
+      ...(entryIds ? { dedupSalts: this.sourceDedupSalts(entryIds) } : {}),
     });
     if (res.failed > 0 || res.enqueueFailed > 0) {
       this.logger.log("send", {

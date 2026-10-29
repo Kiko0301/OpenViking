@@ -53,7 +53,7 @@ const MANAGED_ENV = [
 async function startServer() {
   const initializes = [];
   const requests = [];
-  const gate = { health: null, replay: null, messagesStatus: 200 };
+  const gate = { health: null, replay: null, messagesStatus: 200, pendingTokens: 0 };
   const server = createServer((req, res) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
@@ -80,6 +80,11 @@ async function startServer() {
           res.end(JSON.stringify({ detail: "replay unavailable" }));
           return;
         }
+      }
+      if (req.method === "GET" && /^\/api\/v1\/sessions\/[^/]+$/.test(path)) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", result: { pending_tokens: gate.pendingTokens } }));
+        return;
       }
       // Everything the REST half touches during startup: /health, the profile
       // fetch, recall. An empty result keeps each of them a no-op.
@@ -388,6 +393,109 @@ test("shutdown during replay leaves ordinary capture queued without a premature 
   }, { mcpEnabled: false, takeoverEnabled: false });
 });
 
+test("ordinary shutdown during replay persists a conservative gap across restart", async (t) => {
+  await withExtension(t, async ({ handlers, commands, entries, server, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "older pending before shutdown",
+    });
+    let releaseReplay;
+    server.gate.replay = new Promise((resolve) => { releaseReplay = resolve; });
+    try {
+      await handlers.get("before_agent_start")(
+        { prompt: "shutdown with replay in flight", systemPrompt: "BASE" }, makeCtx(),
+      );
+      await shutdown();
+      assert.ok(entries.some(({ data }) => data?.captureGap === true));
+      assert.equal(server.requests.filter((request) => /\/commit$/.test(request)).length, 0);
+    } finally {
+      releaseReplay();
+    }
+    for (let i = 0; i < 100 && (await listPending()).length > 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal((await listPending()).length, 0, "old replay can complete after shutdown");
+
+    // A later process can still deliver queued and newly captured messages,
+    // but cannot claim a complete archive for this session after an
+    // unobserved shutdown/replay race.
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "pending for next process",
+    });
+    const { default: extension } = await import(pathToFileURL(join(EXTENSION_DIR, "index.ts")).href);
+    const second = fakePi();
+    await extension(second.pi);
+    const notified = [];
+    const statuses = [];
+    const secondCtx = fakeCtx(notified, statuses);
+    const newTurn = { id: "post-shutdown-turn", type: "message", message: { role: "user", content: "capture after restart" } };
+    secondCtx.sessionManager.getBranch = () => [
+      ...entries.filter(({ data }) => data?.captureGap === true).map(({ type, data }, index) => ({
+        id: `gap-${index}`, type: "custom", customType: type, data,
+      })),
+      newTurn,
+    ];
+    server.gate.pendingTokens = 2000;
+    await second.handlers.get("before_agent_start")(
+      { prompt: "resume same session", systemPrompt: "BASE" }, secondCtx,
+    );
+    let replayStatus = "";
+    for (let i = 0; i < 100; i++) {
+      await second.commands.get("viking").handler("", secondCtx);
+      replayStatus = notified.at(-1)?.[0] || "";
+      if (!/replay: pending/.test(replayStatus)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.doesNotMatch(replayStatus, /replay:/);
+    assert.equal((await listPending()).length, 0, "the next process still replays pending messages");
+    const capturesBeforeTurn = server.requests.filter((request) => /\/messages\/batch$/.test(request)).length;
+    await second.handlers.get("turn_end")({ type: "turn_end" }, secondCtx);
+    assert.equal(server.requests.filter((request) => /\/messages\/batch$/.test(request)).length, capturesBeforeTurn + 1);
+    await second.commands.get("viking").handler("commit", secondCtx);
+    assert.ok(notified.some(([message]) => /cannot commit — capture incomplete/.test(message)));
+    await second.handlers.get("session_shutdown")({}, secondCtx);
+    assert.equal(server.requests.filter((request) => /\/commit$/.test(request)).length, 0);
+  }, { mcpEnabled: false, takeoverEnabled: false, commitTokenThreshold: 1000 });
+});
+
+test("a replay rejected after ordinary shutdown cannot be committed after restart", async (t) => {
+  await withExtension(t, async ({ handlers, entries, server, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "reject only after shutdown",
+    });
+    let releaseReplay;
+    server.gate.replay = new Promise((resolve) => { releaseReplay = resolve; });
+    try {
+      await handlers.get("before_agent_start")(
+        { prompt: "replay still in flight", systemPrompt: "BASE" }, makeCtx(),
+      );
+      await shutdown();
+      server.gate.messagesStatus = 400;
+    } finally {
+      releaseReplay();
+    }
+    for (let i = 0; i < 100 && (await listPending()).length > 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal((await listPending()).length, 0, "the rejected queue file is gone");
+
+    const { default: extension } = await import(pathToFileURL(join(EXTENSION_DIR, "index.ts")).href);
+    const second = fakePi();
+    await extension(second.pi);
+    const notified = [];
+    const secondCtx = fakeCtx(notified);
+    secondCtx.sessionManager.getBranch = () => entries.map(({ type, data }, index) => ({
+      id: `gap-${index}`, type: "custom", customType: type, data,
+    }));
+    await second.handlers.get("before_agent_start")(
+      { prompt: "restart after rejection", systemPrompt: "BASE" }, secondCtx,
+    );
+    await second.commands.get("viking").handler("commit", secondCtx);
+    assert.ok(notified.some(([message]) => /cannot commit — capture incomplete/.test(message)));
+    await second.handlers.get("session_shutdown")({}, secondCtx);
+    assert.equal(server.requests.filter((request) => /\/commit$/.test(request)).length, 0);
+  }, { mcpEnabled: false, takeoverEnabled: false });
+});
+
 test("ordinary capture and shutdown commit resume after replay settles", async (t) => {
   await withExtension(t, async ({ handlers, commands, notified, server, makeCtx, shutdown }) => {
     await enqueue("addMessage", "pi-pi-session-handshake", {
@@ -509,6 +617,131 @@ test("queue failure during replay persists a takeover capture gap", async (t) =>
       releaseReplay();
     }
   }, { mcpEnabled: false, takeoverEnabled: true });
+});
+
+test("queue failure during replay blocks an incomplete ordinary commit", async (t) => {
+  await withExtension(t, async ({ handlers, commands, notified, statuses, server, configPath, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "old pending message",
+    });
+    let releaseReplay;
+    server.gate.replay = new Promise((resolve) => { releaseReplay = resolve; });
+    try {
+      await handlers.get("before_agent_start")(
+        { prompt: "ordinary capture gap", systemPrompt: "BASE" }, makeCtx(),
+      );
+      const blockedParent = join(dirname(configPath), "not-a-directory");
+      await writeFile(blockedParent, "");
+      const priorPendingDir = process.env.OPENVIKING_PENDING_DIR;
+      process.env.OPENVIKING_PENDING_DIR = join(blockedParent, "pending");
+      try {
+        const captureCtx = makeCtx();
+        captureCtx.sessionManager.getBranch = () => [
+          { id: "lost-ordinary-turn", type: "message", message: { role: "user", content: "This ordinary message cannot be queued." } },
+        ];
+        await handlers.get("turn_end")({ type: "turn_end" }, captureCtx);
+      } finally {
+        process.env.OPENVIKING_PENDING_DIR = priorPendingDir;
+      }
+    } finally {
+      releaseReplay();
+    }
+    const ctx = makeCtx();
+    let status = "";
+    for (let i = 0; i < 100; i++) {
+      await commands.get("viking").handler("", ctx);
+      status = notified.at(-1)?.[0] || "";
+      if (!/replay: pending/.test(status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(status, /capture: incomplete/);
+    await handlers.get("before_agent_start")(
+      { prompt: "ordinary capture gap status", systemPrompt: "BASE" }, ctx,
+    );
+    assert.match(statuses.at(-1)[1], /capture ✗/);
+    await commands.get("viking").handler("commit", ctx);
+    assert.ok(notified.some(([message]) => /cannot commit — capture incomplete/.test(message)));
+    await shutdown();
+    assert.equal(server.requests.filter((request) => /\/commit$/.test(request)).length, 0);
+  }, { mcpEnabled: false, takeoverEnabled: false });
+});
+
+test("ordinary capture gap survives extension restart and blocks all commits", async (t) => {
+  await withExtension(t, async ({ handlers, entries, server, configPath, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "older pending message",
+    });
+    let releaseReplay;
+    server.gate.replay = new Promise((resolve) => { releaseReplay = resolve; });
+    const firstTurn = { id: "lost-turn", type: "message", message: { role: "user", content: "This turn cannot be queued." } };
+    try {
+      await handlers.get("before_agent_start")(
+        { prompt: "first process", systemPrompt: "BASE" }, makeCtx(),
+      );
+      const blockedParent = join(dirname(configPath), "blocked-pending-parent");
+      await writeFile(blockedParent, "");
+      const priorPendingDir = process.env.OPENVIKING_PENDING_DIR;
+      process.env.OPENVIKING_PENDING_DIR = join(blockedParent, "pending");
+      try {
+        const firstCtx = makeCtx();
+        firstCtx.sessionManager.getBranch = () => [firstTurn];
+        await handlers.get("turn_end")({ type: "turn_end" }, firstCtx);
+      } finally {
+        process.env.OPENVIKING_PENDING_DIR = priorPendingDir;
+      }
+      await shutdown();
+    } finally {
+      releaseReplay();
+    }
+    const persisted = entries.filter(({ data }) => data?.captureGap === true);
+    assert.ok(persisted.length > 0, "a lost ordinary turn must persist a capture gap");
+
+    const { default: extension } = await import(pathToFileURL(join(EXTENSION_DIR, "index.ts")).href);
+    const second = fakePi();
+    await extension(second.pi);
+    const notified = [];
+    const statuses = [];
+    const secondCtx = fakeCtx(notified, statuses);
+    secondCtx.sessionManager.getBranch = () => [
+      firstTurn,
+      ...persisted.map(({ type, data }, index) => ({
+        id: `gap-${index}`, type: "custom", customType: type, data,
+      })),
+    ];
+    await second.handlers.get("before_agent_start")(
+      { prompt: "same session, second process", systemPrompt: "BASE" }, secondCtx,
+    );
+    assert.match(statuses.at(-1)[1], /capture ✗/);
+    await second.commands.get("viking").handler("commit", secondCtx);
+    assert.ok(notified.some(([message]) => /cannot commit — capture incomplete/.test(message)));
+    await second.handlers.get("session_shutdown")({}, secondCtx);
+    assert.equal(server.requests.filter((request) => /\/commit$/.test(request)).length, 0);
+  }, { mcpEnabled: false, takeoverEnabled: false });
+});
+
+test("ordinary replay drop blocks commit of an incomplete prior session", async (t) => {
+  await withExtension(t, async ({ handlers, commands, notified, server, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "old message rejected permanently",
+    });
+    server.gate.messagesStatus = 400;
+    const ctx = makeCtx();
+    await handlers.get("before_agent_start")(
+      { prompt: "ordinary replay drop", systemPrompt: "BASE" }, ctx,
+    );
+    let status = "";
+    for (let i = 0; i < 100; i++) {
+      await commands.get("viking").handler("", ctx);
+      status = notified.at(-1)?.[0] || "";
+      if (!/replay: pending/.test(status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(status, /capture: incomplete/);
+    await commands.get("viking").handler("commit", ctx);
+    assert.ok(notified.some(([message]) => /cannot commit — capture incomplete/.test(message)));
+    await shutdown();
+    assert.equal(server.requests.filter((request) => /\/commit$/.test(request)).length, 0);
+  }, { mcpEnabled: false, takeoverEnabled: false });
 });
 
 test("an empty startup branch is not a capability failure, but an empty completed turn is", async (t) => {

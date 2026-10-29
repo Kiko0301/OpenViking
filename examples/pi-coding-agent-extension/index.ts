@@ -102,12 +102,13 @@ export default async function (pi: ExtensionAPI) {
 
   const replayStatus = (): "pending" | "failed" | null =>
     replayError ? "failed" : replayPending ? "pending" : null;
+  const captureUnavailable = (): boolean => branchUnavailable || sync.droppedCount > 0 || takeover.state.captureGap;
 
   // Finalize only inside a live event handler: recordCaptureGap persists a pi
   // session entry, which must never use an operation scope that already ended.
   const finishReplay = (): void => {
     if (!replaySettled) return;
-    if (config.takeoverEnabled && replayNeedsCaptureGap) {
+    if (replayNeedsCaptureGap && (config.takeoverEnabled || sync.droppedCount > 0)) {
       try {
         takeover.recordCaptureGap();
         replayNeedsCaptureGap = false;
@@ -145,6 +146,10 @@ export default async function (pi: ExtensionAPI) {
         replayError = error instanceof Error ? error.message : String(error);
         logger.logError("replay_pending", error);
       } finally {
+        if (!config.takeoverEnabled && sync.droppedCount > 0 && !replayError) {
+          replayError = `${sync.droppedCount} session message(s) permanently lost during replay`;
+          logger.log("capture_gap", { dropped: sync.droppedCount, source: "replay" });
+        }
         replayNeedsCaptureGap = sync.droppedCount > 0 || Boolean(replayError);
         replaySettled = true;
       }
@@ -251,12 +256,12 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // Restore takeover state — sync watermark, pending archive and capture
-      // gap — before replaying any queued messages, so recovery and replay
-      // cannot disagree about what has been delivered (plan §4).
+      // Capture gaps persist in Pi's session history in both modes. Only
+      // takeover restores its sync watermark; ordinary capture still scans
+      // the branch from zero after a restart.
       const branch = readBranch(ctx) ?? [];
+      takeover.restore(branch);
       if (config.takeoverEnabled) {
-        takeover.restore(branch);
         sync.restoreWatermark(takeover.state.syncedEntryCount, branch);
       }
 
@@ -274,7 +279,7 @@ export default async function (pi: ExtensionAPI) {
       // for pi -c continuations, which never fire session_start).
       if (handshake) adoptBridgeTools(ctx, await handshake);
       if (closed) return;
-      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable, replayStatus());
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, captureUnavailable(), replayStatus());
 
       started = true;
       if (config.logLevel === "info") {
@@ -328,15 +333,15 @@ export default async function (pi: ExtensionAPI) {
     // a success it hands back the state it already has.
     if (bridge && wasStarted && connected && !bypassed && !closed && !toolsRegistered) {
       adoptBridgeTools(ctx, await bridge.connect(DEFAULT_HANDSHAKE_BUDGET_MS));
-      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable, replayStatus());
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, captureUnavailable(), replayStatus());
     }
 
     if (!connected || bypassed || closed) return;
-    updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable, replayStatus());
+    updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, captureUnavailable(), replayStatus());
 
     // A summary that finished since the last turn — or in the last `pi -p`
     // process — trims this prompt's request already.
-    if (config.takeoverEnabled && !branchUnavailable && !replayPending) {
+    if (config.takeoverEnabled && !captureUnavailable() && !replayPending) {
       await takeover.resumePending(() => readBranch(ctx) ?? [], { deadline });
     }
 
@@ -408,7 +413,7 @@ export default async function (pi: ExtensionAPI) {
 
     // Takeover's boundary is a branch entry id; it maps it onto these messages
     // through pi's context projection of the branch.
-    const afterTakeover = config.takeoverEnabled && !branchUnavailable && !replayPending
+    const afterTakeover = config.takeoverEnabled && !captureUnavailable() && !replayPending
       ? takeover.transformContext(
           event.messages as any,
           readBranch(ctx) ?? [],
@@ -455,27 +460,30 @@ export default async function (pi: ExtensionAPI) {
       queuedCaptureChain = queued.then(() => undefined, () => undefined);
       try {
         const result = await queued;
-        if (result.permanentFailures > 0) takeover.recordCaptureGap();
+        if (result.permanentFailures > 0) {
+          takeover.recordCaptureGap();
+          if (!config.takeoverEnabled) replayError = `${sync.droppedCount} session message(s) could not be queued`;
+        }
         takeover.recordQueuedTokens(result.tokens);
-        updateStatus(ctx, connected, result.added, sync.sessionId, config, takeover.state, toolsReady, false, replayStatus());
+        updateStatus(ctx, connected, result.added, sync.sessionId, config, takeover.state, toolsReady, captureUnavailable(), replayStatus());
       } catch (error) {
         replayError = error instanceof Error ? error.message : String(error);
         logger.logError("queue_capture", error);
         takeover.recordCaptureGap();
-        updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, false, replayStatus());
+        updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, captureUnavailable(), replayStatus());
       }
       return;
     }
 
     // The host's 30s cap covers this whole handler, sync included.
     const deadline = Date.now() + HANDLER_BUDGET_MS;
-    const result = await sync.syncBranch(branch);
+    const result = await sync.syncBranch(branch, { autoCommit: !takeover.state.captureGap });
     logger.log("turn_end", { added: result.added, tokens: result.tokens });
     if (result.permanentFailures > 0) takeover.recordCaptureGap();
     // The branch is what the boundary is frozen against and re-confirmed on, so
     // takeover needs it, not just the token delta.
     await takeover.onTurnSynced(result.tokens, () => readBranch(ctx) ?? [], { deadline });
-    updateStatus(ctx, connected, result.added, sync.sessionId, config, takeover.state, toolsReady, false, replayStatus());
+    updateStatus(ctx, connected, result.added, sync.sessionId, config, takeover.state, toolsReady, captureUnavailable(), replayStatus());
   });
 
   // --- session_before_compact ---
@@ -486,9 +494,9 @@ export default async function (pi: ExtensionAPI) {
     const branch = readBranch(ctx);
     if (branch?.length && branchUnavailable) {
       branchUnavailable = false;
-      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, false, replayStatus());
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, captureUnavailable(), replayStatus());
     }
-    if (replayPending) return;
+    if (replayPending || sync.droppedCount > 0 || takeover.state.captureGap) return;
 
     if (config.takeoverEnabled) {
       if (!branch?.length) {
@@ -538,13 +546,14 @@ export default async function (pi: ExtensionAPI) {
 
     await queuedCaptureChain;
     finishReplay();
-    // The queued turn is durable, but an unfinished or failed replay cannot
-    // justify an archive. Preserve pi history and retry on the next session.
-    if (replayPending && config.takeoverEnabled) takeover.recordCaptureGap();
+    // An unfinished replay can still drop an old write after this live handler
+    // ends. Persist a conservative gap now, in both modes, so a later process
+    // cannot commit an archive whose delivery was never confirmed.
+    if (replayPending) takeover.recordCaptureGap();
     await sync.shutdown();
     if (config.takeoverEnabled) {
       await takeover.shutdown();
-    } else if (isCaptureEnabled(config) && !replayPending) {
+    } else if (isCaptureEnabled(config) && !replayPending && sync.droppedCount === 0 && !takeover.state.captureGap) {
       await sync.commit();
     }
   });
@@ -568,6 +577,10 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (args?.trim() === "commit") {
+        if (sync.droppedCount > 0 || takeover.state.captureGap) {
+          ctx.ui.notify(`OpenViking: cannot commit — capture incomplete${sync.droppedCount > 0 ? ` (${sync.droppedCount} message(s) lost)` : " (a prior message was lost)"}`, "warning");
+          return;
+        }
         if (replayPending) {
           ctx.ui.notify(`OpenViking: cannot commit — pending replay ${replayError ? `failed: ${replayError}` : "still running"}`, "warning");
           return;
@@ -620,9 +633,11 @@ export default async function (pi: ExtensionAPI) {
       const takeoverInfo = config.takeoverEnabled
         ? ` | takeover: ${t.coveredUserTurns}/${t.lastSeenUserTurns} turns archived, ~${t.pendingTokens} tokens pending`
         : "";
-      const captureInfo = branchUnavailable && isCaptureEnabled(config)
-        ? " | capture: unavailable (host session history empty)"
-        : "";
+      const captureInfo = sync.droppedCount > 0 || t.captureGap
+        ? ` | capture: incomplete${sync.droppedCount > 0 ? ` (${sync.droppedCount} message(s) lost)` : " (a prior message was lost)"}`
+        : branchUnavailable && isCaptureEnabled(config)
+          ? " | capture: unavailable (host session history empty)"
+          : "";
       const replayInfo = replayPending
         ? ` | replay: ${replayError ? `failed — ${replayError}` : "pending"}`
         : "";
