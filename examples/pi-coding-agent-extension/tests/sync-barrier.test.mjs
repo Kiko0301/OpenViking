@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rename, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SyncManager, describeCommitError } from "../sync.ts";
@@ -365,7 +365,10 @@ test("non-retryable batch failure drops the payloads but still advances the sync
 
 test("retry queue write failure records a permanent capture gap", async () => {
   const previous = process.env.OPENVIKING_PENDING_DIR;
-  process.env.OPENVIKING_PENDING_DIR = "/dev/null/unwritable";
+  const dir = await mkdtemp(join(tmpdir(), "ov-pi-unwritable-queue-"));
+  const file = join(dir, "not-a-directory");
+  await writeFile(file, "");
+  process.env.OPENVIKING_PENDING_DIR = join(file, "unwritable");
   try {
     const { c } = batchClient({ respond: () => ({ ok: false, status: 500, error: { message: "offline" } }) });
     const sync = new SyncManager(c, config());
@@ -380,6 +383,7 @@ test("retry queue write failure records a permanent capture gap", async () => {
   } finally {
     if (previous === undefined) delete process.env.OPENVIKING_PENDING_DIR;
     else process.env.OPENVIKING_PENDING_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

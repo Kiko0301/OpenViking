@@ -91,6 +91,21 @@ export default async function (pi: ExtensionAPI) {
   let compacted = false;
   let started = false;
   let startPromise: Promise<void> | null = null;
+  // An empty branch at startup is normal. Only a completed turn with no branch
+  // entries demonstrates that the host cannot provide capture history.
+  let branchUnavailable = false;
+
+  const readBranch = (ctx: any): any[] | null => {
+    const manager = ctx?.sessionManager;
+    if (typeof manager?.getBranch !== "function") return null;
+    try {
+      const branch = manager.getBranch();
+      return Array.isArray(branch) ? branch : null;
+    } catch (error) {
+      logger.logError("getBranch", error);
+      return null;
+    }
+  };
 
   /**
    * Take a finished handshake: register what the server listed, or report the
@@ -183,9 +198,7 @@ export default async function (pi: ExtensionAPI) {
       // Restore takeover state — sync watermark, pending archive and capture
       // gap — before replaying any queued messages, so recovery and replay
       // cannot disagree about what has been delivered (plan §4).
-      const branch = typeof ctx.sessionManager.getBranch === "function"
-        ? ctx.sessionManager.getBranch()
-        : [];
+      const branch = readBranch(ctx) ?? [];
       if (config.takeoverEnabled) {
         takeover.restore(branch);
         sync.restoreWatermark(takeover.state.syncedEntryCount, branch);
@@ -208,7 +221,7 @@ export default async function (pi: ExtensionAPI) {
       // for pi -c continuations, which never fire session_start).
       if (handshake) adoptBridgeTools(ctx, await handshake);
       if (closed) return;
-      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady);
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable);
 
       started = true;
       if (config.logLevel === "info") {
@@ -223,6 +236,10 @@ export default async function (pi: ExtensionAPI) {
 
   // --- session_start ---
   pi.on("session_start", async (event, ctx) => {
+    // Some hosts expose an operation signal and abort it as soon as the handler
+    // returns. Their ctx methods are then invalid, so start in the awaited
+    // before_agent_start handler instead of continuing with this retired ctx.
+    if (ctx?.signal) return;
     // Fire-and-forget: the OV chain (health check, session ensure, profile
     // build) costs ~2s against the remote server; blocking session_start on it
     // delays every pi startup. start() is memoized via startPromise, so
@@ -257,15 +274,15 @@ export default async function (pi: ExtensionAPI) {
     // a success it hands back the state it already has.
     if (bridge && wasStarted && connected && !bypassed && !closed && !toolsRegistered) {
       adoptBridgeTools(ctx, await bridge.connect(DEFAULT_HANDSHAKE_BUDGET_MS));
-      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady);
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable);
     }
 
     if (!connected || bypassed || closed) return;
 
     // A summary that finished since the last turn — or in the last `pi -p`
     // process — trims this prompt's request already.
-    if (config.takeoverEnabled) {
-      await takeover.resumePending(() => ctx.sessionManager.getBranch(), { deadline });
+    if (config.takeoverEnabled && !branchUnavailable) {
+      await takeover.resumePending(() => readBranch(ctx) ?? [], { deadline });
     }
 
     // Queue recall for the context hook. Pi renders the user message before
@@ -335,10 +352,10 @@ export default async function (pi: ExtensionAPI) {
 
     // Takeover's boundary is a branch entry id; it maps it onto these messages
     // through pi's context projection of the branch.
-    const afterTakeover = config.takeoverEnabled
+    const afterTakeover = config.takeoverEnabled && !branchUnavailable
       ? takeover.transformContext(
           event.messages as any,
-          typeof sessionManager?.getBranch === "function" ? sessionManager.getBranch() : [],
+          readBranch(ctx) ?? [],
         )
       : event.messages;
     const messages = recall.injectRecall(
@@ -366,16 +383,23 @@ export default async function (pi: ExtensionAPI) {
   pi.on("turn_end", async (event, ctx) => {
     if (!connected || bypassed || !isCaptureEnabled(config)) return;
 
+    const branch = readBranch(ctx);
+    if (!branch?.length) {
+      branchUnavailable = true;
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, true);
+      return;
+    }
+    branchUnavailable = false;
+
     // The host's 30s cap covers this whole handler, sync included.
     const deadline = Date.now() + HANDLER_BUDGET_MS;
-    const branch = ctx.sessionManager.getBranch();
     const result = await sync.syncBranch(branch);
     logger.log("turn_end", { added: result.added, tokens: result.tokens });
     if (result.permanentFailures > 0) takeover.recordCaptureGap();
     // The branch is what the boundary is frozen against and re-confirmed on, so
     // takeover needs it, not just the token delta.
-    await takeover.onTurnSynced(result.tokens, () => ctx.sessionManager.getBranch(), { deadline });
-    updateStatus(ctx, connected, result.added, sync.sessionId, config, takeover.state, toolsReady);
+    await takeover.onTurnSynced(result.tokens, () => readBranch(ctx) ?? [], { deadline });
+    updateStatus(ctx, connected, result.added, sync.sessionId, config, takeover.state, toolsReady, false);
   });
 
   // --- session_before_compact ---
@@ -383,6 +407,13 @@ export default async function (pi: ExtensionAPI) {
     if (!connected || bypassed || !isCaptureEnabled(config)) return;
 
     if (config.takeoverEnabled) {
+      const branch = readBranch(ctx);
+      if (!branch?.length) {
+        branchUnavailable = true;
+        updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, true);
+        return;
+      }
+      branchUnavailable = false;
       const deadline = Date.now() + HANDLER_BUDGET_MS;
       const prep = (event as any)?.preparation ?? {};
       // Native compaction syncs the latest branch, archives all captured
@@ -391,7 +422,7 @@ export default async function (pi: ExtensionAPI) {
         firstKeptEntryId: prep.firstKeptEntryId,
         tokensBefore: prep.tokensBefore ?? 0,
         signal: (event as any)?.signal,
-      }, () => ctx.sessionManager.getBranch(), { deadline });
+      }, () => readBranch(ctx) ?? [], { deadline });
     }
 
     const archiveId = await sync.commit();
@@ -449,6 +480,10 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (args?.trim() === "commit") {
+        if (branchUnavailable && config.takeoverEnabled) {
+          ctx.ui.notify("OpenViking: cannot commit — host session history unavailable", "warning");
+          return;
+        }
         await sync.shutdown();
         const commitResult = config.takeoverEnabled ? null : await sync.commit();
         // Manual commit freezes and confirms the boundary against the current
@@ -456,7 +491,7 @@ export default async function (pi: ExtensionAPI) {
         // A `skipped` result archived nothing; it is not a successful commit.
         const skipped = commitResult?.status === "skipped";
         const ok = config.takeoverEnabled
-          ? await takeover.commitAndAdvance(() => ctx.sessionManager.getBranch())
+          ? await takeover.commitAndAdvance(() => readBranch(ctx) ?? [])
           : commitResult !== null && !skipped;
         if (!ok && config.takeoverEnabled && takeover.state.pendingArchive) {
           ctx.ui.notify(
@@ -493,9 +528,12 @@ export default async function (pi: ExtensionAPI) {
       const takeoverInfo = config.takeoverEnabled
         ? ` | takeover: ${t.coveredUserTurns}/${t.lastSeenUserTurns} turns archived, ~${t.pendingTokens} tokens pending`
         : "";
+      const captureInfo = branchUnavailable && isCaptureEnabled(config)
+        ? " | capture: unavailable (host session history empty)"
+        : "";
       ctx.ui.notify(
         `OpenViking: ${connected ? "connected" : "disconnected"} | session: ${sid.slice(0, 12)}...`
-          + `${takeoverInfo} | ${toolsStatusLine()}`,
+          + `${captureInfo}${takeoverInfo} | ${toolsStatusLine()}`,
         "info",
       );
     },
@@ -569,6 +607,7 @@ function updateStatus(
   config: OVConfig,
   takeoverState?: { pendingTokens?: number; coveredUserTurns?: number },
   toolsReady?: boolean,
+  branchUnavailable = false,
 ): void {
   const setter = ctx?.ui?.setStatus;
   if (typeof setter !== "function") return;
@@ -584,7 +623,10 @@ function updateStatus(
   const tools = connected && (config as any).mcpEnabled !== false && !toolsReady
     ? " · tools ✗"
     : "";
-  const status = `${connected ? "OV ✓" : "OV ✗"}${tools} · ↩${added}${pending} · ${sessionId ? sessionId.slice(0, 12) : "none"}`;
+  const capture = connected && branchUnavailable && isCaptureEnabled(config)
+    ? ` · capture ✗${config.takeoverEnabled ? " · takeover ✗" : ""}`
+    : "";
+  const status = `${connected ? "OV ✓" : "OV ✗"}${tools}${capture} · ↩${added}${pending} · ${sessionId ? sessionId.slice(0, 12) : "none"}`;
   try {
     setter("openviking", status);
   } catch {

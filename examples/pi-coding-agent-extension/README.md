@@ -274,12 +274,16 @@ Arguments are checked against the server's original schema before pi's own valid
 
 | Pi Event               | Extension Action                                                                 |
 |------------------------|----------------------------------------------------------------------------------|
-| `session_start`        | Health check → derive OV session → build profile context → restore takeover state |
-| `before_agent_start`   | Idempotent startup for `pi -c` + queue the current prompt for recall              |
+| `session_start`        | Prefetch startup on native pi; defer it on hosts with an operation-scoped `ctx.signal` |
+| `before_agent_start`   | Await startup (also for `pi -c`) + queue the current prompt for recall           |
 | `context`              | Run current-prompt recall after UI rendering, then inject takeover and recall context |
 | `turn_end`             | Extract branch entries → write or pending-queue OV messages → maybe advance boundary |
 | `session_before_compact`| Takeover mode returns OV overview as pi compaction summary; otherwise commits pending messages |
 | `session_shutdown`     | Persist takeover state or final non-takeover commit                              |
+
+Hosts that abort an event's `ctx.signal` when its handler returns are initialized inside the awaited `before_agent_start` handler. This keeps the first prompt's recall on a live context. On such hosts the first prompt may wait for the health check and profile fetch; native pi retains the `session_start` prefetch.
+
+Capture and takeover require a working `SessionManager.getBranch()`. An empty branch during startup is normal, so the extension checks after a completed turn. If the branch is still empty, the footer reports `capture ✗` (and `takeover ✗` when enabled), `/viking` reports the unavailable history, and takeover commits and compaction are skipped. Ordinary commits can still archive messages captured before the branch became unavailable. Recall remains available. A later nonempty branch clears the warning and resumes capture. Hosts such as PI-Desktop that expose a permanently empty branch can use recall but cannot supply the history needed for capture or takeover.
 
 ### Recall: Synchronous, Not Stale
 

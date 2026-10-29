@@ -93,17 +93,19 @@ async function startServer() {
 function fakePi() {
   const handlers = new Map();
   const tools = [];
+  const commands = new Map();
   return {
     pi: {
       on(event, handler) { handlers.set(event, handler); },
       registerTool(tool) { tools.push(tool?.name); },
-      registerCommand() {},
+      registerCommand(name, command) { commands.set(name, command); },
       appendEntry() {},
       getAllTools() { return []; },
       sendMessage() {},
     },
     handlers,
     tools,
+    commands,
   };
 }
 
@@ -148,10 +150,10 @@ async function withExtension(t, fn) {
   // Dynamic, so the resolve hook above is already installed. The module is
   // evaluated once per process; each call to its default export builds a fresh
   // extension instance with its own bridge and its own session state.
-  const mod = await import(join(EXTENSION_DIR, "index.ts"));
+  const mod = await import(pathToFileURL(join(EXTENSION_DIR, "index.ts")).href);
   assert.equal(typeof mod.default, "function");
 
-  const { pi, handlers, tools } = fakePi();
+  const { pi, handlers, tools, commands } = fakePi();
   await mod.default(pi);
   const notified = [];
   const statuses = [];
@@ -159,9 +161,11 @@ async function withExtension(t, fn) {
     server,
     handlers,
     tools,
+    commands,
     notified,
     statuses,
     ctx: fakeCtx(notified, statuses),
+    makeCtx: () => fakeCtx(notified, statuses),
     configPath: join(dir, "ovcli.conf"),
     turn: (prompt) => handlers.get("before_agent_start")(
       { type: "before_agent_start", prompt, systemPrompt: "BASE" },
@@ -217,6 +221,100 @@ test("a refused handshake still leaves the session working", async (t) => {
   });
 });
 
+test("an abort-on-settle host can recall on the first turn", async (t) => {
+  await withExtension(t, async ({ handlers, server, makeCtx, shutdown }) => {
+    const controller = new AbortController();
+    const startupCtx = makeCtx();
+    startupCtx.signal = controller.signal;
+    startupCtx.ui.notify = () => {
+      controller.signal.throwIfAborted();
+    };
+    startupCtx.ui.setStatus = () => {
+      controller.signal.throwIfAborted();
+    };
+
+    await handlers.get("session_start")({ type: "session_start" }, startupCtx);
+    // PI-Desktop retires every ctx bridge method as soon as its handler settles.
+    controller.abort();
+    await handlers.get("before_agent_start")(
+      { prompt: "desktop startup recall probe", systemPrompt: "BASE" },
+      makeCtx(),
+    );
+    await handlers.get("context")(
+      { messages: [{ role: "user", content: "desktop startup recall probe" }] },
+      makeCtx(),
+    );
+    assert.ok(server.requests.some((request) => /search/.test(request)), server.requests.join("\n"));
+    await shutdown();
+  });
+});
+
+test("an empty startup branch is not a capability failure, but an empty completed turn is", async (t) => {
+  await withExtension(t, async ({ handlers, commands, statuses, notified, server, makeCtx, shutdown }) => {
+    await handlers.get("before_agent_start")(
+      { prompt: "desktop branch capability", systemPrompt: "BASE" },
+      makeCtx(),
+    );
+    assert.ok(statuses.some(([, status]) => /OV ✓/.test(status) && !/capture ✗/.test(status)));
+
+    await handlers.get("turn_end")({ type: "turn_end" }, makeCtx());
+    assert.ok(statuses.some(([, status]) => /capture ✗/.test(status)), JSON.stringify(statuses));
+
+    await commands.get("viking").handler("", makeCtx());
+    assert.ok(notified.some(([message]) => /capture: unavailable/.test(message)), JSON.stringify(notified));
+
+    await commands.get("viking").handler("commit", makeCtx());
+    assert.ok(!notified.some(([message]) => /cannot commit/.test(message)), JSON.stringify(notified));
+    assert.ok(server.requests.some((request) => /commit/.test(request)), server.requests.join("\n"));
+
+    await handlers.get("before_agent_start")(
+      { prompt: "recall after capture unavailable", systemPrompt: "BASE" },
+      makeCtx(),
+    );
+    await handlers.get("context")(
+      { messages: [{ role: "user", content: "recall after capture unavailable" }] },
+      makeCtx(),
+    );
+    assert.ok(server.requests.some((request) => /search/.test(request)), server.requests.join("\n"));
+
+    const recoveredCtx = makeCtx();
+    recoveredCtx.sessionManager.getBranch = () => [
+      { id: "entry-recovered", type: "message", message: { role: "user", content: "ok" } },
+    ];
+    await handlers.get("turn_end")({ type: "turn_end" }, recoveredCtx);
+    assert.ok(!/capture ✗/.test(statuses.at(-1)[1]), statuses.at(-1)[1]);
+    await shutdown();
+  });
+});
+
+test("takeover reports a stubbed branch and leaves native compaction alone", async (t) => {
+  await withExtension(t, async ({ server, configPath, shutdown }) => {
+    await shutdown();
+    await writeFile(configPath, JSON.stringify({
+      plugin: { pi: { mcpEnabled: false, takeoverEnabled: true } },
+    }));
+    const { default: extension } = await import(pathToFileURL(join(EXTENSION_DIR, "index.ts")).href);
+    const { pi, handlers, commands } = fakePi();
+    await extension(pi);
+    const statuses = [];
+    const notified = [];
+    const ctx = fakeCtx(notified, statuses);
+    await handlers.get("before_agent_start")(
+      { prompt: "takeover branch probe", systemPrompt: "BASE" }, ctx,
+    );
+    await handlers.get("turn_end")({ type: "turn_end" }, ctx);
+    assert.match(statuses.at(-1)[1], /capture ✗ · takeover ✗/);
+    await commands.get("viking").handler("commit", ctx);
+    assert.ok(notified.some(([message]) => /session history unavailable/.test(message)), JSON.stringify(notified));
+    const requestsBeforeCompaction = server.requests.length;
+    assert.equal(await handlers.get("session_before_compact")(
+      { preparation: { firstKeptEntryId: "entry-1", tokensBefore: 100 } }, ctx,
+    ), undefined);
+    assert.equal(server.requests.length, requestsBeforeCompaction);
+    await handlers.get("session_shutdown")({}, ctx);
+  });
+});
+
 test("reload clears only the owning extension's coexistence marker", async (t) => {
   await withExtension(t, async ({ turn, shutdown }) => {
     await turn("hello");
@@ -254,7 +352,7 @@ for (const plugin of [{ mcpEnabled: false }, { bypassSession: true }]) {
       // The instance loads configuration at construction, so reload it first.
       await shutdown();
       await writeFile(configPath, JSON.stringify({ plugin: { pi: plugin } }));
-      const { default: extension } = await import(join(EXTENSION_DIR, "index.ts"));
+      const { default: extension } = await import(pathToFileURL(join(EXTENSION_DIR, "index.ts")).href);
       const { pi, handlers } = fakePi();
       await extension(pi);
       await handlers.get("before_agent_start")({ prompt: "hello", systemPrompt: "BASE" }, fakeCtx());
@@ -269,7 +367,7 @@ for (const plugin of [{ autoCapture: false }, { autoCapture: false, takeoverEnab
     await withExtension(t, async ({ server, shutdown, configPath }) => {
       await shutdown();
       await writeFile(configPath, JSON.stringify({ plugin: { pi: { ...plugin, mcpEnabled: false } } }));
-      const { default: extension } = await import(join(EXTENSION_DIR, "index.ts"));
+      const { default: extension } = await import(pathToFileURL(join(EXTENSION_DIR, "index.ts")).href);
       const { pi, handlers } = fakePi();
       await extension(pi);
       await handlers.get("before_agent_start")({ prompt: "hello", systemPrompt: "BASE" }, fakeCtx());
