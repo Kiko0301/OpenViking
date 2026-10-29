@@ -33,6 +33,8 @@ export class SyncManager {
   private syncedEntryCount = 0;
   /** Entry at the numeric watermark; detects a same-length sibling branch. */
   private syncedEntryId = "";
+  /** Keep queued turns ordered even when two handlers share one clock tick. */
+  private lastQueuedAt = 0;
   /**
    * Messages this session lost for good: non-retryable (4xx) rejections and
    * queued entries whose retry budget ran out. They are counted as accepted so
@@ -205,7 +207,7 @@ export class SyncManager {
 
   private fetchJSON = (path: string, init?: any) => this.client.fetchJSON(path, init);
 
-  async syncBranch(branch: any[]): Promise<SyncBranchResult> {
+  async syncBranch(branch: any[], opts: { queueOnly?: boolean } = {}): Promise<SyncBranchResult> {
     if (!this.ovSessionId) {
       return { added: 0, tokens: 0, allDelivered: true, queued: 0, permanentFailures: 0 };
     }
@@ -220,7 +222,9 @@ export class SyncManager {
       this.syncedEntryCount = 0;
       this.syncedEntryId = "";
     }
-    const sent = await this.sendPayloads(extracted.payloads);
+    const sent = opts.queueOnly
+      ? await this.queuePayloads(extracted.payloads)
+      : await this.sendPayloads(extracted.payloads);
     const added = sent.accepted;
     let tokens = 0;
     for (const payload of extracted.payloads.slice(0, added)) {
@@ -231,7 +235,7 @@ export class SyncManager {
       this.syncedEntryCount = extracted.nextEntryCount;
       this.syncedEntryId = extracted.nextEntryId;
     }
-    if (added > 0 && !this.config.takeoverEnabled) {
+    if (added > 0 && !this.config.takeoverEnabled && !opts.queueOnly) {
       await this.commitIfNeeded();
     }
     return {
@@ -246,6 +250,45 @@ export class SyncManager {
   async addPayload(payload: any): Promise<AddPayloadResult> {
     const sent = await this.sendPayloads([payload]);
     return { accepted: sent.accepted === 1, delivered: sent.delivered === 1 };
+  }
+
+  /** Persist a completed turn without sending it ahead of startup replay. */
+  private async queuePayloads(payloads: any[]): Promise<{
+    accepted: number;
+    delivered: number;
+    queued: number;
+    permanentFailures: number;
+  }> {
+    if (!this.ovSessionId || payloads.length === 0) {
+      return { accepted: 0, delivered: 0, queued: 0, permanentFailures: 0 };
+    }
+    const createdAt = Math.max(Date.now(), this.lastQueuedAt + 1);
+    let queued = 0;
+    for (const payload of payloads) {
+      const entryTime = createdAt + queued;
+      const result = await enqueue("addMessage", this.ovSessionId, payload, {
+        createdAt: entryTime,
+      });
+      if (!result.ok) break;
+      this.lastQueuedAt = entryTime;
+      queued++;
+    }
+    const permanentFailures = payloads.length - queued;
+    if (permanentFailures > 0) {
+      this.droppedForever += permanentFailures;
+      this.logger.log("queue", {
+        session: this.ovSessionId, queued, permanentFailures,
+      });
+    }
+    // Failed writes are counted as accepted so the watermark cannot resend a
+    // later payload ahead of the successfully queued prefix. The gap blocks
+    // takeover from trimming history that never reached OpenViking.
+    return {
+      accepted: queued + permanentFailures,
+      delivered: 0,
+      queued,
+      permanentFailures,
+    };
   }
 
   /**

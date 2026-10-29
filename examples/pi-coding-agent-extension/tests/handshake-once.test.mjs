@@ -8,6 +8,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { enqueue, listPending } from "../shared/pending-queue.mjs";
 
 const EXTENSION_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const EXTENSION_URL = pathToFileURL(EXTENSION_DIR + "/").href;
@@ -52,7 +53,7 @@ const MANAGED_ENV = [
 async function startServer() {
   const initializes = [];
   const requests = [];
-  const gate = { health: null };
+  const gate = { health: null, replay: null, messagesStatus: 200 };
   const server = createServer((req, res) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
@@ -72,6 +73,14 @@ async function startServer() {
         return;
       }
       if (path === "/health") await gate.health;
+      if (/\/messages(?:\/batch)?$/.test(path)) {
+        await gate.replay;
+        if (gate.messagesStatus !== 200) {
+          res.writeHead(gate.messagesStatus, { "content-type": "application/json" });
+          res.end(JSON.stringify({ detail: "replay unavailable" }));
+          return;
+        }
+      }
       // Everything the REST half touches during startup: /health, the profile
       // fetch, recall. An empty result keeps each of them a no-op.
       res.writeHead(200, { "content-type": "application/json" });
@@ -94,18 +103,20 @@ function fakePi() {
   const handlers = new Map();
   const tools = [];
   const commands = new Map();
+  const entries = [];
   return {
     pi: {
       on(event, handler) { handlers.set(event, handler); },
       registerTool(tool) { tools.push(tool?.name); },
       registerCommand(name, command) { commands.set(name, command); },
-      appendEntry() {},
+      appendEntry(type, data) { entries.push({ type, data }); },
       getAllTools() { return []; },
       sendMessage() {},
     },
     handlers,
     tools,
     commands,
+    entries,
   };
 }
 
@@ -125,7 +136,7 @@ function fakeCtx(notified = [], statuses = []) {
 }
 
 /** Boot one extension instance against a throwaway config and a fake server. */
-async function withExtension(t, fn) {
+async function withExtension(t, fn, plugin = {}) {
   const server = await startServer();
   const dir = await mkdtemp(join(tmpdir(), "ov-pi-handshake-"));
   const saved = Object.fromEntries(MANAGED_ENV.map((name) => [name, process.env[name]]));
@@ -136,7 +147,7 @@ async function withExtension(t, fn) {
   process.env.OPENVIKING_CLI_CONFIG_FILE = join(dir, "ovcli.conf");
   process.env.OPENVIKING_CONFIG_FILE = join(dir, "ov.conf");
   process.env.OPENVIKING_PENDING_DIR = join(dir, "pending");
-  await writeFile(join(dir, "ovcli.conf"), JSON.stringify({ plugin: { pi: {} } }), "utf8");
+  await writeFile(join(dir, "ovcli.conf"), JSON.stringify({ plugin: { pi: plugin } }), "utf8");
 
   t.after(async () => {
     for (const [name, value] of Object.entries(saved)) {
@@ -153,7 +164,7 @@ async function withExtension(t, fn) {
   const mod = await import(pathToFileURL(join(EXTENSION_DIR, "index.ts")).href);
   assert.equal(typeof mod.default, "function");
 
-  const { pi, handlers, tools, commands } = fakePi();
+  const { pi, handlers, tools, commands, entries } = fakePi();
   await mod.default(pi);
   const notified = [];
   const statuses = [];
@@ -162,6 +173,7 @@ async function withExtension(t, fn) {
     handlers,
     tools,
     commands,
+    entries,
     notified,
     statuses,
     ctx: fakeCtx(notified, statuses),
@@ -249,6 +261,256 @@ test("an abort-on-settle host can recall on the first turn", async (t) => {
   });
 });
 
+test("a scoped first turn recalls while current-session replay is still pending", async (t) => {
+  await withExtension(t, async ({ handlers, commands, statuses, notified, server, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "queued before this session",
+    });
+    let releaseReplay;
+    server.gate.replay = new Promise((resolve) => { releaseReplay = resolve; });
+    const controller = new AbortController();
+    const startupCtx = makeCtx();
+    startupCtx.signal = controller.signal;
+    const turn = (async () => {
+      await handlers.get("session_start")({ type: "session_start" }, startupCtx);
+      controller.abort();
+      await handlers.get("before_agent_start")(
+        { prompt: "slow replay recall probe", systemPrompt: "BASE" }, makeCtx(),
+      );
+      await handlers.get("context")(
+        { messages: [{ role: "user", content: "slow replay recall probe" }] }, makeCtx(),
+      );
+    })();
+    let timer;
+    let outcome;
+    try {
+      outcome = await Promise.race([
+        turn.then(() => "ready"),
+        new Promise((resolve) => { timer = setTimeout(() => resolve("blocked"), 800); }),
+      ]);
+      if (outcome === "ready") {
+        const captureCtx = makeCtx();
+        captureCtx.sessionManager.getBranch = () => [
+          { id: "queued-turn", type: "message", message: { role: "user", content: "Capture this new turn after replay finishes." } },
+        ];
+        await handlers.get("turn_end")({ type: "turn_end" }, captureCtx);
+        assert.match(statuses.at(-1)[1], /replay/);
+        assert.equal(server.requests.filter((request) => /\/messages(?:\/batch)?$/.test(request)).length, 1);
+        await commands.get("viking").handler("commit", captureCtx);
+        assert.ok(notified.some(([message]) => /replay/.test(message)), JSON.stringify(notified));
+        const beforeCompact = server.requests.length;
+        assert.equal(await handlers.get("session_before_compact")(
+          { preparation: { firstKeptEntryId: "queued-turn", tokensBefore: 100 } }, captureCtx,
+        ), undefined);
+        assert.equal(server.requests.length, beforeCompact);
+      }
+    } finally {
+      clearTimeout(timer);
+      releaseReplay();
+    }
+    await turn;
+    assert.equal(outcome, "ready", "first-turn recall must not wait for old queued writes");
+    assert.ok(server.requests.some((request) => /search/.test(request)), server.requests.join("\n"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(server.requests.filter((request) => /\/messages(?:\/batch)?$/.test(request)).length >= 2,
+      server.requests.join("\n"));
+    await shutdown();
+  }, { mcpEnabled: false, takeoverEnabled: true });
+});
+
+test("shutdown during replay keeps the completed turn durable and blocks takeover", async (t) => {
+  await withExtension(t, async ({ handlers, server, entries, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "older queued turn",
+    });
+    let releaseReplay;
+    server.gate.replay = new Promise((resolve) => { releaseReplay = resolve; });
+    try {
+      const controller = new AbortController();
+      const startupCtx = makeCtx();
+      startupCtx.signal = controller.signal;
+      await handlers.get("session_start")({ type: "session_start" }, startupCtx);
+      controller.abort();
+      await handlers.get("before_agent_start")(
+        { prompt: "capture before shutdown", systemPrompt: "BASE" }, makeCtx(),
+      );
+      const captureCtx = makeCtx();
+      captureCtx.sessionManager.getBranch = () => [
+        { id: "shutdown-turn", type: "message", message: { role: "user", content: "Keep this turn after shutdown during replay." } },
+      ];
+      await handlers.get("turn_end")({ type: "turn_end" }, captureCtx);
+      assert.ok((await listPending()).some(({ entry }) =>
+        JSON.stringify(entry.payload).includes("Keep this turn after shutdown")));
+
+      await shutdown();
+      assert.ok((await listPending()).some(({ entry }) =>
+        JSON.stringify(entry.payload).includes("Keep this turn after shutdown")));
+      assert.ok(entries.some(({ data }) => data?.captureGap === true));
+      assert.equal(server.requests.filter((request) => /\/commit$/.test(request)).length, 0);
+    } finally {
+      releaseReplay();
+    }
+  }, { mcpEnabled: false, takeoverEnabled: true });
+});
+
+test("shutdown during replay leaves ordinary capture queued without a premature commit", async (t) => {
+  await withExtension(t, async ({ handlers, server, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "old pending message",
+    });
+    let releaseReplay;
+    server.gate.replay = new Promise((resolve) => { releaseReplay = resolve; });
+    try {
+      const controller = new AbortController();
+      const startupCtx = makeCtx();
+      startupCtx.signal = controller.signal;
+      await handlers.get("session_start")({ type: "session_start" }, startupCtx);
+      controller.abort();
+      await handlers.get("before_agent_start")(
+        { prompt: "ordinary shutdown capture", systemPrompt: "BASE" }, makeCtx(),
+      );
+      const captureCtx = makeCtx();
+      captureCtx.sessionManager.getBranch = () => [
+        { id: "ordinary-shutdown", type: "message", message: { role: "user", content: "Persist an ordinary turn before shutdown." } },
+      ];
+      await handlers.get("turn_end")({ type: "turn_end" }, captureCtx);
+      await shutdown();
+      const queued = await listPending();
+      assert.ok(queued.some(({ entry }) => entry.type === "addMessage"
+        && JSON.stringify(entry.payload).includes("Persist an ordinary turn")));
+      assert.ok(!queued.some(({ entry }) => entry.type === "commitSession"));
+      assert.equal(server.requests.filter((request) => /\/commit$/.test(request)).length, 0);
+    } finally {
+      releaseReplay();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(server.requests.filter((request) => /\/commit$/.test(request)).length, 0);
+  }, { mcpEnabled: false, takeoverEnabled: false });
+});
+
+test("ordinary capture and shutdown commit resume after replay settles", async (t) => {
+  await withExtension(t, async ({ handlers, commands, notified, server, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "old pending message",
+    });
+    let releaseReplay;
+    server.gate.replay = new Promise((resolve) => { releaseReplay = resolve; });
+    try {
+      await handlers.get("before_agent_start")(
+        { prompt: "resume after replay", systemPrompt: "BASE" }, makeCtx(),
+      );
+    } finally {
+      releaseReplay();
+    }
+    const ctx = makeCtx();
+    let status = "";
+    for (let i = 0; i < 100; i++) {
+      await commands.get("viking").handler("", ctx);
+      status = notified.at(-1)?.[0] || "";
+      if (!/replay: pending/.test(status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(!/replay: pending/.test(status), status);
+    ctx.sessionManager.getBranch = () => [
+      { id: "post-replay", type: "message", message: { role: "user", content: "Capture after old replay finished." } },
+    ];
+    await handlers.get("turn_end")({ type: "turn_end" }, ctx);
+    await shutdown();
+    const requestPaths = server.requests;
+    const captureIndex = requestPaths.findIndex((request) => /\/messages\/batch$/.test(request));
+    const commitIndex = requestPaths.findIndex((request) => /\/commit$/.test(request));
+    assert.ok(captureIndex >= 0 && commitIndex > captureIndex, requestPaths.join("\n"));
+  }, { mcpEnabled: false, takeoverEnabled: false });
+});
+
+test("replay delivery failure stays visible and blocks an incomplete commit", async (t) => {
+  await withExtension(t, async ({ handlers, commands, notified, statuses, server, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "retry this queued message",
+    });
+    server.gate.messagesStatus = 503;
+    const ctx = makeCtx();
+    await handlers.get("before_agent_start")(
+      { prompt: "replay failure status", systemPrompt: "BASE" }, ctx,
+    );
+    let status = "";
+    for (let i = 0; i < 100; i++) {
+      await commands.get("viking").handler("", ctx);
+      status = notified.at(-1)?.[0] || "";
+      if (/replay: failed/.test(status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(status, /replay: failed/);
+    await handlers.get("before_agent_start")(
+      { prompt: "replay failure again", systemPrompt: "BASE" }, ctx,
+    );
+    assert.match(statuses.at(-1)[1], /replay ✗/);
+    await commands.get("viking").handler("commit", ctx);
+    assert.ok(notified.some(([message]) => /cannot commit — pending replay failed/.test(message)));
+    await shutdown();
+  }, { mcpEnabled: false, takeoverEnabled: false });
+});
+
+test("a dropped replay message records capture gap before takeover resumes", async (t) => {
+  await withExtension(t, async ({ handlers, commands, entries, notified, server, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "old message that the server rejects",
+    });
+    server.gate.messagesStatus = 400;
+    const ctx = makeCtx();
+    await handlers.get("before_agent_start")(
+      { prompt: "replay dropped message", systemPrompt: "BASE" }, ctx,
+    );
+    let status = "";
+    for (let i = 0; i < 100; i++) {
+      await commands.get("viking").handler("", ctx);
+      status = notified.at(-1)?.[0] || "";
+      if (!/replay: pending/.test(status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(!/replay: pending/.test(status), status);
+    assert.ok(entries.some(({ data }) => data?.captureGap === true));
+    await shutdown();
+  }, { mcpEnabled: false, takeoverEnabled: true });
+});
+
+test("queue failure during replay persists a takeover capture gap", async (t) => {
+  await withExtension(t, async ({ handlers, server, entries, configPath, makeCtx, shutdown }) => {
+    await enqueue("addMessage", "pi-pi-session-handshake", {
+      role: "user", content: "old pending message",
+    });
+    let releaseReplay;
+    server.gate.replay = new Promise((resolve) => { releaseReplay = resolve; });
+    try {
+      const controller = new AbortController();
+      const startupCtx = makeCtx();
+      startupCtx.signal = controller.signal;
+      await handlers.get("session_start")({ type: "session_start" }, startupCtx);
+      controller.abort();
+      await handlers.get("before_agent_start")(
+        { prompt: "capture gap probe", systemPrompt: "BASE" }, makeCtx(),
+      );
+      const blockedParent = join(dirname(configPath), "not-a-directory");
+      await writeFile(blockedParent, "");
+      const priorPendingDir = process.env.OPENVIKING_PENDING_DIR;
+      process.env.OPENVIKING_PENDING_DIR = join(blockedParent, "pending");
+      try {
+        const captureCtx = makeCtx();
+        captureCtx.sessionManager.getBranch = () => [
+          { id: "failed-queue", type: "message", message: { role: "user", content: "This message cannot be queued." } },
+        ];
+        await handlers.get("turn_end")({ type: "turn_end" }, captureCtx);
+        assert.ok(entries.some(({ data }) => data?.captureGap === true));
+      } finally {
+        process.env.OPENVIKING_PENDING_DIR = priorPendingDir;
+      }
+      await shutdown();
+    } finally {
+      releaseReplay();
+    }
+  }, { mcpEnabled: false, takeoverEnabled: true });
+});
+
 test("an empty startup branch is not a capability failure, but an empty completed turn is", async (t) => {
   await withExtension(t, async ({ handlers, commands, statuses, notified, server, makeCtx, shutdown }) => {
     await handlers.get("before_agent_start")(
@@ -262,6 +524,12 @@ test("an empty startup branch is not a capability failure, but an empty complete
 
     await commands.get("viking").handler("", makeCtx());
     assert.ok(notified.some(([message]) => /capture: unavailable/.test(message)), JSON.stringify(notified));
+
+    for (let i = 0; i < 100; i++) {
+      await commands.get("viking").handler("", makeCtx());
+      if (!/replay: pending/.test(notified.at(-1)?.[0] || "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
 
     await commands.get("viking").handler("commit", makeCtx());
     assert.ok(!notified.some(([message]) => /cannot commit/.test(message)), JSON.stringify(notified));
@@ -302,6 +570,11 @@ test("takeover reports a stubbed branch and leaves native compaction alone", asy
     await handlers.get("before_agent_start")(
       { prompt: "takeover branch probe", systemPrompt: "BASE" }, ctx,
     );
+    for (let i = 0; i < 100; i++) {
+      await commands.get("viking").handler("", ctx);
+      if (!/replay: pending/.test(notified.at(-1)?.[0] || "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     await handlers.get("turn_end")({ type: "turn_end" }, ctx);
     assert.match(statuses.at(-1)[1], /capture ✗ · takeover ✗/);
     await commands.get("viking").handler("commit", ctx);
@@ -311,6 +584,12 @@ test("takeover reports a stubbed branch and leaves native compaction alone", asy
       { preparation: { firstKeptEntryId: "entry-1", tokensBefore: 100 } }, ctx,
     ), undefined);
     assert.equal(server.requests.length, requestsBeforeCompaction);
+    const recoveredCtx = fakeCtx(notified, statuses);
+    recoveredCtx.sessionManager.getBranch = () => [
+      { id: "entry-1", type: "message", message: { role: "user", content: "Recovered history." } },
+    ];
+    await handlers.get("session_before_compact")({ preparation: {} }, recoveredCtx);
+    assert.ok(!/capture ✗/.test(statuses.at(-1)[1]), statuses.at(-1)[1]);
     await handlers.get("session_shutdown")({}, ctx);
   });
 });

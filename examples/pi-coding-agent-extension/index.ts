@@ -94,6 +94,62 @@ export default async function (pi: ExtensionAPI) {
   // An empty branch at startup is normal. Only a completed turn with no branch
   // entries demonstrates that the host cannot provide capture history.
   let branchUnavailable = false;
+  let replayPending = false;
+  let replaySettled = false;
+  let replayError = "";
+  let replayNeedsCaptureGap = false;
+  let queuedCaptureChain: Promise<void> = Promise.resolve();
+
+  const replayStatus = (): "pending" | "failed" | null =>
+    replayError ? "failed" : replayPending ? "pending" : null;
+
+  // Finalize only inside a live event handler: recordCaptureGap persists a pi
+  // session entry, which must never use an operation scope that already ended.
+  const finishReplay = (): void => {
+    if (!replaySettled) return;
+    if (config.takeoverEnabled && replayNeedsCaptureGap) {
+      try {
+        takeover.recordCaptureGap();
+        replayNeedsCaptureGap = false;
+      } catch (error) {
+        replayError = String(error);
+        logger.logError("replay_capture_gap", error);
+        return;
+      }
+    }
+    // A failed replay may have left older writes undelivered. Keep new turns in
+    // the durable queue and block commits until a later session retries them.
+    if (!replayError) replayPending = false;
+    replaySettled = false;
+  };
+
+  const startReplay = (): void => {
+    replayPending = true;
+    void (async () => {
+      try {
+        await sync.replayPending();
+        // A turn may finish while replay is in flight. Its capture is queued
+        // to disk, then drained after the older messages. Repeat if another
+        // turn queued while the drainer was running.
+        let observed: Promise<void>;
+        do {
+          observed = queuedCaptureChain;
+          await observed;
+          if (!await sync.flushForTakeover()) {
+            replayError = "pending session messages could not be delivered";
+            logger.log("replay_pending", { status: "deferred", error: replayError });
+            break;
+          }
+        } while (queuedCaptureChain !== observed);
+      } catch (error) {
+        replayError = error instanceof Error ? error.message : String(error);
+        logger.logError("replay_pending", error);
+      } finally {
+        replayNeedsCaptureGap = sync.droppedCount > 0 || Boolean(replayError);
+        replaySettled = true;
+      }
+    })();
+  };
 
   const readBranch = (ctx: any): any[] | null => {
     const manager = ctx?.sessionManager;
@@ -204,10 +260,7 @@ export default async function (pi: ExtensionAPI) {
         sync.restoreWatermark(takeover.state.syncedEntryCount, branch);
       }
 
-      await sync.replayPending();
-      if (config.takeoverEnabled && sync.droppedCount > 0) {
-        takeover.recordCaptureGap();
-      }
+      startReplay();
 
       // Profile injection
       profileBlock = await buildSessionProfileBlock(client, config);
@@ -221,7 +274,7 @@ export default async function (pi: ExtensionAPI) {
       // for pi -c continuations, which never fire session_start).
       if (handshake) adoptBridgeTools(ctx, await handshake);
       if (closed) return;
-      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable);
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable, replayStatus());
 
       started = true;
       if (config.logLevel === "info") {
@@ -265,6 +318,7 @@ export default async function (pi: ExtensionAPI) {
 
     // session_start doesn't fire for pi -c continuations.
     await start(ctx);
+    finishReplay();
 
     // Retry the handshake when the session is live but toolless — a server
     // started after pi, or a credential fixed mid-session. `bridge` is null
@@ -274,14 +328,15 @@ export default async function (pi: ExtensionAPI) {
     // a success it hands back the state it already has.
     if (bridge && wasStarted && connected && !bypassed && !closed && !toolsRegistered) {
       adoptBridgeTools(ctx, await bridge.connect(DEFAULT_HANDSHAKE_BUDGET_MS));
-      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable);
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable, replayStatus());
     }
 
     if (!connected || bypassed || closed) return;
+    updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, branchUnavailable, replayStatus());
 
     // A summary that finished since the last turn — or in the last `pi -p`
     // process — trims this prompt's request already.
-    if (config.takeoverEnabled && !branchUnavailable) {
+    if (config.takeoverEnabled && !branchUnavailable && !replayPending) {
       await takeover.resumePending(() => readBranch(ctx) ?? [], { deadline });
     }
 
@@ -313,6 +368,7 @@ export default async function (pi: ExtensionAPI) {
   // --- context ---
   pi.on("context", async (event, ctx) => {
     if (!connected || bypassed) return;
+    finishReplay();
 
     // Keep recall synchronous with the provider request so the current prompt
     // still receives current-query memory, without blocking user-message UI.
@@ -352,7 +408,7 @@ export default async function (pi: ExtensionAPI) {
 
     // Takeover's boundary is a branch entry id; it maps it onto these messages
     // through pi's context projection of the branch.
-    const afterTakeover = config.takeoverEnabled && !branchUnavailable
+    const afterTakeover = config.takeoverEnabled && !branchUnavailable && !replayPending
       ? takeover.transformContext(
           event.messages as any,
           readBranch(ctx) ?? [],
@@ -382,14 +438,34 @@ export default async function (pi: ExtensionAPI) {
   // --- turn_end ---
   pi.on("turn_end", async (event, ctx) => {
     if (!connected || bypassed || !isCaptureEnabled(config)) return;
+    finishReplay();
 
     const branch = readBranch(ctx);
     if (!branch?.length) {
       branchUnavailable = true;
-      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, true);
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, true, replayStatus());
       return;
     }
     branchUnavailable = false;
+
+    if (replayPending) {
+      // A slow replay must not consume this handler's budget or allow newer
+      // writes to overtake older ones. The durable queue survives shutdown.
+      const queued = queuedCaptureChain.then(() => sync.syncBranch(branch, { queueOnly: true }));
+      queuedCaptureChain = queued.then(() => undefined, () => undefined);
+      try {
+        const result = await queued;
+        if (result.permanentFailures > 0) takeover.recordCaptureGap();
+        takeover.recordQueuedTokens(result.tokens);
+        updateStatus(ctx, connected, result.added, sync.sessionId, config, takeover.state, toolsReady, false, replayStatus());
+      } catch (error) {
+        replayError = error instanceof Error ? error.message : String(error);
+        logger.logError("queue_capture", error);
+        takeover.recordCaptureGap();
+        updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, false, replayStatus());
+      }
+      return;
+    }
 
     // The host's 30s cap covers this whole handler, sync included.
     const deadline = Date.now() + HANDLER_BUDGET_MS;
@@ -399,21 +475,27 @@ export default async function (pi: ExtensionAPI) {
     // The branch is what the boundary is frozen against and re-confirmed on, so
     // takeover needs it, not just the token delta.
     await takeover.onTurnSynced(result.tokens, () => readBranch(ctx) ?? [], { deadline });
-    updateStatus(ctx, connected, result.added, sync.sessionId, config, takeover.state, toolsReady, false);
+    updateStatus(ctx, connected, result.added, sync.sessionId, config, takeover.state, toolsReady, false, replayStatus());
   });
 
   // --- session_before_compact ---
   pi.on("session_before_compact", async (event, ctx) => {
     if (!connected || bypassed || !isCaptureEnabled(config)) return;
+    finishReplay();
+
+    const branch = readBranch(ctx);
+    if (branch?.length && branchUnavailable) {
+      branchUnavailable = false;
+      updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, false, replayStatus());
+    }
+    if (replayPending) return;
 
     if (config.takeoverEnabled) {
-      const branch = readBranch(ctx);
       if (!branch?.length) {
         branchUnavailable = true;
-        updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, true);
+        updateStatus(ctx, connected, 0, sync.sessionId, config, takeover.state, toolsReady, true, replayStatus());
         return;
       }
-      branchUnavailable = false;
       const deadline = Date.now() + HANDLER_BUDGET_MS;
       const prep = (event as any)?.preparation ?? {};
       // Native compaction syncs the latest branch, archives all captured
@@ -454,10 +536,15 @@ export default async function (pi: ExtensionAPI) {
 
     if (!connected || bypassed) return;
 
+    await queuedCaptureChain;
+    finishReplay();
+    // The queued turn is durable, but an unfinished or failed replay cannot
+    // justify an archive. Preserve pi history and retry on the next session.
+    if (replayPending && config.takeoverEnabled) takeover.recordCaptureGap();
     await sync.shutdown();
     if (config.takeoverEnabled) {
       await takeover.shutdown();
-    } else if (isCaptureEnabled(config)) {
+    } else if (isCaptureEnabled(config) && !replayPending) {
       await sync.commit();
     }
   });
@@ -474,12 +561,17 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("viking", {
     description: "OpenViking status and manual operations. Use 'commit' to force a sync.",
     handler: async (args, ctx) => {
+      finishReplay();
       if (!connected) {
         ctx.ui.notify("OpenViking: not connected", "warning");
         return;
       }
 
       if (args?.trim() === "commit") {
+        if (replayPending) {
+          ctx.ui.notify(`OpenViking: cannot commit — pending replay ${replayError ? `failed: ${replayError}` : "still running"}`, "warning");
+          return;
+        }
         if (branchUnavailable && config.takeoverEnabled) {
           ctx.ui.notify("OpenViking: cannot commit — host session history unavailable", "warning");
           return;
@@ -531,9 +623,12 @@ export default async function (pi: ExtensionAPI) {
       const captureInfo = branchUnavailable && isCaptureEnabled(config)
         ? " | capture: unavailable (host session history empty)"
         : "";
+      const replayInfo = replayPending
+        ? ` | replay: ${replayError ? `failed — ${replayError}` : "pending"}`
+        : "";
       ctx.ui.notify(
         `OpenViking: ${connected ? "connected" : "disconnected"} | session: ${sid.slice(0, 12)}...`
-          + `${captureInfo}${takeoverInfo} | ${toolsStatusLine()}`,
+          + `${captureInfo}${replayInfo}${takeoverInfo} | ${toolsStatusLine()}`,
         "info",
       );
     },
@@ -608,6 +703,7 @@ function updateStatus(
   takeoverState?: { pendingTokens?: number; coveredUserTurns?: number },
   toolsReady?: boolean,
   branchUnavailable = false,
+  replayStatus: "pending" | "failed" | null = null,
 ): void {
   const setter = ctx?.ui?.setStatus;
   if (typeof setter !== "function") return;
@@ -626,7 +722,8 @@ function updateStatus(
   const capture = connected && branchUnavailable && isCaptureEnabled(config)
     ? ` · capture ✗${config.takeoverEnabled ? " · takeover ✗" : ""}`
     : "";
-  const status = `${connected ? "OV ✓" : "OV ✗"}${tools}${capture} · ↩${added}${pending} · ${sessionId ? sessionId.slice(0, 12) : "none"}`;
+  const replay = replayStatus === "pending" ? " · replay …" : replayStatus === "failed" ? " · replay ✗" : "";
+  const status = `${connected ? "OV ✓" : "OV ✗"}${tools}${capture}${replay} · ↩${added}${pending} · ${sessionId ? sessionId.slice(0, 12) : "none"}`;
   try {
     setter("openviking", status);
   } catch {

@@ -62,6 +62,47 @@ test("syncBranch returns added token accounting and delivered status", async () 
   });
 });
 
+test("queue-only capture durably records a turn without racing startup replay", async () => {
+  await withPendingDir(async () => {
+    let requests = 0;
+    const c = client({ fetchJSON: async () => { requests++; return { ok: true, result: {} }; } });
+    const sync = new SyncManager(c, config({ takeoverEnabled: false }));
+    await sync.ensureSession("pi-session");
+    const result = await sync.syncBranch([
+      { id: "u-1", type: "message", message: { role: "user", content: "Durably capture this turn before replay completes." } },
+    ], { queueOnly: true });
+    assert.equal(result.added, 1);
+    assert.equal(result.queued, 1);
+    assert.equal(result.allDelivered, false);
+    assert.equal(result.permanentFailures, 0);
+    assert.equal(sync.syncedCount, 1);
+    assert.equal(requests, 0);
+    assert.equal((await listPending()).length, 1);
+  });
+});
+
+test("queue-only turns keep their order when the clock has the same millisecond", async () => {
+  await withPendingDir(async () => {
+    const sync = new SyncManager(client(), config());
+    await sync.ensureSession("pi-session");
+    const originalNow = Date.now;
+    Date.now = () => 1_000_000;
+    try {
+      const first = { id: "u-1", type: "message", message: { role: "user", content: "The first queued turn is older." } };
+      const second = { id: "u-2", type: "message", message: { role: "user", content: "The second queued turn is newer." } };
+      await sync.syncBranch([first], { queueOnly: true });
+      await sync.syncBranch([first, second], { queueOnly: true });
+    } finally {
+      Date.now = originalNow;
+    }
+    const pending = await listPending();
+    assert.equal(pending.length, 2);
+    assert.ok(pending[0].entry.createdAt < pending[1].entry.createdAt);
+    assert.match(JSON.stringify(pending[0].entry.payload), /first queued turn/);
+    assert.match(JSON.stringify(pending[1].entry.payload), /second queued turn/);
+  });
+});
+
 async function readLastRecord(path) {
   const lines = (await readFile(path, "utf8")).trim().split("\n");
   return JSON.parse(lines[lines.length - 1]);
